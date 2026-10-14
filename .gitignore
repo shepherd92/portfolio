@@ -1,0 +1,17 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Test and coverage output
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Generated documentation
+docs/build/
+
+# Saved market prices and exchange rates
+/snapshots/
+config
