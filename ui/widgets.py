@@ -6,7 +6,10 @@ from decimal import Decimal, InvalidOperation
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from ui.reporting import format_number
+from ui.reporting import format_number, plain_number
+from ui.links import open_cell_link
+from ui.sorting import TreeSort
+from ui.theme import BACKGROUND, MUTED_TEXT, ROW_BACKGROUND, ALTERNATE_BACKGROUND, CATEGORY_BACKGROUND
 
 
 class AutoScrollbar(ttk.Scrollbar):
@@ -23,6 +26,35 @@ def bind_shortcuts(widget, actions):
             action()
             return 'break'
         widget.bind(key, invoke)
+
+
+def shade_allocation_groups(tree):
+    """Separate category headers and keep each asset class in one alternating band."""
+    tree.tag_configure('category', background=CATEGORY_BACKGROUND)
+    tree.tag_configure('plain', background=ROW_BACKGROUND)
+    tree.tag_configure('alternate', background=ALTERNATE_BACKGROUND)
+    for category in tree.get_children():
+        tree.item(category, tags=('category',))
+        for index, group in enumerate(tree.get_children(category)):
+            tag = 'alternate' if index % 2 else 'plain'
+            for item in (group, *tree.get_children(group)):
+                tree.item(item, tags=(tag,))
+
+
+def retain_visible_selection(tree):
+    """Clear detached selections and keep keyboard navigation on visible rows."""
+    roots = tree.get_children()
+
+    def visible(item):
+        while tree.parent(item):
+            item = tree.parent(item)
+        return item in roots
+
+    for item in tree.selection():
+        if not visible(item):
+            tree.selection_remove(item)
+    if tree.focus() and not visible(tree.focus()):
+        tree.focus(roots[0] if roots else '')
 
 
 def whole_number(value):
@@ -61,7 +93,7 @@ class RoundedEntry(ttk.Entry):
             return
         self._updating = True
         value = self._value.get()
-        self._display.set(value if self._editing else whole_number(value))
+        self._display.set(plain_number(value) if self._editing else whole_number(value))
         self._updating = False
 
     def _changed(self, *_):
@@ -113,7 +145,7 @@ class PieChart(ttk.Frame):
         self.columnconfigure(0, weight=1, uniform="chart")
         self.columnconfigure(1, weight=1, uniform="chart")
         self.rowconfigure(0, weight=1)
-        background = ttk.Style(self).lookup("TFrame", "background") or "white"
+        background = ttk.Style(self).lookup("TFrame", "background") or BACKGROUND
         self.canvas = tk.Canvas(self, background=background, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.legend = tk.Canvas(self, background=background, highlightthickness=0)
@@ -130,7 +162,8 @@ class PieChart(ttk.Frame):
         self._data, self._colors, self._fractions = {}, {}, {}
         self._empty_message = "No holdings"
 
-    def set_data(self, values, colors, empty_message="No holdings"):
+    def set_data(self, values, colors, empty_message="No holdings", *, percent_values=False):
+        """Normalize slice geometry; optionally label values already expressed in percent."""
         data = {str(key): float(value) for key, value in values.items()}
         if any(not math.isfinite(value) or value < 0 for value in data.values()):
             raise ValueError("Chart values must be finite and nonnegative.")
@@ -143,12 +176,14 @@ class PieChart(ttk.Frame):
         for widget in self._legend_frame.winfo_children():
             widget.destroy()
         for index, key in enumerate(data):
-            swatch = tk.Canvas(self._legend_frame, width=12, height=12, highlightthickness=0)
+            swatch = tk.Canvas(self._legend_frame, width=12, height=12, highlightthickness=0,
+                               background=self.legend.cget('background'))
             swatch.create_rectangle(0, 0, 13, 13, fill=self._color(key), outline="")
             swatch.grid(row=index, column=0, padx=(2, 7), pady=7, sticky="n")
             label = ttk.Label(self._legend_frame, text=key, wraplength=130)
             label.grid(row=index, column=1, sticky="nw", pady=5)
-            percentage = ttk.Label(self._legend_frame, text=f"{self._fractions[key]:.1%}")
+            percentage = ttk.Label(self._legend_frame, text=(f"{data[key]:.1f}%" if percent_values
+                                                          else f"{self._fractions[key]:.1%}"))
             percentage.grid(row=index, column=2, sticky="ne", padx=7, pady=5)
             for widget in (swatch, label, percentage):
                 self._bind_scroll(widget)
@@ -162,12 +197,23 @@ class PieChart(ttk.Frame):
         return self._colors.get(key, "#64748b")
 
     def _bind_scroll(self, widget):
-        widget.bind("<MouseWheel>", lambda event: self.legend.yview_scroll(-1 if event.delta > 0 else 1, "units"))
-        widget.bind("<Button-4>", lambda event: self.legend.yview_scroll(-1, "units"))
-        widget.bind("<Button-5>", lambda event: self.legend.yview_scroll(1, "units"))
+        widget.bind("<MouseWheel>", lambda event: self._scroll_legend(-1 if event.delta > 0 else 1))
+        widget.bind("<Button-4>", lambda event: self._scroll_legend(-1))
+        widget.bind("<Button-5>", lambda event: self._scroll_legend(1))
+
+    def _scroll_legend(self, direction):
+        if self.legend.yview() != (0.0, 1.0):
+            self.legend.yview_scroll(direction, "units")
+        return "break"
 
     def _legend_size(self, _event=None):
-        self.legend.configure(scrollregion=self.legend.bbox("all"))
+        content_height = self._legend_frame.winfo_reqheight() if self._data else 0
+        viewport_height = self.legend.winfo_height()
+        self.legend.coords(self._legend_window, 0, max(0, (viewport_height - content_height) / 2))
+        self.legend.configure(scrollregion=(0, 0, self.legend.winfo_width(),
+                                            max(content_height, viewport_height)))
+        if content_height <= viewport_height:
+            self.legend.yview_moveto(0)
 
     def _legend_width(self, _event=None):
         width = self.legend.winfo_width()
@@ -175,13 +221,14 @@ class PieChart(ttk.Frame):
         for widget in self._legend_frame.winfo_children():
             if int(widget.grid_info().get("column", -1)) == 1:
                 widget.configure(wraplength=max(40, width - 90))
+        self._legend_size()
 
     def _draw(self, _event=None):
         self.canvas.delete("all")
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
         if not any(self._fractions.values()):
             self.canvas.create_text(width / 2, height / 2, text=self._empty_message,
-                                    width=max(40, width - 24), fill="#64748b", font="TkDefaultFont")
+                                    width=max(40, width - 24), fill=MUTED_TEXT, font="TkDefaultFont")
             return
         radius = max(1, (min(width, height) - 28) / 2)
         bounds = (width / 2 - radius, height / 2 - radius, width / 2 + radius, height / 2 + radius)
@@ -202,12 +249,15 @@ class DataTable(ttk.Frame):
 
     def __init__(self, parent, columns, choices=None, validate=None, on_change=None,
                  can_delete=None, height=8, sort_key=None,
-                 field_rows=None, rounded_columns=(), locked_fields=None, dialog_title='row'):
+                 field_rows=None, rounded_columns=(), numeric_columns=(), locked_fields=None,
+                 dialog_title='row', resolve_add=None, links=None):
         super().__init__(parent)
         self.columns = list(columns)
         self.field_rows = field_rows or tuple((key,) for key, _, _ in self.columns)
         self.choices, self.validate = choices or {}, validate
         self.on_change, self.can_delete = on_change, can_delete
+        self.resolve_add = resolve_add
+        self.links = links or {}
         self.sort_key = sort_key
         self.rounded_columns = set(rounded_columns)
         self.locked_fields, self.dialog_title = locked_fields, dialog_title
@@ -221,6 +271,8 @@ class DataTable(ttk.Frame):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, minwidth=min(width, 60),
                              anchor="e" if key in self.rounded_columns else "w")
+        self.sorting = TreeSort(self.tree, numeric_columns=self.rounded_columns | set(numeric_columns),
+                                value=lambda item, column: self.sort_value(self._rows[item], column))
         vertical = AutoScrollbar(self, orient="vertical", command=self.tree.yview)
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal = AutoScrollbar(self, orient="horizontal", command=self.tree.xview)
@@ -243,6 +295,9 @@ class DataTable(ttk.Frame):
     def display_value(self, row, key):
         return whole_number(row[key]) if key in self.rounded_columns else row[key]
 
+    def sort_value(self, row, key):
+        return row.get(key, '')
+
     def set_rows(self, rows):
         normalized = [self._normalize(row) for row in rows]
         self.tree.delete(*self.tree.get_children())
@@ -254,16 +309,17 @@ class DataTable(ttk.Frame):
         self._update_buttons()
 
     def get_rows(self):
-        return [dict(self._rows[item]) for item in self.tree.get_children()]
+        return [dict(row) for row in self._rows.values()]
 
     def row(self, item):
         return dict(self._rows[item])
 
     def sort_rows(self):
-        if self.sort_key:
+        if self.sort_key and self.sorting.column is None:
             items = sorted(self.tree.get_children(), key=lambda item: self.sort_key(self._rows[item]))
             for index, item in enumerate(items):
                 self.tree.move(item, '', index)
+        self.sorting.apply()
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
@@ -318,6 +374,9 @@ class DataTable(ttk.Frame):
             button.configure(state="normal" if selected else "disabled")
 
     def _double_click(self, event):
+        if open_cell_link(event, self.tree, {key: lambda item, link=link: link(self.row(item))
+                                           for key, link in self.links.items()}):
+            return 'break'
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
@@ -333,31 +392,36 @@ class DataTable(ttk.Frame):
         form = ttk.Frame(dialog, padding=16)
         form.pack(fill="both", expand=True)
         variables, first = self._edit_fields(form, old)
+        saved = None
 
         def accept(_event=None):
+            nonlocal saved
             if not self._enabled:
                 dialog.destroy()
                 return "break"
             row = dict(old or {})
             row.update({key: variable.get() for key, variable in variables.items()})
             try:
-                row = self._normalize(self.validate(dict(row), dict(old) if old is not None else None)
-                                      if self.validate else row)
+                target = item or (self.resolve_add(row) if self.resolve_add else None)
+                previous = self.row(target) if target else None
+                row = self._normalize(self.validate(dict(row), previous) if self.validate else row)
             except ValueError as error:
                 messagebox.showerror("Invalid entry", str(error), parent=dialog)
                 return "break"
-            if row == old:
+            if row == previous:
                 dialog.destroy()
                 return 'break'
             values = [self.display_value(row, key) for key, _, _ in self.columns]
-            target = item or self.tree.insert("", "end", values=values)
-            if item:
-                self.tree.item(item, values=values)
+            if target:
+                self.tree.item(target, values=values)
+            else:
+                target = self.tree.insert("", "end", values=values)
             self._rows[target] = row
+            saved = target
             self.tree.selection_set(target)
             self.tree.see(target)
             dialog.destroy()
-            self._notify("edit" if item else "add", old, row)
+            self._notify("edit" if previous is not None else "add", previous, row)
             return "break"
 
         buttons = ttk.Frame(form)
@@ -375,6 +439,7 @@ class DataTable(ttk.Frame):
                 self.tree.see(selection[0])
             self.tree.focus_set()
             self._update_buttons()
+        return saved
 
     def _edit_fields(self, form, old):
         variables, first = {}, None
@@ -383,8 +448,9 @@ class DataTable(ttk.Frame):
         for index, fields in enumerate(self.field_rows):
             for column, key in enumerate(fields):
                 padding = (0, 12) if column < len(fields) - 1 else 0
+                span = max(map(len, self.field_rows)) if len(fields) == 1 else 1
                 ttk.Label(form, text=labels[key]).grid(row=2 * index, column=column,
-                                                     sticky="w", padx=padding, pady=(6, 2))
+                                                     sticky="w", columnspan=span, padx=padding, pady=(6, 2))
                 variable = tk.StringVar(value=(old or {}).get(key, ""))
                 variables[key] = variable
                 width = 12 if column else 30
@@ -398,7 +464,7 @@ class DataTable(ttk.Frame):
                     entry = RoundedEntry if key in self.rounded_columns else ttk.Entry
                     editor = entry(form, textvariable=variable, width=width,
                                    state="readonly" if key in readonly else "normal")
-                editor.grid(row=2 * index + 1, column=column, sticky="ew", padx=padding, pady=(0, 6))
+                editor.grid(row=2 * index + 1, column=column, columnspan=span, sticky="ew", padx=padding, pady=(0, 6))
                 if first is None and key not in readonly:
                     first = editor
         return variables, first

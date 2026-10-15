@@ -1,15 +1,11 @@
-import json
-from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
-from portfolio.models import CASH, Holding, MarketSnapshot, Quote
+from portfolio.models import CASH, Holding, MarketData, Quote
 from portfolio.planning import PlanningError, rebalance
 import portfolio.planning as planning
-from portfolio.storage import load_snapshot
 from support import exhaustive_objectives, portfolio_fixture
 
 
@@ -23,7 +19,7 @@ class RefinementTests(unittest.TestCase):
                 tickers = ('A', 'B', 'C')
                 portfolio = portfolio_fixture(tuple(Holding(t, t, q) for t, q in zip(tickers, owned)),
                                       {'A': 40, 'B': 20, 'C': 40}, {'EUR': cash})
-                market = MarketSnapshot({t: Quote(p, 'EUR') for t, p in zip(tickers, prices)}, {})
+                market = MarketData({t: Quote(p, 'EUR') for t, p in zip(tickers, prices)}, {})
                 result = rebalance(portfolio, market)
                 self.assertEqual(exhaustive_objectives(portfolio, market, False, result),
                                  exhaustive_objectives(portfolio, market, False))
@@ -38,7 +34,7 @@ class RefinementTests(unittest.TestCase):
                 tickers = ('A', 'B', 'C')
                 portfolio = portfolio_fixture(tuple(Holding(t, t, q) for t, q in zip(tickers, owned)),
                                       dict(zip(tickers, targets)), {'EUR': cash})
-                market = MarketSnapshot({t: Quote(p, 'EUR') for t, p in zip(tickers, prices)}, {})
+                market = MarketData({t: Quote(p, 'EUR') for t, p in zip(tickers, prices)}, {})
                 result = rebalance(portfolio, market, allow_selling=True)
                 self.assertEqual(exhaustive_objectives(portfolio, market, True, result),
                                  exhaustive_objectives(portfolio, market, True))
@@ -46,14 +42,14 @@ class RefinementTests(unittest.TestCase):
     def test_aggregate_value_overflow_has_validation_error(self):
         portfolio = portfolio_fixture((Holding('A', 'group', 1), Holding('B', 'group', 1, False)),
                               {'group': 100}, {})
-        market = MarketSnapshot({t: Quote(1e308, 'EUR') for t in ('A', 'B')}, {})
+        market = MarketData({t: Quote(1e308, 'EUR') for t in ('A', 'B')}, {})
         with self.assertRaisesRegex(PlanningError, 'too large'):
             rebalance(portfolio, market)
 
     def test_unaffordable_main_does_not_trigger_unnecessary_sale(self):
         portfolio = portfolio_fixture((Holding('A', 'stocks', 0), Holding('B', 'bonds', 1)),
                               {'stocks': 50, 'bonds': 50}, {})
-        market = MarketSnapshot({'A': Quote(2.5, 'EUR'), 'B': Quote(1.5, 'EUR')}, {})
+        market = MarketData({'A': Quote(2.5, 'EUR'), 'B': Quote(1.5, 'EUR')}, {})
         result = rebalance(portfolio, market, allow_selling=True)
         self.assertEqual(result.trades, ())
         self.assertEqual(result.cash_value, 0)
@@ -66,7 +62,7 @@ class RefinementTests(unittest.TestCase):
     def test_numpy_unsigned_shares_become_python_integers(self):
         portfolio = portfolio_fixture((Holding('A', 'group', np.uint64(2)),), {'group': 50, CASH: 50}, {})
         self.assertIs(type(portfolio.holdings[0].shares), int)
-        market = MarketSnapshot({'A': Quote(10, 'EUR')}, {})
+        market = MarketData({'A': Quote(10, 'EUR')}, {})
         self.assertEqual(rebalance(portfolio, market, allow_selling=True).trades[0].shares, -1)
 
     def test_underflow_after_minor_unit_normalization_is_rejected(self):
@@ -75,7 +71,7 @@ class RefinementTests(unittest.TestCase):
 
     def test_fx_overflow_and_underflow_are_rejected(self):
         for price, rate in ((1e-200, 1e-200), (1e200, 1e200)):
-            market = MarketSnapshot({'A': Quote(price, 'USD')}, {'USD': rate})
+            market = MarketData({'A': Quote(price, 'USD')}, {'USD': rate})
             with self.subTest(price=price), self.assertRaises(ValueError):
                 market.price('A')
 
@@ -83,21 +79,9 @@ class RefinementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Quote(10**1000, 'EUR')
 
-    def test_malformed_snapshot_shapes_are_rejected(self):
-        fixtures = [[], {}, {'quotes': [], 'rates': {}, 'base_currency': 'EUR'},
-                    {'quotes': {}, 'rates': [], 'base_currency': 'EUR'},
-                    {'quotes': {'A': 1}, 'rates': {}, 'base_currency': 'EUR'}]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'snapshot.json'
-            for data in fixtures:
-                path.write_text(json.dumps(data))
-                with self.subTest(data=data), self.assertRaises(ValueError):
-                    load_snapshot(path)
-
-
     def test_solver_success_cannot_hide_a_violated_budget(self):
         portfolio = portfolio_fixture((Holding('A', 'group', 0),), {'group': 100}, {'EUR': 1})
-        market = MarketSnapshot({'A': Quote(10, 'EUR')}, {})
+        market = MarketData({'A': Quote(10, 'EUR')}, {})
         real_milp = planning.milp
 
         def bad_solution(*args, **kwargs):

@@ -1,49 +1,40 @@
 """Human-readable recommendations shared by the GUI and command line."""
 
-from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from math import fsum
 
-from portfolio.models import CASH, STOCK_MARKET, TREASURY
+from portfolio.models import CASH, TREASURY
 
 
-def format_number(value, spec=',.2f'):
+def plain_number(value):
+    """Show the full finite value without exponent notation, including in editors."""
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return str(value)
+    if not amount.is_finite() or not -324 <= amount.adjusted() <= 308:
+        return str(value)  # Keep an invalid draft available for normal validation.
+    return format(amount, 'f')
+
+
+def format_number(value, spec=',.0f'):
     """Group numeric display text with narrow nonbreaking spaces."""
     return format(value, spec).replace(',', '\u202f')
 
 
-def format_amount(value, places=2):
-    """Keep tiny nonzero execution amounts visible in both tables and exports."""
-    text = format_number(value, f',.{places}f')
-    return f'{value:.6g}' if value and Decimal(text.replace('\u202f', '')) == 0 else text
+def format_amount(value, places=0):
+    """Round display text only, using fixed-point notation and grouped digits."""
+    text = format_number(Decimal(str(value)), f',.{places}f')
+    return text.removeprefix('-') if Decimal(text.replace('\u202f', '')) == 0 else text
 
 
-def current_values(holdings, manual_holdings, cash, market, *, parent=None):
-    """Value holdings by allocation leaf, without requiring valid target ratios.
-
-    A selected parent only prices that branch; zero positions need no quote
-    or exchange rate. Signed cash balances remain signed.
-    """
-    if parent not in (None, STOCK_MARKET, TREASURY, CASH):
-        raise ValueError(f'Unknown allocation category: {parent!r}')
-    parts = defaultdict(list)
-    if parent in (None, STOCK_MARKET):
-        for holding in holdings:
-            value = holding.shares * market.price(holding.ticker) if holding.shares else 0.
-            parts[STOCK_MARKET, holding.group].append(value)
-    if parent in (None, TREASURY):
-        for holding in manual_holdings:
-            value = market.value(holding.amount, holding.currency) if holding.amount else 0.
-            parts[TREASURY, holding.currency].append(value)
-    if parent in (None, CASH):
-        for currency, amount in cash.items():
-            parts[CASH, currency].append(market.value(amount, currency) if amount else 0.)
-    return {key: fsum(values) for key, values in parts.items()}
+def format_percent(value):
+    return f'{format_amount(value, 2)}%'
 
 
 def format_plan(plan, targets):
     manual_endings = {holding.currency: holding.amount for holding in plan.final_manual_holdings}
-    lines = [f"Planned wealth: {format_number(plan.wealth)} {plan.base_currency}",
+    lines = [f"Planned wealth: {format_amount(plan.wealth)} {plan.base_currency}",
              "Execute sells, then currency conversions, then buys (estimated prices)."]
     for action, trades in (("SELL", [t for t in plan.trades if t.shares < 0]),
                            ("BUY", [t for t in plan.trades if t.shares > 0])):
@@ -52,43 +43,43 @@ def format_plan(plan, targets):
                 lines.append(f"FX    {format_amount(fx.from_amount)} {fx.from_currency} -> "
                              f"{format_amount(fx.to_amount)} {fx.to_currency}")
         for trade in trades:
-            lines.append(f"{action:4}  {abs(trade.shares):6d} {trade.ticker:12} "
-                         f"@ {format_amount(trade.price, 4)} {trade.currency}; "
-                         f"ending shares {plan.final_shares[trade.ticker]}")
+            lines.append(f"{action:4}  {format_amount(abs(trade.shares)):>6} {trade.ticker:12} "
+                         f"@ {format_amount(trade.price, 2)} {trade.currency}; "
+                         f"ending shares {format_amount(plan.final_shares[trade.ticker])}")
         for trade in plan.manual_trades:
             if (trade.amount > 0) == (action == 'BUY'):
                 ending = manual_endings[trade.currency]
                 amount = abs(Decimal(str(trade.amount)))
                 ending = Decimal(str(ending))
-                lines.append(f"{action:4}  {format_number(amount)} {trade.currency} {TREASURY} "
-                             f"(manual asset); ending value {format_number(ending)} {trade.currency}")
+                lines.append(f"{action:4}  {format_amount(amount)} {trade.currency} {TREASURY} "
+                             f"(manual asset); ending value {format_amount(ending)} {trade.currency}")
     if not (plan.trades or plan.manual_trades or plan.conversions):
         lines.append("No trades.")
     lines.append("\nAllocation basis: total wealth, including cash")
     lines.extend(_allocation_lines(plan, targets))
     lines.append("\nCash balances:")
-    lines.extend(f"  {format_number(amount)} {currency}" for currency, amount in plan.cash.items()
-                 if amount or targets.children[CASH].get(currency, 0))
+    lines.extend(f"  {format_amount(amount)} {currency}" for currency, amount in plan.cash.items()
+                 if amount or targets.weights[CASH].get(currency, 0))
     return "\n".join(lines)
 
 
 def _allocation_lines(plan, targets):
-    lines = ["\nCategory / child             Value    Total %   Target %   Within target %"]
-    for parent, target in targets.top.items():
+    lines = [f"\nCategory / child          End ({plan.base_currency})          End       Target"]
+    for parent, target in targets.totals.items():
+        weights = targets.weights[parent]
         values = {name: plan.allocation_values.get((parent, name), 0.)
                   for branch, name in plan.allocation_values if branch == parent}
         value = fsum(values.values())
-        if not value and not target and not any(targets.children[parent].values()):
+        if not any(values.values()) and not target:
             continue
         actual = 100 * value / plan.wealth if plan.wealth else 0.
-        lines.append(f"{parent:24} {format_number(value, '12,.2f')} {actual:9.2f}% {target:9.2f}%")
-        for child in sorted(set(values) | set(targets.children[parent]),
-                            key=lambda name: (-targets.children[parent].get(name, 0), name)):
+        lines.append(f"{parent:24} {format_amount(value):>12} {format_percent(actual):>12} {format_percent(target):>12}")
+        for child in sorted(set(values) | set(weights),
+                            key=lambda name: (-weights.get(name, 0), name)):
             amount = values.get(child, 0.)
             actual = 100 * amount / plan.wealth if plan.wealth else 0.
-            local = targets.children[parent].get(child, 0.)
-            effective = target * local / 100
-            if not amount and not local:
+            weight = weights.get(child, 0.)
+            if not amount and not weight:
                 continue
-            lines.append(f"  {child:22} {format_number(amount, '12,.2f')} {actual:9.2f}% {effective:9.2f}% {local:17.2f}%")
+            lines.append(f"  {child:22} {format_amount(amount):>12} {format_percent(actual):>12} {format_percent(weight):>12}")
     return lines

@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, MarketSnapshot, Portfolio, Quote
+from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, Portfolio
 import portfolio.storage as portfolio_io
-from portfolio.storage import (config_signature, load_portfolio, load_snapshot,
-                          load_portfolio_with_signature, save_portfolio, save_snapshot)
+from portfolio.storage import (config_signature, load_portfolio,
+                          load_portfolio_with_signature, save_portfolio)
 
 
 class StorageTests(unittest.TestCase):
@@ -20,8 +20,7 @@ class StorageTests(unittest.TestCase):
         self.directory = Path(temporary.name) / "config"
         self.directory.mkdir()
         self.original = {
-            "asset_group.csv": ("note,parent,target_allocation,asset_group\r\n"
-                                ",,100,Stock market\r\n,,0,MÁK\r\n,,0,Cash\r\n"
+            "asset_group.csv": ("note,parent,portfolio_allocation,asset_group\r\n"
                                 "Keep group,Stock market,100,stock\r\n").encode(),
             "asset.csv": (b"asset_group,ticker,is_main,shares,ibkr_id,notes\r\n"
                           b'stock,A,True,4,123,"Keep, exactly"\r\n'
@@ -30,9 +29,7 @@ class StorageTests(unittest.TestCase):
         }
         for name, contents in self.original.items():
             (self.directory / name).write_bytes(contents)
-        self.allocation = AllocationTargets(
-            {STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
-            {STOCK_MARKET: {"stock": 100}, TREASURY: {}, CASH: {}})
+        self.allocation = AllocationTargets({STOCK_MARKET: {"stock": 100}, TREASURY: {}, CASH: {}})
         self.portfolio = Portfolio((Holding("A", "stock", 7), Holding("NEW", "stock", 0, False)),
                                    self.allocation, {"EUR": 35, "USD": 2})
 
@@ -47,7 +44,8 @@ class StorageTests(unittest.TestCase):
         self.assertNotEqual(result, signature)
         self.assertEqual(set(self.contents()), set(self.original))
         rows = list(csv.DictReader(io.StringIO((self.directory / "asset.csv").read_text())))
-        self.assertEqual(list(rows[0]), ["asset_group", "ticker", "is_main", "shares", "ibkr_id", "notes"])
+        self.assertEqual(list(rows[0]), ["asset_group", "ticker", "is_main", "shares", "ibkr_id", "notes",
+                                         "isin", "exchange", "currency", "ter", "name", "ibkr_name"])
         self.assertEqual(rows[0]["ibkr_id"], "123")
         self.assertEqual(rows[0]["notes"], "Keep, exactly")
         self.assertEqual(rows[1]["ticker"], "NEW")
@@ -85,8 +83,7 @@ class StorageTests(unittest.TestCase):
     def test_group_rename_preserves_metadata(self):
         portfolio = Portfolio(tuple(Holding(h.ticker, 'Equities', h.shares, h.is_main)
                                     for h in self.portfolio.holdings),
-                              AllocationTargets(self.allocation.top,
-                                  {**self.allocation.children, STOCK_MARKET: {'Equities': 100}}),
+                              AllocationTargets({**self.allocation.weights, STOCK_MARKET: {'Equities': 100}}),
                               self.portfolio.cash)
         save_portfolio(portfolio, self.directory, group_origins={'Equities': 'stock'})
         with (self.directory / 'asset_group.csv').open() as stream:
@@ -180,7 +177,7 @@ class StorageTests(unittest.TestCase):
 
     def test_csv_parser_errors_are_reported_as_validation_errors(self):
         path = self.directory / 'asset_group.csv'
-        path.write_text('parent,asset_group,target_allocation,note\nStock market,stock,100,' + 'x' * 140000 + '\n')
+        path.write_text('parent,asset_group,portfolio_allocation,note\nStock market,stock,100,' + 'x' * 140000 + '\n')
         for operation in (lambda: load_portfolio(self.directory),
                           lambda: save_portfolio(self.portfolio, self.directory)):
             with self.assertRaisesRegex(ValueError, 'asset_group.csv'):
@@ -196,27 +193,6 @@ class StorageTests(unittest.TestCase):
                 save_portfolio(self.portfolio, self.directory)
             self.assertEqual(self.contents(), existing)
 
-    def test_snapshot_roundtrip_and_atomic_failure(self):
-        snapshot = MarketSnapshot({"A": Quote(1234, "GBp")}, {"GBP": 1.2})
-        path = self.directory / "snapshot.json"
-        save_snapshot(snapshot, path)
-        self.assertEqual(load_snapshot(path), snapshot)
-        original = path.read_bytes()
-        with patch.object(portfolio_io.os, "replace", side_effect=OSError("injected failure")):
-            with self.assertRaises(OSError):
-                save_snapshot(MarketSnapshot({"A": Quote(1, "EUR")}, {}), path)
-        self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(set(self.contents()), {*self.original, "snapshot.json"})
-
-    def test_invalid_snapshot_does_not_replace_existing_json(self):
-        snapshot = MarketSnapshot({"A": Quote(1, "EUR")}, {})
-        path = self.directory / "snapshot.json"
-        save_snapshot(snapshot, path)
-        original = path.read_bytes()
-        object.__setattr__(snapshot.quotes["A"], "price", float("nan"))
-        with self.assertRaises(ValueError):
-            save_snapshot(snapshot, path)
-        self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == "__main__":

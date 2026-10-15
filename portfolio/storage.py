@@ -1,24 +1,26 @@
-"""CSV portfolio storage, fixed JSON snapshots, and explicit Yahoo fetching."""
+"""CSV portfolio storage and live market data fetching."""
 
 import csv
-from datetime import datetime, timezone
+from dataclasses import asdict, fields
 import hashlib
 import io
-import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 
-from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding,
-                    MarketSnapshot, Portfolio, Quote, currency_code, parse_manual_amount)
+from portfolio.models import (AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding,
+                    MarketData, Portfolio, Quote, currency_code, parse_manual_amount)
 
 
-SCRIPT_DIRECTORY = Path(__file__).resolve().parents[1]
-SNAPSHOT_DIRECTORY = SCRIPT_DIRECTORY / "snapshots"
+RESOURCE_DIRECTORY = Path(__file__).resolve().parents[1]
+SCRIPT_DIRECTORY = (Path(os.environ.get("APPIMAGE") or sys.executable).resolve().parent
+                    if getattr(sys, "frozen", False) else RESOURCE_DIRECTORY)
 
 
+_ASSET_DETAIL_COLUMNS = tuple(field.name for field in fields(AssetDetails))
 _CSV_COLUMNS = {
-    "asset_group.csv": ("parent", "asset_group", "target_allocation"),
+    "asset_group.csv": ("parent", "asset_group", "portfolio_allocation"),
     "asset.csv": ("asset_group", "ticker", "is_main", "shares"),
     "cash.csv": ("currency", "amount"),
     "manual_asset.csv": ("currency", "amount"),
@@ -52,7 +54,7 @@ def save_portfolio(portfolio, directory, expected_signature=None, *, group_origi
         "asset_group.csv": (("parent", "asset_group"), _allocation_rows(portfolio.allocation)),
         "asset.csv": ("ticker", [
             {"asset_group": holding.group, "ticker": holding.ticker,
-             "is_main": str(holding.is_main), "shares": str(holding.shares)}
+             "is_main": str(holding.is_main), "shares": str(holding.shares), **asdict(holding.details)}
             for holding in portfolio.holdings]),
         "cash.csv": ("currency", [
             {"currency": currency, "amount": str(amount)}
@@ -88,7 +90,7 @@ def load_portfolio_with_signature(directory):
         if flag not in ("true", "false"):
             raise ValueError(f"{row['ticker']}: is_main must be True or False")
         holdings.append(Holding(row["ticker"].strip(), row["asset_group"].strip(),
-                                int(row["shares"]), flag == "true"))
+                                int(row["shares"]), flag == "true", _asset_details(row)))
     manual_holdings = tuple(ManualHolding(parse_manual_amount(row["amount"]),
                                          row["currency"].strip()) for row in manual)
     portfolio = Portfolio(tuple(holdings), _read_allocation(groups),
@@ -98,53 +100,7 @@ def load_portfolio_with_signature(directory):
     return portfolio, _signature(contents)
 
 
-def load_snapshot(path):
-    with Path(path).open(encoding="utf-8") as stream:
-        data = json.load(stream, object_pairs_hook=lambda pairs: _unique(pairs, "JSON key"))
-    if (not isinstance(data, dict) or not {"quotes", "rates", "base_currency"} <= data.keys()
-            or not isinstance(data["quotes"], dict) or not isinstance(data["rates"], dict)
-            or any(not isinstance(quote, dict) or set(quote) != {"price", "currency"}
-                   for quote in data["quotes"].values())):
-        raise ValueError("Snapshot requires base_currency, a quotes object with price/currency, and a rates object")
-    return MarketSnapshot({ticker: Quote(**quote) for ticker, quote in data["quotes"].items()},
-                          data["rates"], data["base_currency"], data.get("fetched_at"))
-
-
-def save_snapshot(snapshot, path):
-    """Atomically save prices in snapshots/ or outside the script's code tree."""
-    if not isinstance(snapshot, MarketSnapshot):
-        raise ValueError("Expected a MarketSnapshot")
-    if any(not isinstance(ticker, str) for ticker in snapshot.quotes):
-        raise ValueError("Snapshot quote tickers must be strings")
-    snapshot = MarketSnapshot(
-        {ticker: Quote(quote.price, quote.currency) for ticker, quote in snapshot.quotes.items()},
-        snapshot.rates, snapshot.base_currency, snapshot.fetched_at)
-    data = {"base_currency": snapshot.base_currency,
-            "quotes": {ticker: {"price": quote.price, "currency": quote.currency}
-                       for ticker, quote in snapshot.quotes.items()},
-            "rates": dict(snapshot.rates)}
-    if snapshot.fetched_at is not None:
-        data["fetched_at"] = snapshot.fetched_at
-    serialized = (json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
-    try:
-        path = Path(path).expanduser().resolve()
-    except RuntimeError as error:
-        raise ValueError(f"Could not resolve snapshot path: {error}") from error
-    code_directory = SCRIPT_DIRECTORY.resolve()
-    # Keep the allowlist at the literal snapshots directory. Resolving that
-    # directory could turn a symlink into permission to overwrite source files.
-    snapshot_directory = code_directory / "snapshots"
-    if path.is_relative_to(code_directory) and not path.is_relative_to(snapshot_directory):
-        raise ValueError(f"Save snapshots in {SNAPSHOT_DIRECTORY} or outside the script directory")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _stage(path, serialized)
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def fetch_snapshot(portfolio, base_currency="EUR"):
+def fetch_market_data(portfolio, base_currency="EUR"):
     """Fetch each quote and each required currency-to-base rate exactly once."""
     import yfinance as yf
 
@@ -163,7 +119,7 @@ def fetch_snapshot(portfolio, base_currency="EUR"):
             rates[currency] = yf.Ticker(f"{currency}{base_currency}=X").fast_info["last_price"]
         except Exception as error:
             raise ValueError(f"Could not price {currency}/{base_currency}: {error}") from error
-    return MarketSnapshot(quotes, rates, base_currency, datetime.now(timezone.utc).isoformat())
+    return MarketData(quotes, rates, base_currency)
 
 
 def _read_csv(name, contents):
@@ -222,6 +178,8 @@ def _csv_bytes(name, contents, key, rows, original_keys=None):
             if value in existing:
                 raise ValueError(f"{name}: duplicate {key}: {value}")
             existing[value] = row
+    if name == "asset.csv":
+        columns.extend(column for column in _ASSET_DETAIL_COLUMNS if column not in columns)
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
@@ -232,13 +190,16 @@ def _csv_bytes(name, contents, key, rows, original_keys=None):
     return stream.getvalue().encode("utf-8")
 
 
+def _asset_details(row):
+    values = {name: row.get(name, "") for name in _ASSET_DETAIL_COLUMNS}
+    ter = values["ter"].strip()
+    values["ter"] = float(ter) if ter else None
+    return AssetDetails(**values)
+
+
 def _allocation_rows(allocation):
-    rows = [{"parent": "", "asset_group": root, "target_allocation": str(target)}
-            for root, target in allocation.top.items()]
-    rows.extend({"parent": root, "asset_group": child, "target_allocation": str(target)}
-                for root, children in allocation.children.items()
-                for child, target in children.items())
-    return rows
+    return [{"parent": parent, "asset_group": name, "portfolio_allocation": str(target)}
+            for parent, weights in allocation.weights.items() for name, target in weights.items()]
 
 
 def _allocation_origins(group_origins):
@@ -249,15 +210,13 @@ def _allocation_origins(group_origins):
 
 def _read_allocation(rows):
     values = _unique((((row["parent"].strip(), row["asset_group"].strip()),
-                        float(row["target_allocation"])) for row in rows), "allocation target")
-    top = {child: value for (parent, child), value in values.items() if not parent}
-    children = {root: {} for root in (STOCK_MARKET, TREASURY, CASH)}
-    for (parent, child), value in values.items():
-        if parent:
-            if parent not in children:
-                raise ValueError(f"Unknown allocation parent: {parent}")
-            children[parent][child] = value
-    return AllocationTargets(top, children)
+                        float(row["portfolio_allocation"])) for row in rows), "allocation target")
+    weights = {parent: {} for parent in (STOCK_MARKET, TREASURY, CASH)}
+    for (parent, name), value in values.items():
+        if parent not in weights:
+            raise ValueError(f"Unknown allocation parent: {parent}")
+        weights[parent][name] = value
+    return AllocationTargets(weights)
 
 
 def _stage(path, contents):

@@ -1,7 +1,8 @@
 """Immutable inputs and results. All monetary values use explicit currencies."""
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from math import fsum, isclose, isfinite
 from numbers import Integral, Real
@@ -41,40 +42,80 @@ def identifier(value, name):
     return value
 
 
+def allocation_name(category, name):
+    """Validate a stock class or normalize a currency within its category."""
+    if category not in ALLOCATION_BRANCHES:
+        raise ValueError('Allocation category must be Stock market, MÁK, or Cash.')
+    if category == STOCK_MARKET:
+        name = identifier(name, 'Asset class')
+        if name in ALLOCATION_BRANCHES:
+            raise ValueError('This name is reserved for an allocation category.')
+    else:
+        name = currency_code(name)
+        if category == TREASURY and name not in ('EUR', 'HUF'):
+            raise ValueError('MÁK targets must use EUR or HUF.')
+    return name
+
+
+def percentage(value):
+    value = number(value, 'Target percentage', minimum=0)
+    if value > 100:
+        raise ValueError('Target percentages cannot exceed 100%.')
+    return value
+
+
+def current_values(holdings, manual_holdings, cash, market, *, parent=None):
+    """Value holdings by allocation leaf, without requiring valid allocation targets.
+
+    A selected parent only prices that branch; zero positions need no quote
+    or exchange rate. Signed cash balances remain signed.
+    """
+    if parent not in (None, STOCK_MARKET, TREASURY, CASH):
+        raise ValueError(f'Unknown allocation category: {parent!r}')
+    parts = defaultdict(list)
+    if parent in (None, STOCK_MARKET):
+        for holding in holdings:
+            value = holding.shares * market.price(holding.ticker) if holding.shares else 0.
+            parts[STOCK_MARKET, holding.group].append(value)
+    if parent in (None, TREASURY):
+        for holding in manual_holdings:
+            value = market.value(holding.amount, holding.currency) if holding.amount else 0.
+            parts[TREASURY, holding.currency].append(value)
+    if parent in (None, CASH):
+        for currency, amount in cash.items():
+            parts[CASH, currency].append(market.value(amount, currency) if amount else 0.)
+    return {key: fsum(values) for key, values in parts.items()}
+
+
 @dataclass(frozen=True)
 class AllocationTargets:
-    """Percentages of total wealth and percentages within each allocation branch."""
+    """Every asset target is a percentage of total portfolio value."""
 
-    top: Mapping[str, float]
-    children: Mapping[str, Mapping[str, float]]
+    weights: Mapping[str, Mapping[str, float]]
 
     def __post_init__(self):
-        top = _percentages(self.top, "Target")
-        if set(top) != set(ALLOCATION_BRANCHES):
-            raise ValueError("Top-level targets must describe Stock market, MÁK, and Cash")
-        if not isclose(fsum(top.values()), 100, abs_tol=1e-8, rel_tol=0):
-            raise ValueError(_total_error('Portfolio targets', fsum(top.values())))
-        if set(self.children) != set(ALLOCATION_BRANCHES):
-            raise ValueError("Child targets must describe every allocation branch")
-        children = {}
+        if set(self.weights) != set(ALLOCATION_BRANCHES):
+            raise ValueError("Targets must describe Stock market, MÁK, and Cash")
+        weights = {}
         for branch in ALLOCATION_BRANCHES:
-            normalize = currency_code if branch != STOCK_MARKET else lambda value: identifier(value, "Group")
-            values = _percentages(self.children[branch], "Child target", normalize)
-            if branch == TREASURY and not set(values) <= {"EUR", "HUF"}:
-                raise ValueError("MÁK targets must use EUR or HUF")
-            total = fsum(values.values())
-            valid_total = isclose(total, 100, abs_tol=1e-8, rel_tol=0)
-            if not valid_total and not (top[branch] == 0 and total == 0):
-                raise ValueError(_total_error(f'{branch} targets', total))
-            children[branch] = MappingProxyType(values)
-        object.__setattr__(self, "top", MappingProxyType({branch: top[branch] for branch in ALLOCATION_BRANCHES}))
-        object.__setattr__(self, "children", MappingProxyType(children))
+            values = {}
+            for name, value in self.weights[branch].items():
+                name = allocation_name(branch, name)
+                if name in values:
+                    raise ValueError(f'Duplicate target: {name}')
+                values[name] = percentage(value)
+            weights[branch] = MappingProxyType(values)
+        total = fsum(value for values in weights.values() for value in values.values())
+        if not isclose(total, 100, abs_tol=1e-8, rel_tol=0):
+            shown_total = Decimal(str(total)).normalize()
+            difference = abs(100 - shown_total).normalize()
+            change = f'{"add" if total < 100 else "reduce by"} {difference:f}%'
+            raise ValueError(f'Portfolio targets total {shown_total:f}%: {change}. Targets must sum to 100%.')
+        object.__setattr__(self, "weights", MappingProxyType(weights))
 
     @property
-    def effective(self):
-        return MappingProxyType({(branch, child): self.top[branch] * share / 100
-                                 for branch, children in self.children.items()
-                                 for child, share in children.items()})
+    def totals(self):
+        return MappingProxyType({branch: fsum(values.values()) for branch, values in self.weights.items()})
 
 
 def parse_manual_amount(text):
@@ -97,23 +138,55 @@ def parse_manual_amount(text):
 
 
 @dataclass(frozen=True)
+class AssetDetails:
+    """Optional instrument information; TER is a percentage, not a fraction."""
+
+    isin: str = ""
+    exchange: str = ""
+    currency: str = ""
+    ter: float | None = None
+    name: str = ""
+    ibkr_name: str = ""
+
+    def __post_init__(self):
+        for name in ("isin", "exchange", "currency", "name", "ibkr_name"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"Asset {name} must be text")
+            object.__setattr__(self, name, value.strip())
+        if self.isin:
+            isin = self.isin.upper()
+            if not self.isin.isascii() or not _valid_isin(isin):
+                raise ValueError("ISIN must have 12 characters and a valid check digit")
+            object.__setattr__(self, "isin", isin)
+        if self.currency:
+            object.__setattr__(self, "currency", currency_code(self.currency))
+        if self.ter is not None:
+            ter = number(self.ter, "TER percentage", minimum=0)
+            if ter > 100:
+                raise ValueError("TER percentage cannot exceed 100")
+            object.__setattr__(self, "ter", ter)
+
+
+@dataclass(frozen=True)
 class Holding:
     ticker: str
     group: str
     shares: int
     is_main: bool = True
+    details: AssetDetails = field(default_factory=AssetDetails)
 
     def __post_init__(self):
         identifier(self.ticker, "Ticker")
-        identifier(self.group, "Group")
-        if self.group == CASH:
-            raise ValueError("Cash is reserved for currency balances")
+        allocation_name(STOCK_MARKET, self.group)
         if (isinstance(self.shares, bool) or not isinstance(self.shares, Integral)
                 or not 0 <= self.shares <= MAX_SHARES):
             raise ValueError(f"Shares must be whole numbers between 0 and {MAX_SHARES}")
         object.__setattr__(self, "shares", int(self.shares))
         if not isinstance(self.is_main, bool):
             raise ValueError("is_main must be a boolean")
+        if not isinstance(self.details, AssetDetails):
+            raise ValueError("Holding details must be AssetDetails")
 
 
 @dataclass(frozen=True)
@@ -175,12 +248,12 @@ class Portfolio:
         if len(currencies) != len(manual):
             raise ValueError("MÁK holdings must have unique currencies")
         manual += tuple(ManualHolding(0, currency)
-                        for currency in allocation.children[TREASURY]
-                        if currency not in currencies and allocation.effective[TREASURY, currency] > 0)
+                        for currency in allocation.weights[TREASURY]
+                        if currency not in currencies and allocation.weights[TREASURY][currency] > 0)
         if len({holding.ticker for holding in holdings}) != len(holdings):
             raise ValueError("Listed tickers must be unique")
         listed_groups = {holding.group for holding in holdings}
-        if listed_groups != allocation.children[STOCK_MARKET].keys():
+        if listed_groups != allocation.weights[STOCK_MARKET].keys():
             raise ValueError("Stock market targets must describe every listed asset group")
         for group in listed_groups:
             if sum(holding.is_main for holding in holdings if holding.group == group) != 1:
@@ -199,16 +272,16 @@ class Portfolio:
     @property
     def required_holdings(self):
         """Listed instruments that are held or can receive new purchases."""
-        targets = self.allocation.effective
+        targets = self.allocation.weights[STOCK_MARKET]
         return tuple(holding for holding in self.holdings
-                     if holding.shares or (holding.is_main and targets[STOCK_MARKET, holding.group] > 0))
+                     if holding.shares or (holding.is_main and targets[holding.group] > 0))
 
     @property
     def required_manual_holdings(self):
         """Treasury currencies that are held or can receive new purchases."""
-        targets = self.allocation.effective
+        targets = self.allocation.weights[TREASURY]
         return tuple(holding for holding in self.manual_holdings
-                     if holding.amount or targets.get((TREASURY, holding.currency), 0) > 0)
+                     if holding.amount or targets.get(holding.currency, 0) > 0)
 
     def required_currencies(self, quotes):
         """Currencies needed to value holdings, fund trades, and distribute cash."""
@@ -216,27 +289,19 @@ class Portfolio:
         currencies.update(quotes[holding.ticker].currency for holding in self.required_holdings
                           if holding.ticker in quotes)
         currencies.update(holding.currency for holding in self.required_manual_holdings)
-        # Cash preferences still distribute residual cash when the parent target is zero.
-        currencies.update(currency for currency, weight in self.allocation.children[CASH].items()
+        currencies.update(currency for currency, weight in self.allocation.weights[CASH].items()
                           if weight > 0)
         return currencies
 
 
 @dataclass(frozen=True)
-class MarketSnapshot:
+class MarketData:
     quotes: Mapping[str, Quote]
     rates: Mapping[str, float]  # base-currency units per currency unit
     base_currency: str = "EUR"
-    fetched_at: str | None = None  # Acquisition time, not the market's quote timestamp.
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self):
-        if self.fetched_at is not None:
-            try:
-                acquired = datetime.fromisoformat(self.fetched_at.replace("Z", "+00:00"))
-                if acquired.utcoffset() is None:
-                    raise ValueError
-            except (AttributeError, TypeError, ValueError) as error:
-                raise ValueError("Snapshot acquisition time must be a timezone-aware ISO timestamp") from error
         base = currency_code(self.base_currency)
         rates = {}
         for key, value in self.rates.items():
@@ -259,7 +324,7 @@ class MarketSnapshot:
         object.__setattr__(self, "quotes", MappingProxyType(quotes))
 
     def validate_portfolio(self, portfolio):
-        """Reject incomplete coverage before a snapshot is accepted or used."""
+        """Reject incomplete coverage before market data is accepted or used."""
         missing_quotes = sorted(holding.ticker for holding in portfolio.required_holdings
                                 if holding.ticker not in self.quotes)
         missing_rates = sorted(portfolio.required_currencies(self.quotes) - self.rates.keys())
@@ -335,18 +400,13 @@ class Plan:
         return fsum(value for (parent, _), value in self.allocation_values.items() if parent == CASH)
 
 
-def _percentages(values, name, normalize=lambda value: identifier(value, "Group")):
-    result = {}
-    for key, value in values.items():
-        key = normalize(key)
-        if key in result:
-            raise ValueError(f"Duplicate {name}: {key}")
-        result[key] = number(value, name, minimum=0)
-        if result[key] > 100:
-            raise ValueError("Target percentages cannot exceed 100")
-    return result
-
-
-def _total_error(name, total):
-    change = f'add {100 - total:g}%' if total < 100 else f'reduce by {total - 100:g}%'
-    return f'{name} total {total:g}%: {change}. Target percentages must sum to 100.'
+def _valid_isin(value):
+    if (len(value) != 12 or not value[:2].isalpha() or not value[:-1].isalnum()
+            or not value[-1].isdigit()):
+        return False
+    digits = ''.join(str(ord(char) - ord('A') + 10) if char.isalpha() else char for char in value)
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        digit = int(char) * (2 if index % 2 else 1)
+        total += digit // 10 + digit % 10
+    return total % 10 == 0

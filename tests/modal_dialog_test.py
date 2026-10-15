@@ -30,18 +30,18 @@ class ModalDialogTests(unittest.TestCase):
     def editor(self, kind):
         if kind == 'target':
             editor = AllocationEditor(self.root)
-            editor.set_rows([{'parent': '', 'group': group, 'target': target}
-                             for group, target in ((STOCK_MARKET, '60'), (TREASURY, '30'), (CASH, '10'))])
-            item = next(item for item, row in editor._rows.items() if row['group'] == CASH)
+            editor.set_rows([{'parent': category, 'group': group, 'target': target}
+                             for category, group, target in ((STOCK_MARKET, 'US', '60'), (TREASURY, 'EUR', '30'), (CASH, 'EUR', '10'))])
+            item = next(item for item, row in editor._rows.items() if row['parent'] == CASH)
             return editor, lambda: editor._edit(item), lambda: float(next(
-                row['target'] for row in editor.get_rows() if row['group'] == CASH))
-        parent = HoldingsView(self.root) if kind == 'combined' else self.root
+                row['target'] for row in editor.get_rows() if row['parent'] == CASH))
+        parent = HoldingsView(self.root) if kind == 'holdings' else self.root
         editor = DataTable(parent, [('amount', 'Amount', 100), ('currency', 'Currency', 80)],
                            choices={'currency': lambda: ('EUR', 'HUF')})
         editor.set_rows([{'amount': '10', 'currency': 'EUR'}])
-        if kind == 'combined':
+        if kind == 'holdings':
             parent.set_tables({CASH: editor})
-            parent.tree.selection_set(parent.tree.get_children()[0])
+            parent.tree.selection_set(next(iter(parent._sources)))
             open_dialog = parent._edit_selected
         else:
             open_dialog = lambda: editor._edit(editor.tree.get_children()[0])
@@ -59,7 +59,7 @@ class ModalDialogTests(unittest.TestCase):
 
     def test_editors_wait_for_mapping_then_grab_and_save(self):
         original = tk.Toplevel
-        for kind in ('table', 'target', 'combined'):
+        for kind in ('table', 'target', 'holdings'):
             with self.subTest(kind=kind):
                 editor, open_dialog, value = self.editor(kind)
                 grabs, dialogs = [], []
@@ -90,7 +90,7 @@ class ModalDialogTests(unittest.TestCase):
 
     def test_cancel_before_mapping_leaves_rows_unchanged(self):
         original = tk.Toplevel
-        for kind in ('table', 'target', 'combined'):
+        for kind in ('table', 'target', 'holdings'):
             with self.subTest(kind=kind):
                 editor, open_dialog, value = self.editor(kind)
 

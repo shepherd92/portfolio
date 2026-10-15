@@ -1,4 +1,4 @@
-"""Hierarchical targets round-trip without rewriting portfolio inputs on load."""
+"""Absolute asset targets round-trip without rewriting inputs on load."""
 
 import csv
 from pathlib import Path
@@ -8,20 +8,18 @@ import unittest
 from unittest.mock import Mock, patch
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, Portfolio
-import portfolio.storage as portfolio_io
-from portfolio.storage import (config_signature, fetch_snapshot, load_portfolio,
+from portfolio.storage import (config_signature, fetch_market_data, load_portfolio,
                           load_portfolio_with_signature, save_portfolio)
 
 
-class HierarchyStorageTests(unittest.TestCase):
+class AllocationStorageTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         self.allocation = AllocationTargets(
-            {STOCK_MARKET: 60, TREASURY: 30, CASH: 10},
-            {STOCK_MARKET: {"US": 100}, TREASURY: {"EUR": 40, "HUF": 60},
-             CASH: {"EUR": 20, "GBP": 80}})
+            {STOCK_MARKET: {"US": 60}, TREASURY: {"EUR": 12, "HUF": 18},
+             CASH: {"EUR": 2, "GBP": 8}})
         self.portfolio = Portfolio((Holding("A", "US", 4),), self.allocation, {"EUR": 20},
                                    (ManualHolding(0, "EUR"), ManualHolding(4000, "HUF")))
 
@@ -38,26 +36,28 @@ class HierarchyStorageTests(unittest.TestCase):
         for row in rows:
             row["note"] = "US metadata" if row["parent"] == STOCK_MARKET else "Other metadata"
         with (self.directory / "asset_group.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["parent", "asset_group", "target_allocation", "note"])
+            writer = csv.DictWriter(stream, fieldnames=["parent", "asset_group", "portfolio_allocation", "note"])
             writer.writeheader()
             writer.writerows(rows)
 
-    def test_roundtrip_stores_relative_targets_and_distinguishes_currency_parents(self):
+    def test_roundtrip_stores_absolute_targets_and_distinguishes_currency_parents(self):
         signature = save_portfolio(self.portfolio, self.directory)
         loaded, loaded_signature = load_portfolio_with_signature(self.directory)
         self.assertEqual(loaded, self.portfolio)
         self.assertEqual(loaded_signature, signature)
         self.assertEqual(signature, config_signature(self.directory))
-        targets = {(row["parent"], row["asset_group"]): float(row["target_allocation"])
+        targets = {(row["parent"], row["asset_group"]): float(row["portfolio_allocation"])
                    for row in self.rows()}
-        self.assertEqual(targets[(STOCK_MARKET, "US")], 100)
-        self.assertEqual(targets[(TREASURY, "EUR")], 40)
-        self.assertEqual(targets[(CASH, "EUR")], 20)
-        self.assertEqual(loaded.allocation.effective[(STOCK_MARKET, "US")], 60)
+        self.assertEqual(targets[(STOCK_MARKET, "US")], 60)
+        self.assertEqual(targets[(TREASURY, "EUR")], 12)
+        self.assertEqual(targets[(CASH, "EUR")], 2)
+        self.assertEqual(loaded.allocation.totals, {STOCK_MARKET: 60, TREASURY: 30, CASH: 10})
+        self.assertEqual(len(targets), 5)
+        self.assertTrue(all(parent for parent, _ in targets))
 
     def test_target_file_requires_parent_column(self):
         save_portfolio(self.portfolio, self.directory)
-        (self.directory / "asset_group.csv").write_text("asset_group,target_allocation\nUS,100\n")
+        (self.directory / "asset_group.csv").write_text("asset_group,portfolio_allocation\nUS,100\n")
         original = self.contents()
         for operation in (lambda: load_portfolio(self.directory),
                           lambda: save_portfolio(self.portfolio, self.directory)):
@@ -65,10 +65,9 @@ class HierarchyStorageTests(unittest.TestCase):
                 operation()
             self.assertEqual(self.contents(), original)
 
-    def test_hierarchical_rename_preserves_leaf_metadata_without_reusing_deleted_names(self):
+    def test_class_rename_preserves_leaf_metadata_without_reusing_deleted_names(self):
         self.write_metadata()
-        allocation = AllocationTargets(self.allocation.top,
-                                       {**self.allocation.children, STOCK_MARKET: {"Equities": 100}})
+        allocation = AllocationTargets({**self.allocation.weights, STOCK_MARKET: {"Equities": 60}})
         portfolio = Portfolio((Holding("A", "Equities", 4),), allocation, self.portfolio.cash,
                               self.portfolio.manual_holdings)
         save_portfolio(portfolio, self.directory, group_origins={"Equities": "US"})
@@ -78,14 +77,14 @@ class HierarchyStorageTests(unittest.TestCase):
         row = next(row for row in self.rows() if row["parent"] == STOCK_MARKET)
         self.assertEqual(row["note"], "")
 
-    def test_zero_parent_preserves_child_preferences_on_roundtrip(self):
-        allocation = AllocationTargets({STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
-                                       self.allocation.children)
+    def test_zero_targets_preserve_asset_definitions_on_roundtrip(self):
+        allocation = AllocationTargets({STOCK_MARKET: {"US": 100}, TREASURY: {"EUR": 0, "HUF": 0},
+                                        CASH: {"EUR": 0, "GBP": 0}})
         portfolio = Portfolio(self.portfolio.holdings, allocation, self.portfolio.cash,
                               self.portfolio.manual_holdings)
         save_portfolio(portfolio, self.directory)
         self.assertEqual(load_portfolio(self.directory), portfolio)
-        self.assertEqual(load_portfolio(self.directory).allocation.children[CASH]["GBP"], 80)
+        self.assertEqual(load_portfolio(self.directory).allocation.weights[CASH]["GBP"], 0)
 
     def test_duplicate_and_unknown_parents_fail_without_writing(self):
         save_portfolio(self.portfolio, self.directory)
@@ -93,8 +92,9 @@ class HierarchyStorageTests(unittest.TestCase):
         original = path.read_text(encoding="utf-8")
         # Read the column order generated by the writer, then add invalid rows.
         header = original.splitlines()[0].split(",")
-        for values in ({"parent": STOCK_MARKET, "asset_group": "US", "target_allocation": "1"},
-                       {"parent": "Other", "asset_group": "US", "target_allocation": "1"}):
+        for values in ({"parent": STOCK_MARKET, "asset_group": "US", "portfolio_allocation": "1"},
+                       {"parent": "Other", "asset_group": "US", "portfolio_allocation": "1"},
+                       {"parent": "", "asset_group": STOCK_MARKET, "portfolio_allocation": "0"}):
             path.write_text(original + ",".join(values[column] for column in header) + "\n",
                             encoding="utf-8")
             before = self.contents()
@@ -118,43 +118,40 @@ class HierarchyStorageTests(unittest.TestCase):
         }[name]))
         portfolio = Portfolio(self.portfolio.holdings, self.allocation, {"EUR": 20})
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
-            snapshot = fetch_snapshot(portfolio)
+            market = fetch_market_data(portfolio)
         self.assertEqual([call.args[0] for call in ticker.call_args_list],
                          ["A", "GBPEUR=X", "HUFEUR=X"])
-        self.assertEqual(set(snapshot.quotes), {"A"})
-        self.assertEqual(dict(snapshot.rates), {"EUR": 1, "GBP": 1.2, "HUF": .0025})
+        self.assertEqual(set(market.quotes), {"A"})
+        self.assertEqual(dict(market.rates), {"EUR": 1, "GBP": 1.2, "HUF": .0025})
 
     def test_target_only_fx_failure_names_the_required_pair(self):
-        allocation = AllocationTargets({STOCK_MARKET: 0, TREASURY: 0, CASH: 100},
-                                       {STOCK_MARKET: {}, TREASURY: {}, CASH: {"GBP": 100}})
+        allocation = AllocationTargets({STOCK_MARKET: {}, TREASURY: {}, CASH: {"GBP": 100}})
         portfolio = Portfolio((), allocation, {"EUR": 10})
         ticker = Mock(side_effect=OSError("offline"))
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
             with self.assertRaisesRegex(ValueError, "GBP/EUR"):
-                fetch_snapshot(portfolio)
+                fetch_market_data(portfolio)
 
     def test_inactive_target_currencies_do_not_require_fx(self):
-        allocation = AllocationTargets({STOCK_MARKET: 0, TREASURY: 0, CASH: 100},
-                                       {STOCK_MARKET: {}, TREASURY: {"HUF": 100},
+        allocation = AllocationTargets({STOCK_MARKET: {}, TREASURY: {"HUF": 0},
                                         CASH: {"EUR": 100, "XYZ": 0}})
         portfolio = Portfolio((), allocation, {"EUR": 10})
         ticker = Mock(side_effect=AssertionError("Unused currency must not be fetched"))
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
-            snapshot = fetch_snapshot(portfolio)
+            market = fetch_market_data(portfolio)
         ticker.assert_not_called()
-        self.assertEqual(dict(snapshot.rates), {"EUR": 1})
+        self.assertEqual(dict(market.rates), {"EUR": 1})
 
-    def test_zero_cash_parent_still_fetches_positive_residual_currency_targets(self):
-        allocation = AllocationTargets({STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
-                                       {STOCK_MARKET: {"US": 100}, TREASURY: {}, CASH: {"GBP": 100}})
+    def test_zero_cash_target_does_not_fetch_unused_currency(self):
+        allocation = AllocationTargets({STOCK_MARKET: {"US": 100}, TREASURY: {}, CASH: {"GBP": 0}})
         portfolio = Portfolio(self.portfolio.holdings, allocation, {"EUR": 10})
         ticker = Mock(side_effect=lambda name: SimpleNamespace(fast_info={
             "A": {"last_price": 30, "currency": "EUR"}, "GBPEUR=X": {"last_price": 1.2},
         }[name]))
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
-            snapshot = fetch_snapshot(portfolio)
-        self.assertEqual([call.args[0] for call in ticker.call_args_list], ["A", "GBPEUR=X"])
-        self.assertEqual(dict(snapshot.rates), {"EUR": 1, "GBP": 1.2})
+            market = fetch_market_data(portfolio)
+        self.assertEqual([call.args[0] for call in ticker.call_args_list], ["A"])
+        self.assertEqual(dict(market.rates), {"EUR": 1})
 
 
 if __name__ == "__main__":

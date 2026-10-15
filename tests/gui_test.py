@@ -1,7 +1,7 @@
 """Real Tk widget tests. Run with REBALANCE_GUI_TESTS=1 under a display/Xvfb."""
 
 import csv
-import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 from ui.app import MODES, PortfolioApp
 from ui.widgets import PieChart
-from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, MarketSnapshot, Portfolio, Quote
-from portfolio.storage import SNAPSHOT_DIRECTORY, load_portfolio, save_portfolio, save_snapshot
+from portfolio.models import AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, MarketData, Portfolio, Quote
+from portfolio.storage import load_portfolio, save_portfolio
 
 
 @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1', 'GUI tests require REBALANCE_GUI_TESTS=1 and a display')
@@ -25,24 +25,24 @@ class GuiTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         allocation = AllocationTargets(
-            {STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
             {STOCK_MARKET: {'Stocks': 50, 'Bonds': 50}, TREASURY: {'EUR': 0, 'HUF': 0}, CASH: {'EUR': 0}})
         self.portfolio = Portfolio((Holding('MAIN', 'Stocks', 3), Holding('OLD', 'Stocks', 2, False),
                                     Holding('BOND', 'Bonds', 5)), allocation, {'EUR': 20},
                                    (ManualHolding(0, 'EUR'),))
         save_portfolio(self.portfolio, self.directory)
         self.portfolio = load_portfolio(self.directory)
-        self.market = MarketSnapshot({ticker: Quote(price, 'EUR') for ticker, price in
+        self.market = MarketData({ticker: Quote(price, 'EUR') for ticker, price in
                                      {'MAIN': 10, 'OLD': 5, 'BOND': 10, 'NEW': 20}.items()}, {})
-        self.snapshot = self.directory / 'prices.json'
-        save_snapshot(self.market, self.snapshot)
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = PortfolioApp(self.root, self.directory, snapshot_path=self.snapshot)
-        self.addCleanup(self.cleanup_root)
-        self.hierarchical_portfolio = self.app.portfolio()
         self.errors = patch('ui.app.messagebox.showerror').start()
         self.addCleanup(patch.stopall)
+        patch('ui.app.fetch_market_data', return_value=self.market).start()
+        patch('ui.app.fetch_asset_details', return_value=AssetDetails()).start()
+        self.app = PortfolioApp(self.root, self.directory)
+        self.addCleanup(self.cleanup_root)
+        self.finish_worker()
+        self.loaded_portfolio = self.app.portfolio()
 
     def cleanup_root(self):
         self.app.dirty = False
@@ -64,8 +64,8 @@ class GuiTests(unittest.TestCase):
         self.app.class_table.set_rows(rows)
         self.app._classes_changed('edit', old, normalized)
 
-    def set_targets(self, *, top=None, stock=None, treasury=None, cash=None):
-        changes = {'': top, STOCK_MARKET: stock, TREASURY: treasury, CASH: cash}
+    def set_targets(self, *, stock=None, treasury=None, cash=None):
+        changes = {STOCK_MARKET: stock, TREASURY: treasury, CASH: cash}
         rows = self.app.target_table.get_rows()
         for parent, values in changes.items():
             if values is not None:
@@ -75,12 +75,12 @@ class GuiTests(unittest.TestCase):
         self.app.target_table.set_rows(rows)
         self.app._edited()
 
-    def reopen_app(self, *, snapshot_path=None):
+    def reopen_app(self):
         self.app.dirty = False
         self.app.close()
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = PortfolioApp(self.root, self.directory, snapshot_path=snapshot_path)
+        self.app = PortfolioApp(self.root, self.directory)
 
     def test_startup_refreshes_once_in_background_without_changing_inputs(self):
         before = {path: path.read_bytes() for path in self.directory.glob('*.csv')}
@@ -90,7 +90,7 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(portfolio, self.portfolio)
             self.assertEqual(base, 'EUR')
             return self.market
-        with patch('ui.app.fetch_snapshot', side_effect=fetch) as request:
+        with patch('ui.app.fetch_market_data', side_effect=fetch) as request:
             self.reopen_app()
             self.assertTrue(self.app.busy)
             self.finish_worker()
@@ -98,32 +98,24 @@ class GuiTests(unittest.TestCase):
             request.assert_called_once()
         self.assertNotEqual(worker_threads, [threading.get_ident()])
         self.assertEqual(self.app.market, self.market)
-        self.assertIn('110 EUR', self.app.summary.get())
+        self.assertIn('110 EUR', self.app.current_title.get())
         self.assertFalse(self.app.dirty)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
 
-    def test_startup_with_explicit_snapshot_stays_offline(self):
-        with patch('ui.app.fetch_snapshot') as request:
-            self.reopen_app(snapshot_path=self.snapshot)
-            self.root.update()
-            request.assert_not_called()
-        self.assertFalse(self.app.busy)
-        self.assertEqual(self.app.market, self.market)
-        self.assertIn('Snapshot:', self.app.source.get())
-
     def test_failed_startup_refresh_leaves_app_available_for_retry(self):
-        with patch('ui.app.fetch_snapshot', side_effect=[ValueError('Network unavailable'), self.market]) as request:
+        with patch('ui.app.fetch_market_data', side_effect=[ValueError('Network unavailable'), self.market]) as request:
             self.reopen_app()
             self.finish_worker()
             self.assertIsNone(self.app.market)
             self.assertTrue(self.app.holdings_table._enabled)
-            self.assertEqual(str(self.app.refresh_button.cget('state')), 'normal')
+            self.assertEqual(str(self.app.generate_button.cget('state')), 'normal')
             self.assertIn('Network unavailable', self.app.status.get())
-            self.app.refresh_prices()
+            self.app.generate_plan()
             self.finish_worker()
             self.assertEqual(request.call_count, 2)
+            self.assertIsNotNone(self.app.plan)
         self.assertEqual(self.app.market, self.market)
-        self.errors.assert_called_once()
+        self.errors.assert_not_called()
 
     def test_close_during_automatic_refresh_does_not_touch_destroyed_widgets(self):
         gate, completed = threading.Event(), threading.Event()
@@ -132,7 +124,7 @@ class GuiTests(unittest.TestCase):
             gate.wait(2)
             completed.set()
             return self.market
-        with patch('ui.app.fetch_snapshot', side_effect=fetch):
+        with patch('ui.app.fetch_market_data', side_effect=fetch):
             self.reopen_app()
             self.assertTrue(self.app.busy)
             self.app.close()
@@ -142,15 +134,14 @@ class GuiTests(unittest.TestCase):
         self.assertIsNone(self.app.market)
 
     def test_startup_values_and_matching_chart_colors(self):
-        self.assertEqual(dict(self.app.portfolio().allocation.top), {STOCK_MARKET: 100, TREASURY: 0, CASH: 0})
+        self.assertEqual(dict(self.app.portfolio().allocation.totals), {STOCK_MARKET: 100, TREASURY: 0, CASH: 0})
         self.assertEqual(self.app.current_chart._data, {STOCK_MARKET: 90, CASH: 20})
-        self.assertEqual(self.app.target_chart._data, {STOCK_MARKET: 100, CASH: 0})
+        self.assertEqual(self.app.target_chart._data, {STOCK_MARKET: 100, CASH: 0, TREASURY: 0})
         self.assertEqual(self.app.current_chart._colors, self.app.target_chart._colors)
-        self.assertIn('110 EUR', self.app.summary.get())
+        self.assertIn('110 EUR', self.app.current_title.get())
 
     def test_load_edit_and_save_preserve_numeric_precision(self):
         allocation = AllocationTargets(
-            {STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
             {STOCK_MARKET: {name: 100 / 3 for name in ('A', 'B', 'C')}, TREASURY: {}, CASH: {'EUR': 0}})
         portfolio = Portfolio(tuple(Holding(name, name, 1) for name in ('A', 'B', 'C')),
                               allocation, {'EUR': 123.12345678912345})
@@ -190,14 +181,6 @@ class GuiTests(unittest.TestCase):
                     notes = {row['asset_group']: row['note'] for row in csv.DictReader(stream)}
                 self.assertEqual(notes[name], 'Retirement')
 
-    def test_malformed_snapshot_is_reported_and_preserves_previous_market(self):
-        self.snapshot.write_text(json.dumps({'base_currency': 'EUR', 'rates': {},
-                                            'quotes': {'MAIN': {'price': 1, 'currency': []}}}))
-        with patch('ui.app.filedialog.askopenfilename', return_value=str(self.snapshot)):
-            self.app.load_market()
-        self.errors.assert_called_once()
-        self.assertEqual(self.app.market, self.market)
-
     def test_target_edit_immediately_updates_chart_and_invalidates_plan(self):
         self.app.generate_plan()
         self.finish_worker()
@@ -211,7 +194,7 @@ class GuiTests(unittest.TestCase):
     def test_invalid_target_total_does_not_appear_as_valid_pie(self):
         self.set_targets(stock={'Bonds': 40, 'Stocks': 40})
         self.assertEqual(self.app.target_chart._data, {})
-        self.assertIn(STOCK_MARKET, self.app.target_chart._empty_message)
+        self.assertIn('100%', self.app.target_chart._empty_message)
         self.app.generate_plan()
         self.assertFalse(self.app.busy)
         self.errors.assert_called()
@@ -230,7 +213,7 @@ class GuiTests(unittest.TestCase):
         old = next(row for row in self.app.class_table.get_rows() if row['group'] == 'Stocks')
         self.change_class(old, {'group': 'Equities', 'main_ticker': 'MAIN'})
         portfolio = self.app.portfolio()
-        self.assertEqual(portfolio.allocation.children[STOCK_MARKET]['Equities'], 50)
+        self.assertEqual(portfolio.allocation.weights[STOCK_MARKET]['Equities'], 50)
         self.assertTrue(all(h.group == 'Equities' for h in portfolio.holdings if h.ticker in ('MAIN', 'OLD')))
 
     def test_class_cannot_steal_another_groups_ticker_or_delete_holdings(self):
@@ -259,15 +242,18 @@ class GuiTests(unittest.TestCase):
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '-15'}])
         self.app._edited()
         self.assertEqual(sum(self.app.current_chart._data.values()), 90)
-        self.assertIn('75 EUR', self.app.summary.get())
-        self.assertIn('cash deficit', self.app.summary.get())
-        self.assertNotIn('\n', self.app.summary.get())
+        self.assertIn('75 EUR', self.app.current_title.get())
+        self.assertTrue(self.app.cash_deficit_note.grid_info())
+        self.app.chart_scope.set(STOCK_MARKET)
+        self.assertFalse(self.app.cash_deficit_note.grid_info())
+        self.assertEqual(self.app.current_title.get(), 'Current allocation · 90 EUR')
+        self.assertNotIn('\n', self.app.current_title.get())
 
     def test_cash_target_funds_sales_and_aggregates_currencies(self):
-        self.set_targets(top={STOCK_MARKET: 0, TREASURY: 0, CASH: 100}, cash={'EUR': 50, 'USD': 50})
+        self.set_targets(stock={'Stocks': 0, 'Bonds': 0}, cash={'EUR': 50, 'USD': 50})
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '10'}, {'currency': 'USD', 'amount': '20'}])
         self.app._edited()
-        self.app._accept_market(MarketSnapshot(self.market.quotes, {'USD': .5}), 'Test prices')
+        self.app._accept_market(MarketData(self.market.quotes, {'USD': .5}))
         self.assertEqual(self.app.current_chart._data[CASH], 20)
         self.app.mode.set(MODES[1])
         self.app.generate_plan()
@@ -278,31 +264,27 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.portfolio().cash, {'EUR': 10, 'USD': 20})
 
     def test_zero_rows_sort_last_after_loading_and_edits(self):
-        self.set_targets(top={STOCK_MARKET: 80, TREASURY: 0, CASH: 20},
-                         stock={'Stocks': 100, 'Bonds': 0}, cash={'EUR': 100})
+        self.set_targets(stock={'Stocks': 80, 'Bonds': 0}, cash={'EUR': 20})
         expected = ['Stocks', 'Bonds']
         children = [row['group'] for row in self.app.target_table.get_rows() if row['parent'] == STOCK_MARKET]
         self.assertEqual(children, ['Stocks', 'Bonds'])
-        self.assertEqual([row['group'] for row in self.app.class_table.get_rows()], expected)
+        table = self.app.class_table
+        self.assertEqual([table.tree.set(item, 'group') for item in table.tree.get_children()], expected)
         self.app.holdings_table.set_rows([{'ticker': 'A', 'group': 'Stocks', 'shares': '0'},
                                          {'ticker': 'B', 'group': 'Stocks', 'shares': '3'}])
-        self.assertEqual([row['ticker'] for row in self.app.holdings_table.get_rows()], ['B', 'A'])
+        table = self.app.holdings_table
+        self.assertEqual([table.tree.set(item, 'ticker') for item in table.tree.get_children()], ['B', 'A'])
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '0'}, {'currency': 'HUF', 'amount': '-50'}])
-        self.assertEqual([row['currency'] for row in self.app.cash_table.get_rows()], ['HUF', 'EUR'])
+        table = self.app.cash_table
+        self.assertEqual([table.tree.set(item, 'currency') for item in table.tree.get_children()], ['HUF', 'EUR'])
 
     def test_asset_classes_only_define_stock_representatives(self):
         self.assertEqual(set(self.app._group_names()), {'Stocks', 'Bonds'})
         for group in (CASH, TREASURY, STOCK_MARKET):
             with self.subTest(group=group), self.assertRaisesRegex(ValueError, 'reserved'):
                 self.app._validate_class({'group': group, 'main_ticker': 'BANK'}, None)
-        self.assertEqual(self.app.portfolio().allocation.top[CASH], 0)
+        self.assertEqual(self.app.portfolio().allocation.totals[CASH], 0)
 
-
-    def test_snapshot_dialogs_start_in_the_separate_directory(self):
-        for name, action in (('askopenfilename', self.app.load_market), ('asksaveasfilename', self.app.save_market)):
-            with patch('ui.app.filedialog.' + name, return_value='') as dialog:
-                action()
-                self.assertEqual(Path(dialog.call_args.kwargs['initialdir']), SNAPSHOT_DIRECTORY)
 
     def test_background_fetch_updates_widgets_only_on_main_thread(self):
         main_thread = threading.get_ident()
@@ -332,13 +314,22 @@ class GuiTests(unittest.TestCase):
         self.assertIn('unavailable', self.app.status.get())
         self.errors.assert_called_once()
 
-    def test_missing_prices_and_changed_base_currency_clear_plan(self):
-        self.app.base_currency.set('USD')
-        self.assertIsNone(self.app.market)
-        self.assertIsNone(self.app.plan)
+    def test_failed_currency_refresh_clears_previous_prices_and_plan(self):
         self.app.generate_plan()
-        self.assertFalse(self.app.busy)
-        self.errors.assert_called_once()
+        self.finish_worker()
+        self.assertIsNotNone(self.app.plan)
+        with patch('ui.app.fetch_market_data', side_effect=ValueError('Market unavailable')) as fetch:
+            self.app.base_currency.set('USD')
+            self.assertTrue(self.app.busy)
+            self.assertIsNone(self.app.market)
+            self.assertIsNone(self.app.plan)
+            self.finish_worker()
+        fetch.assert_called_once_with(self.app.portfolio(), 'USD')
+        self.assertIsNone(self.app.market)
+        self.assertIn('unavailable', self.app.current_title.get())
+        self.assertIn('Market unavailable', self.app.status.get())
+        self.assertEqual(str(self.app.base_entry.cget('state')), 'readonly')
+        self.errors.assert_not_called()
 
     def test_save_and_external_edit_protection(self):
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '35'}])
@@ -372,6 +363,56 @@ class GuiTests(unittest.TestCase):
         table._edit(item)
         self.assertEqual(next(h.shares for h in self.app.portfolio().holdings if h.ticker == 'OLD'), 7)
 
+    def test_add_existing_zero_share_ticker_updates_the_hidden_holding(self):
+        old = next(row for row in self.app.class_table.get_rows() if row['group'] == 'Stocks')
+        self.change_class(old, {'group': 'Stocks', 'main_ticker': 'NEW'})
+        table = self.app.holdings_table
+        original_count = len(table.get_rows())
+        hidden = next(item for item in table.tree.get_children() if table.row(item)['ticker'] == 'NEW')
+        self.assertNotIn((table, hidden), self.app.real_allocations._sources.values())
+        failures = []
+
+        def add_dialog():
+            dialog = next(child for child in table.winfo_children() if isinstance(child, tk.Toplevel))
+            try:
+                form = dialog.winfo_children()[0]
+                fields = [widget for widget in form.winfo_children() if isinstance(widget, ttk.Entry)]
+                self.assertEqual(len(fields), 2)
+                for editor, value in zip(fields, ('NEW', '4')):
+                    if isinstance(editor, ttk.Combobox):
+                        editor.set(value)
+                    else:
+                        editor.delete(0, 'end')
+                        editor.insert(0, value)
+                save = next(widget for child in form.winfo_children() for widget in child.winfo_children()
+                            if isinstance(widget, ttk.Button) and widget.cget('text') == 'Save')
+                save.invoke()
+            except Exception as error:
+                failures.append(error)
+            finally:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+
+        self.root.after(30, add_dialog)
+        table.add()
+        if failures:
+            raise failures[0]
+        self.assertEqual(len(table.get_rows()), original_count)
+        self.assertEqual(table.row(hidden), {'ticker': 'NEW', 'group': 'Stocks', 'shares': '4'})
+        self.assertIn((table, hidden), self.app.real_allocations._sources.values())
+        self.assertTrue(next(h.is_main for h in self.app.portfolio().holdings if h.ticker == 'NEW'))
+
+    def test_home_add_resolves_catalogue_ticker_and_uses_its_asset_class(self):
+        table = self.app.holdings_table
+        item = self.app._existing_holding({'ticker': ' MAIN '})
+        self.assertIsNotNone(item)
+        row = self.app._validate_holding({'ticker': 'MAIN', 'group': 'Bonds', 'shares': '4'}, table.row(item))
+        self.assertEqual((row['ticker'], row['group'], row['shares']), ('MAIN', 'Stocks', '4'))
+        with self.assertRaisesRegex(ValueError, 'Assets'):
+            self.app._validate_holding({'ticker': 'UNKNOWN', 'shares': '4'}, None)
+        with self.assertRaisesRegex(ValueError, 'different asset'):
+            self.app._validate_holding({'ticker': 'OLD', 'shares': '4'}, table.row(item))
+
     def test_pie_handles_zero_singleton_and_many_groups(self):
         chart = self.app.current_chart
         chart.set_data({}, {}, 'Nothing invested')
@@ -381,6 +422,56 @@ class GuiTests(unittest.TestCase):
         chart.set_data({str(i): i + 1 for i in range(20)}, {})
         self.assertEqual(len(chart.canvas.find_all()), 20)
         self.assertAlmostEqual(sum(chart._fractions.values()), 1)
+
+    def test_pie_legend_scrolls_only_when_content_overflows(self):
+        window = tk.Toplevel(self.root)
+        self.addCleanup(window.destroy)
+        window.geometry('520x200')
+        chart = PieChart(window)
+        chart.pack(fill='both', expand=True)
+        scrollbar = next(widget for widget in chart.winfo_children() if isinstance(widget, ttk.Scrollbar))
+
+        def assert_fitted():
+            self.assertEqual(chart.legend.yview(), (0.0, 1.0))
+            self.assertEqual(chart.legend.canvasy(0), 0)
+            self.assertFalse(scrollbar.winfo_ismapped())
+            content_height = chart._legend_frame.winfo_reqheight() if chart._data else 0
+            self.assertEqual(chart.legend.coords(chart._legend_window),
+                             [0, (chart.legend.winfo_height() - content_height) / 2])
+
+        chart.set_data({'A': 1, 'B': 2}, {})
+        self.root.update()
+        assert_fitted()
+        for widget in (chart.legend, *chart._legend_frame.winfo_children()):
+            for event, options in (('<Button-4>', {}), ('<Button-5>', {}),
+                                   ('<MouseWheel>', {'delta': 120}), ('<MouseWheel>', {'delta': -120})):
+                widget.event_generate(event, **options)
+                assert_fitted()
+
+        chart.set_data({f'Asset {index}': 1 for index in range(12)}, {})
+        self.root.update()
+        self.assertTrue(scrollbar.winfo_ismapped())
+        self.assertEqual(chart.legend.coords(chart._legend_window), [0, 0])
+        chart._legend_frame.winfo_children()[0].event_generate('<Button-5>')
+        self.assertGreater(chart.legend.yview()[0], 0)
+        chart.legend.event_generate('<Button-4>')
+        self.assertEqual(chart.legend.yview()[0], 0)
+        chart.legend.event_generate('<MouseWheel>', delta=-120)
+        self.assertGreater(chart.legend.yview()[0], 0)
+
+        window.geometry('520x500')
+        self.root.update()
+        assert_fitted()
+        window.geometry('520x200')
+        self.root.update()
+        chart.legend.yview_moveto(1)
+        self.assertGreater(chart.legend.yview()[0], 0)
+        chart.set_data({'A': 1}, {})
+        self.root.update()
+        assert_fitted()
+        chart.set_data({}, {})
+        self.root.update()
+        assert_fitted()
 
     def test_modal_add_and_confirmed_remove_keep_class_inputs_consistent(self):
         table = self.app.class_table
@@ -398,14 +489,14 @@ class GuiTests(unittest.TestCase):
             save.invoke()
         self.root.after(30, add_dialog)
         table._edit()
-        self.assertEqual(self.app.portfolio().allocation.children[STOCK_MARKET]['Extra'], 0)
+        self.assertEqual(self.app.portfolio().allocation.weights[STOCK_MARKET]['Extra'], 0)
         self.assertIn(Holding('EXTRA', 'Extra', 0), self.app.portfolio().holdings)
         with patch('ui.widgets.messagebox.askyesno', return_value=False):
             table.remove_selected()
-        self.assertIn('Extra', self.app.portfolio().allocation.children[STOCK_MARKET])
+        self.assertIn('Extra', self.app.portfolio().allocation.weights[STOCK_MARKET])
         with patch('ui.widgets.messagebox.askyesno', return_value=True):
             table.remove_selected()
-        self.assertEqual(self.app.portfolio(), self.hierarchical_portfolio)
+        self.assertEqual(self.app.portfolio(), self.loaded_portfolio)
         self.assertNotIn('Extra', self.app.group_origins)
 
     def test_canceling_modal_edit_leaves_inputs_unchanged(self):
@@ -415,7 +506,7 @@ class GuiTests(unittest.TestCase):
             dialog.destroy()
         self.root.after(30, cancel_dialog)
         table._edit(table.tree.get_children()[0])
-        self.assertEqual(self.app.portfolio(), self.hierarchical_portfolio)
+        self.assertEqual(self.app.portfolio(), self.loaded_portfolio)
         self.assertFalse(self.app.dirty)
 
     def test_navigation_selling_choices_and_window_icon(self):
@@ -427,12 +518,12 @@ class GuiTests(unittest.TestCase):
         self.assertLess(labels[0].grid_info()['column'], self.app.mode_box.grid_info()['column'])
         self.assertEqual(tuple(self.app.mode_box.cget('values')), MODES)
         self.assertEqual([self.app.notebook.tab(tab, 'text') for tab in self.app.notebook.tabs()],
-                         ['Rebalance', 'Asset classes', 'Trade plan'])
+                         ['Home', 'Asset classes', 'Assets', 'Trade plan'])
         self.assertEqual(tuple(self.app.scope_box.cget('values')), ('All', STOCK_MARKET, TREASURY, CASH))
         self.assertEqual(self.app.chart_scope.get(), 'All')
         self.assertEqual((self.app.icon.width(), self.app.icon.height()), (128, 128))
-        self.assertIn(CASH, self.app.portfolio().allocation.top)
-        self.assertIn(TREASURY, self.app.portfolio().allocation.top)
+        self.assertIn(CASH, self.app.portfolio().allocation.totals)
+        self.assertIn(TREASURY, self.app.portfolio().allocation.totals)
 
     def edit_money_row(self, table, amount, currency, *, item=None, save=True):
         errors = []
@@ -495,7 +586,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.app.save())
         self.app._load_directory(self.directory)
         self.assertEqual(dict(self.app.portfolio().cash), {'EUR': 20, 'GBP': 250.75})
-        self.assertIn('GBP', self.app.portfolio().allocation.children[CASH])
+        self.assertNotIn('GBP', self.app.portfolio().allocation.weights[CASH])
         self.errors.assert_not_called()
 
     def test_whole_unit_tables_preserve_fractional_amounts_through_edits_and_save(self):
@@ -527,27 +618,63 @@ class GuiTests(unittest.TestCase):
         for control in (self.app.base_entry, self.app.mode_box):
             self.assertEqual(str(control.cget('state')), 'readonly')
         self.assertEqual(tuple(self.app.base_entry.cget('values')), ('EUR', 'USD', 'HUF'))
-        with patch('ui.app.fetch_snapshot', return_value=self.market):
+        with patch('ui.app.fetch_market_data', return_value=self.market):
             self.app.refresh_prices()
             for control in (self.app.base_entry, self.app.mode_box):
                 self.assertEqual(str(control.cget('state')), 'disabled')
             self.finish_worker()
         for control in (self.app.base_entry, self.app.mode_box):
             self.assertEqual(str(control.cget('state')), 'readonly')
-        self.app.base_entry.set('USD')
-        self.assertIsNone(self.app.market)
-        self.assertIsNone(self.app.plan)
-        self.assertIn('Base currency changed', self.app.source.get())
+        before = self.app.portfolio()
+        dollar_market = MarketData(self.market.quotes, {'EUR': 2}, 'USD')
+        with patch('ui.app.fetch_market_data', return_value=dollar_market) as fetch:
+            self.app.base_entry.set('USD')
+            self.assertTrue(self.app.busy)
+            self.assertIsNone(self.app.market)
+            self.assertIsNone(self.app.plan)
+            self.finish_worker()
+        fetch.assert_called_once_with(before, 'USD')
+        self.assertIs(self.app.market, dollar_market)
+        self.assertEqual(self.app.current_title.get(), 'Current allocation · 220 USD')
+        self.assertEqual(self.app.portfolio(), before)
+        self.assertFalse(self.app.dirty)
+        self.assertEqual(str(self.app.base_entry.cget('state')), 'readonly')
+
+    def test_currency_change_discards_a_late_result_for_the_old_currency(self):
+        started, gate, completed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        dollar_market = MarketData(self.market.quotes, {'EUR': 2}, 'USD')
+        def fetch(portfolio, base):
+            if base == 'EUR':
+                started.set()
+                gate.wait(2)
+                completed.set()
+                return self.market
+            return dollar_market
+        with patch('ui.app.fetch_market_data', side_effect=fetch) as request:
+            self.app.refresh_prices()
+            self.assertTrue(started.wait(2))
+            self.app.base_currency.set('USD')
+            self.finish_worker()
+            gate.set()
+            self.assertTrue(completed.wait(2))
+            self.root.after(120, self.root.quit)
+            self.root.mainloop()
+        self.assertEqual([call.args[1] for call in request.call_args_list], ['EUR', 'USD'])
+        self.assertIs(self.app.market, dollar_market)
+        self.assertIn('220 USD', self.app.current_title.get())
+        self.assertFalse(self.app.busy)
+        self.errors.assert_not_called()
 
     def test_add_treasury_manual_value_fx_and_save_roundtrip(self):
-        self.assertIn(TREASURY, self.app.portfolio().allocation.top)
+        self.assertIn(TREASURY, self.app.portfolio().allocation.totals)
         self.assertEqual(self.app.portfolio().manual_holdings, (ManualHolding(0, 'EUR'),))
         self.app.manual_table.set_rows([{'amount': '40000', 'currency': 'HUF'}])
         self.app._edited()
-        market = MarketSnapshot(self.market.quotes, {'HUF': .0025})
-        self.app._accept_market(market, 'Test prices')
+        market = MarketData(self.market.quotes, {'HUF': .0025})
+        self.app._accept_market(market)
         self.assertEqual(self.app.current_chart._data[TREASURY], 100)
-        self.assertIn('210 EUR', self.app.summary.get())
+        self.assertIn('210 EUR', self.app.current_title.get())
         self.assertTrue(self.app.save())
         self.app._load_directory(self.directory)
         self.assertEqual(self.app.portfolio().manual_holdings, (ManualHolding(40000, 'HUF'),))
@@ -555,10 +682,10 @@ class GuiTests(unittest.TestCase):
                          {'Stocks', 'Bonds'})
 
     def test_manual_holdings_participate_in_every_mode_and_preserve_inputs(self):
-        self.set_targets(top={STOCK_MARKET: 50, TREASURY: 50, CASH: 0}, treasury={'EUR': 100, 'HUF': 0})
+        self.set_targets(stock={'Stocks': 25, 'Bonds': 25}, treasury={'EUR': 50, 'HUF': 0})
         self.app.manual_table.set_rows([{'amount': '40', 'currency': 'EUR'}])
         self.app._edited()
-        self.app._accept_market(self.market, 'Test prices')
+        self.app._accept_market(self.market)
         original = self.app.portfolio()
         for mode in MODES:
             self.app.mode.set(mode)
@@ -603,12 +730,12 @@ class GuiTests(unittest.TestCase):
             table.remove_selected()
         self.assertEqual(table.get_rows(), [])
         self.assertEqual(self.app.portfolio().manual_holdings, ())
-        self.assertEqual(dict(self.app.portfolio().allocation.children[TREASURY]), {'EUR': 0, 'HUF': 0})
+        self.assertEqual(dict(self.app.portfolio().allocation.weights[TREASURY]), {'EUR': 0, 'HUF': 0})
         self.assertTrue(self.app.save())
         self.assertEqual(load_portfolio(self.directory), self.app.portfolio())
 
     def test_removing_targeted_treasury_balance_preserves_target_with_zero_holding(self):
-        self.set_targets(top={STOCK_MARKET: 50, TREASURY: 50, CASH: 0}, treasury={'EUR': 100, 'HUF': 0})
+        self.set_targets(stock={'Stocks': 25, 'Bonds': 25}, treasury={'EUR': 50, 'HUF': 0})
         table = self.app.manual_table
         table.set_rows([{'amount': '25.50', 'currency': 'EUR'}])
         self.app._edited()
@@ -616,15 +743,15 @@ class GuiTests(unittest.TestCase):
         with patch('ui.widgets.messagebox.askyesno', return_value=True):
             table.remove_selected()
         self.assertEqual(self.app.portfolio().manual_holdings, (ManualHolding(0, 'EUR'),))
-        self.assertEqual(self.app.portfolio().allocation.children[TREASURY]['EUR'], 100)
+        self.assertEqual(self.app.portfolio().allocation.weights[TREASURY]['EUR'], 50)
         self.assertEqual(table.get_rows(), [{'amount': '0.0', 'currency': 'EUR'}])
 
     def test_refresh_changes_fx_but_never_manual_values(self):
         self.app.manual_table.set_rows([{'amount': '40000', 'currency': 'HUF'}])
         self.app._edited()
         original = self.app.portfolio()
-        market = MarketSnapshot(self.market.quotes, {'HUF': .0026})
-        with patch('ui.app.fetch_snapshot', return_value=market) as fetch:
+        market = MarketData(self.market.quotes, {'HUF': .0026})
+        with patch('ui.app.fetch_market_data', return_value=market) as fetch:
             self.app.refresh_prices()
             self.finish_worker()
         fetch.assert_called_once_with(original, 'EUR')
@@ -637,8 +764,10 @@ class GuiTests(unittest.TestCase):
         self.root.deiconify()
         self.root.geometry('1050x760')
         self.root.update()
-        tree = self.app.manual_table.tree
-        box = tree.bbox(tree.get_children()[0])
+        tree = self.app.real_allocations.tree
+        item = next(item for item, (table, _) in self.app.real_allocations._sources.items()
+                    if table is self.app.manual_table)
+        box = tree.bbox(item)
         self.assertTrue(box, 'Manual values disappeared below the table header')
         self.assertGreaterEqual(box[3], 25)
         for chart in (self.app.current_chart, self.app.target_chart):
@@ -661,7 +790,7 @@ class GuiTests(unittest.TestCase):
         with patch('ui.app.filedialog.asksaveasfilename', return_value=str(path)):
             self.app.export_plan()
         self.assertIn('Planned wealth:', path.read_text())
-        self.app.time_limit.set('10')
+        self.app.mode.set('Allowed')
         self.assertIsNone(self.app.plan)
         for tree in (view.transactions, view.allocations, view.cash):
             self.assertEqual(tree.get_children(), ())
@@ -681,67 +810,46 @@ class GuiTests(unittest.TestCase):
         self.assertNotIn('Unused', [tree.item(item, 'text') for item in tree.get_children(root)])
         self.assertNotIn('Unused', self.app.current_chart._data)
         self.assertNotIn('Unused', self.app.target_chart._data)
-        self.assertEqual(self.app.portfolio().allocation.children[STOCK_MARKET]['Unused'], 0)
+        self.assertEqual(self.app.portfolio().allocation.weights[STOCK_MARKET]['Unused'], 0)
         self.assertTrue(self.app.save())
         loaded = load_portfolio(self.directory)
         self.assertIn(Holding('IDLE', 'Unused', 0), loaded.holdings)
-        self.assertEqual(loaded.allocation.children[STOCK_MARKET]['Unused'], 0)
+        self.assertEqual(loaded.allocation.weights[STOCK_MARKET]['Unused'], 0)
 
-    def test_held_zero_target_stays_visible_without_market_prices(self):
+    def test_held_zero_target_hides_from_editor_without_removing_holding(self):
         self.app.market = None
         self.set_targets(stock={'Stocks': 0, 'Bonds': 100})
         tree = self.app.target_table.tree
         root = next(item for item in tree.get_children() if tree.item(item, 'text') == STOCK_MARKET)
-        self.assertIn('Stocks', [tree.item(item, 'text') for item in tree.get_children(root)])
+        self.assertNotIn('Stocks', [tree.item(item, 'text') for item in tree.get_children(root)])
         self.app.chart_scope.set(STOCK_MARKET)
-        self.assertIn('Stocks', self.app.target_chart._data)
-        self.assertEqual(self.app.target_chart._data['Stocks'], 0)
+        self.assertNotIn('Stocks', self.app.target_chart._data)
 
-    def test_custom_time_limit_is_converted_before_background_planning(self):
-        self.app.time_limit.set('12.5')
-        self.assertEqual(self.app.time_entry.get(), '12')
-        original = self.app.portfolio()
-        from portfolio.planning import rebalance
-        with patch('ui.app.rebalance', wraps=rebalance) as planner:
-            self.app.generate_plan()
-            self.assertIn('12.5 min', self.app.status.get())
-            self.assertEqual(str(self.app.time_entry.cget('state')), 'disabled')
-            self.finish_worker()
-        planner.assert_called_once_with(original, self.market, allow_selling=False, time_limit=750)
-        self.assertEqual(str(self.app.time_entry.cget('state')), 'normal')
-        self.assertIsNotNone(self.app.plan)
-        self.app.time_limit.set('15')
-        self.assertIsNone(self.app.plan)
-        self.assertFalse(self.app.dirty)
+    def test_zero_target_holding_remains_only_in_current_category_chart(self):
+        self.set_targets(stock={'Stocks': 0, 'Bonds': 100})
+        self.app.chart_scope.set(STOCK_MARKET)
+        self.assertEqual(self.app.target_chart._data, {'Bonds': 100})
+        self.assertEqual(self.app.current_chart._data, {'Bonds': 50, 'Stocks': 40})
+        self.assertEqual(self.app.target_chart._colors, self.app.current_chart._colors)
+        self.app.chart_scope.set('All')
+        self.assertEqual(self.app.target_chart._data, {STOCK_MARKET: 100, CASH: 0, TREASURY: 0})
 
-    def test_focusing_a_fractional_time_limit_does_not_change_the_request(self):
-        self.app.time_limit.set('12.5')
-        revision = self.app.revision
-        self.app.time_entry.event_generate('<FocusIn>')
-        self.assertEqual(self.app.time_entry.get(), '12.5')
-        self.app.time_entry.event_generate('<FocusOut>')
-        self.assertEqual(self.app.time_entry.get(), '12')
-        self.assertEqual(self.app.time_limit.get(), '12.5')
-        self.assertEqual(self.app.revision, revision)
-        self.assertFalse(self.app.dirty)
-
-    def test_invalid_time_limit_does_not_start_background_planning(self):
-        with patch('ui.app.rebalance') as planner:
-            for value in ('0', '-2', 'nan', 'inf', '', '1e308'):
-                with self.subTest(value=value):
-                    self.app.time_limit.set(value)
-                    self.app.generate_plan()
-                    self.assertFalse(self.app.busy)
-            planner.assert_not_called()
-        self.assertEqual(self.errors.call_count, 6)
-
-    def test_parent_target_changes_preserve_children_and_show_effective_targets(self):
-        self.set_targets(top={STOCK_MARKET: 60, TREASURY: 30, CASH: 10},
-                         treasury={'EUR': 40, 'HUF': 60}, cash={'EUR': 100})
+    def test_absolute_leaf_targets_derive_category_totals(self):
+        self.set_targets(stock={'Stocks': 30, 'Bonds': 30},
+                         treasury={'EUR': 12, 'HUF': 18}, cash={'EUR': 10})
         allocation = self.app.portfolio().allocation
-        self.assertEqual(dict(allocation.children[STOCK_MARKET]), {'Bonds': 50, 'Stocks': 50})
-        self.assertEqual(allocation.effective[STOCK_MARKET, 'Stocks'], 30)
-        self.assertEqual(allocation.effective[TREASURY, 'HUF'], 18)
+        self.assertEqual(dict(allocation.weights[STOCK_MARKET]), {'Bonds': 30, 'Stocks': 30})
+        self.assertEqual(allocation.weights[STOCK_MARKET]['Stocks'], 30)
+        self.assertEqual(allocation.weights[TREASURY]['HUF'], 18)
+        self.assertEqual(dict(allocation.totals), {STOCK_MARKET: 60, TREASURY: 30, CASH: 10})
+        self.assertTrue(all(row['parent'] for row in self.app.target_table.get_rows()))
+        self.app.chart_scope.set(TREASURY)
+        self.assertEqual(self.app.target_chart._data, {'HUF': 18, 'EUR': 12})
+        self.assertAlmostEqual(self.app.target_chart._fractions['HUF'], .6)
+        self.assertAlmostEqual(self.app.target_chart._fractions['EUR'], .4)
+        labels = [child.cget('text') for child in self.app.target_chart._legend_frame.winfo_children()
+                  if isinstance(child, ttk.Label)]
+        self.assertEqual(labels, ['HUF', '18.0%', 'EUR', '12.0%'])
         visible = {row['currency'] for row in self.app.manual_table.get_rows()}
         self.assertIn('HUF', visible)
 
@@ -749,10 +857,10 @@ class GuiTests(unittest.TestCase):
         self.root.deiconify()
         before, revision = self.app.portfolio(), self.app.revision
         expected = {
-            'All': ({STOCK_MARKET: 90, CASH: 20}, {STOCK_MARKET: 100, CASH: 0}),
+            'All': ({STOCK_MARKET: 90, CASH: 20}, {STOCK_MARKET: 100, CASH: 0, TREASURY: 0}),
             STOCK_MARKET: ({'Bonds': 50, 'Stocks': 40}, {'Bonds': 50, 'Stocks': 50}),
             TREASURY: ({}, {}),
-            CASH: ({'EUR': 20}, {'EUR': 0}),
+            CASH: ({'EUR': 20}, {}),
         }
         tables = {STOCK_MARKET: self.app.holdings_table, TREASURY: self.app.manual_table,
                   CASH: self.app.cash_table}
@@ -766,44 +874,45 @@ class GuiTests(unittest.TestCase):
                 roots = {tree.item(item, 'text') for item in tree.get_children()}
                 self.assertEqual(roots, {STOCK_MARKET, TREASURY, CASH} if scope == 'All' else {scope})
                 self.assertEqual(self.app.real_allocations.scope, scope)
-                self.assertEqual(bool(self.app.real_allocations.tree.winfo_ismapped()), scope == 'All')
-                for category, table in tables.items():
-                    self.assertEqual(bool(table.winfo_ismapped()), scope == category)
+                holdings_tree = self.app.real_allocations.tree
+                self.assertTrue(holdings_tree.winfo_ismapped())
+                visible_categories = {holdings_tree.item(item, 'text') for item in holdings_tree.get_children()}
+                self.assertEqual(visible_categories, set(tables) if scope == 'All' else {scope})
+                self.assertTrue(all(not table.winfo_ismapped() for table in tables.values()))
                 self.assertFalse(self.app.dirty)
                 self.assertEqual(self.app.revision, revision)
                 self.assertEqual(self.app.portfolio(), before)
 
     def populate_multicurrency_values(self):
-        self.set_targets(top={STOCK_MARKET: 60, TREASURY: 30, CASH: 10},
-                         treasury={'EUR': 25, 'HUF': 75}, cash={'EUR': 40, 'HUF': 20, 'USD': 40})
+        self.set_targets(stock={'Stocks': 30, 'Bonds': 30},
+                         treasury={'EUR': 7.5, 'HUF': 22.5}, cash={'EUR': 4, 'HUF': 2, 'USD': 4})
         self.app.manual_table.set_rows([{'currency': 'EUR', 'amount': '100'},
                                         {'currency': 'HUF', 'amount': '40000'}])
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '20'},
                                       {'currency': 'HUF', 'amount': '4000'},
                                       {'currency': 'USD', 'amount': '40'}])
         self.app._edited()
-        self.app._accept_market(MarketSnapshot(self.market.quotes, {'HUF': .0025, 'USD': .5}), 'Fixture')
+        self.app._accept_market(MarketData(self.market.quotes, {'HUF': .0025, 'USD': .5}))
 
     def test_value_is_one_line_for_only_the_selected_scope(self):
         self.populate_multicurrency_values()
         for scope, value in [('All', 340), (STOCK_MARKET, 90), (TREASURY, 200), (CASH, 50)]:
             with self.subTest(scope=scope):
                 self.app.chart_scope.set(scope)
-                label = 'Total portfolio' if scope == 'All' else scope
-                self.assertEqual(self.app.summary.get(), f'{label} value: {value} EUR')
+                self.assertEqual(self.app.current_title.get(), f'Current allocation · {value} EUR')
                 self.assertAlmostEqual(sum(self.app.current_chart._data.values()), value)
 
-    def test_summary_rounds_display_without_rounding_values_or_percentages(self):
+    def test_heading_rounds_display_without_rounding_values_or_percentages(self):
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '20.75'}])
         self.set_targets(stock={'Stocks': 33.33, 'Bonds': 66.67})
-        self.assertEqual(self.app.summary.get(), 'Total portfolio value: 111 EUR')
+        self.assertEqual(self.app.current_title.get(), 'Current allocation · 111 EUR')
         self.app.chart_scope.set(CASH)
-        self.assertEqual(self.app.summary.get(), 'Cash value: 21 EUR')
+        self.assertEqual(self.app.current_title.get(), 'Current allocation · 21 EUR')
         self.assertEqual(self.app.current_chart._data, {'EUR': 20.75})
         self.assertEqual(self.app.portfolio().cash, {'EUR': 20.75})
         self.app.chart_scope.set(STOCK_MARKET)
         self.assertEqual(self.app.target_chart._data, {'Bonds': 66.67, 'Stocks': 33.33})
-        self.assertEqual(self.app.summary.get(), 'Stock market value: 90 EUR')
+        self.assertEqual(self.app.current_title.get(), 'Current allocation · 90 EUR')
 
     def test_saving_a_filtered_view_preserves_every_category(self):
         self.populate_multicurrency_values()
@@ -816,7 +925,7 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.chart_scope.get(), CASH)
         self.assertEqual(self.app.real_allocations.scope, CASH)
         self.assertEqual({row['parent'] for row in self.app.target_table.get_rows()},
-                         {'', STOCK_MARKET, TREASURY, CASH})
+                         {STOCK_MARKET, TREASURY, CASH})
 
     def test_changing_scope_preserves_completed_plan_and_export(self):
         self.app.generate_plan()
@@ -832,17 +941,13 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(str(self.app.export_button.cget('state')), 'normal')
             self.assertTrue(self.app.plan_view.allocations.get_children())
 
-    def test_incomplete_snapshot_preserves_previous_prices_and_plan(self):
+    def test_incomplete_refresh_preserves_previous_prices(self):
         self.populate_multicurrency_values()
         before = self.app.market
-        self.app.generate_plan()
-        self.finish_worker()
-        plan = self.app.plan
-        save_snapshot(MarketSnapshot(self.market.quotes, {'USD': .5}), self.snapshot)
-        with patch('ui.app.filedialog.askopenfilename', return_value=str(self.snapshot)):
-            self.app.load_market()
+        with patch('ui.app.fetch_market_data', return_value=MarketData(self.market.quotes, {'USD': .5})):
+            self.app.refresh_prices()
+            self.finish_worker()
         self.assertIs(self.app.market, before)
-        self.assertIs(self.app.plan, plan)
         self.assertIn('HUF', self.app.status.get())
         self.errors.assert_called_once()
 
@@ -850,15 +955,16 @@ class GuiTests(unittest.TestCase):
         self.app.manual_table.set_rows([{'currency': 'HUF', 'amount': '40000'}])
         self.app._edited()
         self.app.chart_scope.set(STOCK_MARKET)
-        self.assertIn('90 EUR', self.app.summary.get())
+        self.assertIn('90 EUR', self.app.current_title.get())
         self.app.chart_scope.set(TREASURY)
-        self.assertIn('unavailable', self.app.summary.get())
+        self.assertIn('unavailable', self.app.current_title.get())
         self.assertIn('HUF', self.app.current_chart._empty_message)
 
 
     def test_matrix_headers_and_geometry_at_minimum_window_size(self):
         self.root.deiconify()
         self.root.geometry('1050x760')
+        self.app.save_button.configure(text='Save inputs *')
         self.root.update()
 
         def descendants(widget):
@@ -866,12 +972,31 @@ class GuiTests(unittest.TestCase):
                 yield child
                 yield from descendants(child)
 
+        self.assertNotIn('Portfolio planner', [widget.cget('text') for widget in descendants(self.root)
+                                               if isinstance(widget, ttk.Label)])
+        buttons = (self.app.open_button, self.app.save_button)
+        self.assertEqual(self.app.open_button.cget('text'), 'Open directory')
+        self.assertEqual(len({button.winfo_rooty() for button in buttons}), 1)
+        self.assertTrue(all(button in set(descendants(self.app.portfolio_page)) for button in buttons))
         widgets = list(descendants(self.app.portfolio_page))
         labels = {widget.cget('text'): widget for widget in widgets if isinstance(widget, ttk.Label)}
         self.assertNotIn('All assets, including cash', labels)
         self.assertNotIn('Target allocations', labels)
         self.assertNotIn('Real allocations', labels)
-        left_header, right_header = labels['Target allocation'], labels['Current allocation']
+        left_header = labels['Target allocation']
+        headings = [widget for widget in widgets if isinstance(widget, ttk.Label)
+                    and str(widget.cget('textvariable')) == str(self.app.current_title)]
+        self.assertEqual(len(headings), 1)
+        right_header = headings[0]
+        source = next(widget for widget in widgets if isinstance(widget, ttk.Label)
+                      and str(widget.cget('textvariable')) == str(self.app.source))
+        self.assertNotIn('Refresh prices', [widget.cget('text') for widget in widgets
+                                             if isinstance(widget, ttk.Button)])
+        self.assertIs(source.master, self.app.scope_box.master)
+        self.assertGreater(source.winfo_rootx(),
+                           self.app.scope_box.winfo_rootx() + self.app.scope_box.winfo_width())
+        self.assertLessEqual(source.winfo_rooty(),
+                             self.app.scope_box.winfo_rooty() + self.app.scope_box.winfo_height())
         for header, chart in ((left_header, self.app.target_chart), (right_header, self.app.current_chart)):
             self.assertIs(header.master, self.app.matrix)
             self.assertLess(header.winfo_rooty(), chart.master.winfo_rooty())
@@ -881,59 +1006,73 @@ class GuiTests(unittest.TestCase):
         self.assertLess(self.app.target_chart.winfo_rooty(), self.app.target_table.winfo_rooty())
         self.assertLess(self.app.current_chart.winfo_rooty(), self.app.real_allocations.winfo_rooty())
         self.assertLess(self.app.target_table.winfo_rootx(), self.app.real_allocations.winfo_rootx())
-        summary = next(widget for widget in widgets if isinstance(widget, ttk.Label)
-                       and str(widget.cget('textvariable')) == str(self.app.summary))
-        self.assertLess(summary.winfo_rooty(), self.app.target_chart.winfo_rooty())
-        self.assertLessEqual(summary.winfo_rootx() + summary.winfo_width(),
-                             labels['Base currency'].winfo_rootx())
-        summary_font = ttk.Style(self.root).lookup(summary.cget('style'), 'font')
-        self.assertEqual(font.Font(root=self.root, font=summary_font).actual('weight'), 'bold')
-        summary_height = summary.winfo_height()
+        controls = (self.app.open_button, self.app.save_button, self.app.base_entry,
+                    self.app.scope_box, source)
+        for first, second in zip(controls, controls[1:]):
+            self.assertLess(first.winfo_rootx() + first.winfo_width(), second.winfo_rootx())
+        row_top = max(control.winfo_rooty() for control in controls)
+        row_bottom = min(control.winfo_rooty() + control.winfo_height() for control in controls)
+        self.assertLess(row_top, row_bottom)
+        self.assertLess(row_bottom, left_header.winfo_rooty())
+        self.assertEqual(self.app.base_entry.winfo_rooty(), self.app.scope_box.winfo_rooty())
+        heading_font = ttk.Style(self.root).lookup(right_header.cget('style'), 'font')
+        self.assertEqual(font.Font(root=self.root, font=heading_font).actual('weight'), 'bold')
+        heading_height = right_header.winfo_height()
         for panel in (self.app.target_panel, self.app.real_panel,
                       self.app.target_chart.master, self.app.current_chart.master):
-            self.assertFalse(any(isinstance(child, ttk.Label) for child in panel.winfo_children()))
-        for scope, tree in [('All', self.app.real_allocations.tree),
-                            (STOCK_MARKET, self.app.holdings_table.tree),
-                            (TREASURY, self.app.manual_table.tree), (CASH, self.app.cash_table.tree)]:
+            self.assertFalse(any(isinstance(child, ttk.Label) and child.winfo_ismapped()
+                                 for child in panel.winfo_children()))
+        tree = self.app.real_allocations.tree
+        for scope in ('All', STOCK_MARKET, TREASURY, CASH):
             self.app.chart_scope.set(scope)
             self.root.update()
-            self.assertEqual(summary.winfo_height(), summary_height)
-            self.assertNotIn('\n', self.app.summary.get())
+            self.assertEqual(right_header.winfo_height(), heading_height)
+            self.assertNotIn('\n', self.app.current_title.get())
             self.assertTrue(tree.winfo_ismapped())
             self.assertTrue(tree.bbox(tree.get_children()[0]))
             self.assertLessEqual(tree.winfo_rooty() + tree.winfo_height(),
                                  self.root.winfo_rooty() + self.root.winfo_height())
             for chart in (self.app.target_chart, self.app.current_chart):
                 self.assertGreaterEqual(chart.canvas.winfo_height(), 100)
-            for control in (summary, self.app.base_entry, self.app.scope_box, self.app.refresh_button,
-                            self.app.load_prices_button, self.app.save_prices_button):
+            for control in (right_header, source, self.app.base_entry, self.app.scope_box,
+                            self.app.open_button, self.app.save_button):
                 self.assertTrue(control.winfo_ismapped())
                 self.assertGreaterEqual(control.winfo_width(), control.winfo_reqwidth())
                 self.assertLessEqual(control.winfo_rootx() + control.winfo_width(),
                                      self.root.winfo_rootx() + self.root.winfo_width())
+        forint_market = MarketData(self.market.quotes, {'EUR': 400}, 'HUF')
+        with patch('ui.app.fetch_market_data', return_value=forint_market):
+            self.app.base_entry.set('HUF')
+            self.finish_worker()
+        self.root.update()
+        self.assertGreaterEqual(source.winfo_width(), source.winfo_reqwidth())
+        self.assertLessEqual(source.winfo_rootx() + source.winfo_width(),
+                             self.root.winfo_rootx() + self.root.winfo_width())
 
     def test_currency_targets_remain_after_balance_row_removed(self):
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '20'}, {'currency': 'GBP', 'amount': '0'}])
         self.app._edited()
-        self.assertEqual(self.app.portfolio().allocation.children[CASH]['GBP'], 0)
-        self.set_targets(top={STOCK_MARKET: 80, TREASURY: 0, CASH: 20}, cash={'EUR': 50, 'GBP': 50})
+        self.assertNotIn('GBP', self.app.portfolio().allocation.weights[CASH])
+        self.set_targets(stock={'Stocks': 40, 'Bonds': 40}, cash={'EUR': 10, 'GBP': 10})
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '20'}])
         self.app._edited()
-        self.assertEqual(self.app.portfolio().allocation.children[CASH]['GBP'], 50)
-        self.app.generate_plan()
-        self.finish_worker()
-        self.assertIsNone(self.app.plan)
-        self.assertIn('GBP', self.app.status.get())
+        self.assertEqual(self.app.portfolio().allocation.weights[CASH]['GBP'], 10)
+        with patch('ui.app.fetch_market_data', return_value=MarketData(self.market.quotes, {'GBP': 1.2})) as fetch:
+            self.app.generate_plan()
+            self.finish_worker()
+        fetch.assert_called_once_with(self.app.portfolio(), 'EUR')
+        self.assertIsNotNone(self.app.plan)
+        self.assertGreater(self.app.plan.cash['GBP'], 0)
 
     def test_treasury_chart_uses_fx_and_separate_currency_ratios(self):
-        self.set_targets(top={STOCK_MARKET: 60, TREASURY: 40, CASH: 0}, treasury={'EUR': 25, 'HUF': 75})
+        self.set_targets(stock={'Stocks': 30, 'Bonds': 30}, treasury={'EUR': 10, 'HUF': 30})
         self.app.manual_table.set_rows([{'currency': 'EUR', 'amount': '100'},
                                         {'currency': 'HUF', 'amount': '40000'}])
         self.app._edited()
-        self.app._accept_market(MarketSnapshot(self.market.quotes, {'HUF': .0025}), 'Fixture')
+        self.app._accept_market(MarketData(self.market.quotes, {'HUF': .0025}))
         self.app.chart_scope.set(TREASURY)
         self.assertEqual(self.app.current_chart._data, {'EUR': 100, 'HUF': 100})
-        self.assertEqual(self.app.target_chart._data, {'HUF': 75, 'EUR': 25})
+        self.assertEqual(self.app.target_chart._data, {'HUF': 30, 'EUR': 10})
         self.assertEqual(self.app.current_chart._fractions, {'EUR': .5, 'HUF': .5})
 
     def test_target_editor_keeps_selection_after_callback(self):
@@ -991,14 +1130,13 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(list(self.app.current_chart._data), list(self.app.target_chart._data))
 
     def test_price_timestamp_is_preserved_in_plan_context(self):
-        stamp = '2026-10-01T08:30:00+00:00'
-        self.app._accept_market(MarketSnapshot(self.market.quotes, {}, fetched_at=stamp), 'Snapshot')
-        self.assertIn('Fetched 2026-10-01', self.app.source.get())
+        stamp = datetime.now(timezone.utc)
+        self.app._accept_market(MarketData(self.market.quotes, {}, fetched_at=stamp))
+        expected = f'Fetched {stamp.astimezone():%Y-%m-%d %H:%M}'
+        self.assertEqual(self.app.source.get(), expected)
         self.app.generate_plan()
         self.finish_worker()
-        self.assertIn('Fetched 2026-10-01', self.app.plan_report)
-        self.app._accept_market(self.market, 'Untimed snapshot')
-        self.assertIn('Fetch time unknown', self.app.source.get())
+        self.assertIn(expected, self.app.plan_report)
 
 
 if __name__ == '__main__':

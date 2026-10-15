@@ -1,47 +1,50 @@
-"""Show the same editable holdings together or by allocation category."""
+"""An allocation tree that delegates holding edits to the canonical tables."""
 
+from collections import Counter
 import tkinter as tk
 from tkinter import ttk
 
 from portfolio.models import CASH, STOCK_MARKET, TREASURY
-from ui.widgets import AutoScrollbar, bind_shortcuts
+from ui.links import open_cell_link, quote_url
+from ui.sorting import TreeSort
+from ui.theme import MENU_STYLE
+from ui.widgets import AutoScrollbar, bind_shortcuts, retain_visible_selection, shade_allocation_groups
 
 
 class HoldingsView(ttk.Frame):
-    """A combined view delegates edits to the canonical category tables."""
+    """Show asset groups and their holdings consistently in every scope."""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.scope = 'All'
-        self._tables, self._sources = {}, {}
+        self._tables, self._sources, self._branches = {}, {}, {}
         self._enabled = True
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        self._combined = ttk.Frame(self)
-        self._combined.grid(row=0, column=0, sticky='nsew')
-        self._combined.columnconfigure(0, weight=1)
-        self._combined.rowconfigure(0, weight=1)
-        columns = (('category', 'Category', 115), ('asset', 'Asset', 180),
-                   ('amount', 'Amount', 100), ('unit', 'Unit', 85))
-        self.tree = ttk.Treeview(self._combined, columns=[key for key, _, _ in columns],
-                                 show='headings', selectmode='browse', height=8)
+        columns = (('asset', 'Asset', 100), ('amount', 'Amount', 95), ('unit', 'Unit', 65))
+        self.tree = ttk.Treeview(self, columns=[key for key, _, _ in columns],
+                                 selectmode='browse', height=8)
+        self.tree.heading('#0', text='Asset class')
+        self.tree.column('#0', width=160, minwidth=110)
         self.tree.grid(row=0, column=0, sticky='nsew')
         for key, label, width in columns:
             self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, minwidth=60, anchor='e' if key == 'amount' else 'w')
-        vertical = AutoScrollbar(self._combined, orient='vertical', command=self.tree.yview)
+            self.tree.column(key, width=width, minwidth=55, anchor='e' if key == 'amount' else 'w')
+        self.sorting = TreeSort(self.tree, numeric_columns=('amount',), value=self._sort_value,
+                                on_sort=lambda: shade_allocation_groups(self.tree))
+        vertical = AutoScrollbar(self, orient='vertical', command=self.tree.yview)
         vertical.grid(row=0, column=1, sticky='ns')
-        horizontal = AutoScrollbar(self._combined, orient='horizontal', command=self.tree.xview)
+        horizontal = AutoScrollbar(self, orient='horizontal', command=self.tree.xview)
         horizontal.grid(row=1, column=0, sticky='ew')
         self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        controls = ttk.Frame(self._combined)
+        controls = ttk.Frame(self)
         controls.grid(row=2, column=0, columnspan=2, sticky='w', pady=(7, 0))
         self.add_button = ttk.Button(controls, text='Add', command=self._add)
         self.edit_button = ttk.Button(controls, text='Edit', command=self._edit_selected)
         self.remove_button = ttk.Button(controls, text='Remove', command=self._remove)
         for button in (self.add_button, self.edit_button, self.remove_button):
             button.pack(side='left', padx=(0, 6))
-        self._menu = tk.Menu(self, tearoff=False)
+        self._menu = tk.Menu(self, tearoff=False, **MENU_STYLE)
         self.tree.bind('<Double-1>', self._double_click)
         self.tree.bind('<<TreeviewSelect>>', self._update_buttons)
         bind_shortcuts(self.tree, {'<Return>': self._edit_selected, '<F2>': self._edit_selected,
@@ -51,51 +54,83 @@ class HoldingsView(ttk.Frame):
     def set_tables(self, tables):
         self._tables = dict(tables)
         self._menu.delete(0, 'end')
-        for category in self._tables:
+        for category, table in self._tables.items():
             self._menu.add_command(label=category, command=lambda category=category: self._add_to(category))
-        for table in self._tables.values():
-            table.grid(row=0, column=0, sticky='nsew')
+            table.grid_remove()
             table.set_enabled(self._enabled)
-        self.set_scope(self.scope)
         self.refresh()
 
     def set_scope(self, scope):
         if scope != 'All' and scope not in self._tables:
             raise ValueError(f'Unknown holdings category: {scope}')
         self.scope = scope
-        self._combined.grid_remove()
-        for table in self._tables.values():
-            table.grid_remove()
-        (self._combined if scope == 'All' else self._tables[scope]).grid()
-        self._update_buttons()
+        self._filter_rows()
 
     def refresh(self, source=None):
-        selected = self.tree.selection()
-        source = source or (self._sources.get(selected[0]) if selected else None)
-        self.tree.delete(*self.tree.get_children())
+        selected = next(iter(self.tree.selection()), None)
+        selected_source = source or self._sources.get(selected)
+        selected_branch = next((key for key, item in self._branches.items() if item == selected), None)
+        expanded = {key: self.tree.item(item, 'open') for key, item in self._branches.items()}
+        self.tree.delete(*(item for key, item in self._branches.items() if len(key) == 1))
         self._sources.clear()
+        self._branches.clear()
         for category in (STOCK_MARKET, TREASURY, CASH):
             table = self._tables.get(category)
             if table is None:
                 continue
-            for source_item in table.tree.get_children():
-                row = table.row(source_item)
+            root = self._branch('', (category,), expanded)
+            rows = [(item, table.row(item)) for item in table.tree.get_children()]
+            if category == STOCK_MARKET:
+                rows = [(item, row) for item, row in rows if int(row['shares']) != 0]
+            counts = Counter(row['group'] for _, row in rows) if category == STOCK_MARKET else {}
+            for source_item, row in rows:
                 if category == STOCK_MARKET:
-                    values = category, f"{row['ticker']} · {row['group']}", table.display_value(row, 'shares'), 'shares'
+                    key = category, row['group']
+                    group = self._branches.get(key) or self._branch(root, key, expanded)
+                    item = group if counts[row['group']] == 1 else self.tree.insert(group, 'end')
+                    self.tree.item(item, values=(row['ticker'], table.display_value(row, 'shares'), 'shares'))
                 else:
-                    values = category, category, table.display_value(row, 'amount'), row['currency']
-                item = self.tree.insert('', 'end', values=values)
+                    item = self.tree.insert(root, 'end', text=row['currency'],
+                                            values=('', table.display_value(row, 'amount'), row['currency']))
                 self._sources[item] = table, source_item
-                if self._sources[item] == source:
-                    self.tree.selection_set(item)
-                    self.tree.focus(item)
-                    self.tree.see(item)
-        self._update_buttons()
+        restored = (next((item for item, value in self._sources.items() if value == selected_source), None)
+                    if selected_source else self._branches.get(selected_branch))
+        if restored:
+            self.tree.selection_set(restored)
+            self.tree.focus(restored)
+            if source:
+                self.tree.see(restored)
+        self._filter_rows()
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
         for table in self._tables.values():
             table.set_enabled(self._enabled)
+        self._update_buttons()
+
+    def _branch(self, parent, key, expanded):
+        item = self.tree.insert(parent, 'end', text=key[-1], open=expanded.get(key, True))
+        self._branches[key] = item
+        return item
+
+    def _sort_value(self, item, column):
+        if column == '#0':
+            return self.tree.item(item, 'text')
+        if column == 'amount' and item in self._sources:
+            table, source = self._sources[item]
+            row = table.row(source)
+            return row.get('shares', row.get('amount', ''))
+        return self.tree.set(item, column)
+
+    def _filter_rows(self):
+        for key, item in self._branches.items():
+            if len(key) == 1:
+                if self.scope == 'All' or key[0] == self.scope:
+                    self.tree.move(item, '', 'end')
+                else:
+                    self.tree.detach(item)
+        self.sorting.apply()
+        retain_visible_selection(self.tree)
         self._update_buttons()
 
     def _update_buttons(self, _event=None):
@@ -107,6 +142,9 @@ class HoldingsView(ttk.Frame):
     def _add(self):
         if not self._enabled:
             return
+        if self.scope != 'All':
+            self._add_to(self.scope)
+            return
         try:
             self._menu.tk_popup(self.add_button.winfo_rootx(),
                                 self.add_button.winfo_rooty() + self.add_button.winfo_height())
@@ -116,15 +154,17 @@ class HoldingsView(ttk.Frame):
     def _add_to(self, category):
         if self._enabled:
             table = self._tables[category]
-            table.add()
-            selected = table.tree.selection()
-            self.refresh((table, selected[0]) if selected else None)
+            added = table.add()
+            if added:
+                self.refresh((table, added))
             self.tree.focus_set()
 
     def _selection(self):
         selected = self.tree.selection()
         source = self._sources.get(selected[0]) if self._enabled and selected else None
-        return source if source and source[0].tree.exists(source[1]) else None
+        if source and source[0].tree.exists(source[1]):
+            return source if self.scope == 'All' or source[0] is self._tables[self.scope] else None
+        return None
 
     def _edit_selected(self):
         source = self._selection()
@@ -146,7 +186,10 @@ class HoldingsView(ttk.Frame):
             self.tree.focus_set()
 
     def _double_click(self, event):
+        if open_cell_link(event, self.tree, {'asset': lambda item: quote_url(self.tree.set(item, 'asset'))}):
+            return 'break'
         item = self.tree.identify_row(event.y)
-        if item:
+        if item in self._sources and 'indicator' not in self.tree.identify_element(event.x, event.y):
             self.tree.selection_set(item)
             self._edit_selected()
+            return 'break'

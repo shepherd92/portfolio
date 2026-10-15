@@ -9,31 +9,28 @@ import numpy as np
 from scipy.optimize import Bounds, LinearConstraint
 
 from portfolio.models import (CASH, STOCK_MARKET, TREASURY, MAX_SHARES, Conversion, Holding,
-                    ManualHolding, ManualTrade, Plan, Trade, number)
+                    ManualHolding, ManualTrade, Plan, Trade)
 from portfolio.solver import milp
 
 
-DEFAULT_TIME_LIMIT = 300.  # Seconds for the entire optimization, including retries.
+PLANNING_TIMEOUT_SECONDS = 60 * 60  # Shared by every optimization stage and retry.
 
 
 class PlanningError(ValueError):
     """No verified optimal plan could be produced."""
 
 
-def rebalance(portfolio, market, *, allow_selling=False, time_limit=DEFAULT_TIME_LIMIT):
-    """Minimize parent error, child error, cash-target error, then traded value.
+def rebalance(portfolio, market, *, allow_selling=False):
+    """Minimize allocation error, cash-target error, then traded value.
 
-    Hierarchical targets prioritize top-level error before effective leaf error.
+    Every asset-class target is a percentage of the whole portfolio.
     Currency targets distribute remaining cash through FX. Main tickers and
     manual holdings may increase; signed opening cash must be funded. Every
-    solver stage must finish optimally within one shared time_limit in seconds.
+    solver stage must finish optimally within one fixed 60-minute deadline.
     """
     if not isinstance(allow_selling, bool):
         raise ValueError("allow_selling must be a boolean")
-    time_limit = number(time_limit, 'Time limit', minimum=0)
-    if time_limit == 0:
-        raise ValueError('Time limit must be greater than zero')
-    deadline = monotonic() + time_limit
+    deadline = monotonic() + PLANNING_TIMEOUT_SECONDS
     market.validate_portfolio(portfolio)
     positions, prices, owned, wealth = _value_positions(portfolio, market)
     final = _optimize(portfolio, positions, prices, owned, wealth, allow_selling, deadline) if positions else ()
@@ -45,7 +42,7 @@ def rebalance(portfolio, market, *, allow_selling=False, time_limit=DEFAULT_TIME
 def _remaining_time(deadline):
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise PlanningError('Planning time limit reached. Increase the time limit and try again.')
+        raise PlanningError('Planning exceeded the 60-minute limit. Try again or simplify the portfolio.')
     return remaining
 
 
@@ -81,15 +78,15 @@ def _manual_amount(units):
 
 def _value_positions(portfolio, market):
     positions = []
-    targets = portfolio.allocation.effective
+    targets = portfolio.allocation.weights
     for holding in portfolio.required_holdings:
         quote = market.quotes[holding.ticker]
         key = (STOCK_MARKET, holding.group)
         positions.append(_Position(holding, holding.shares, quote.price,
-                                   quote.currency, holding.is_main and targets[key] > 0))
+                                   quote.currency, holding.is_main and targets[key[0]][key[1]] > 0))
     for holding in portfolio.required_manual_holdings:
         key = (TREASURY, holding.currency)
-        positions.append(_Position(holding, holding.cents, .01, holding.currency, targets.get(key, 0) > 0))
+        positions.append(_Position(holding, holding.cents, .01, holding.currency, targets[key[0]].get(key[1], 0) > 0))
     prices = np.array([market.value(position.price, position.currency) for position in positions])
     if np.any(prices <= 0):
         raise PlanningError("Converted trading units must have positive value")
@@ -106,26 +103,20 @@ def _value_positions(portfolio, market):
 
 
 def _target_expressions(portfolio, positions, prices, wealth):
-    """Return each target's linear value expression, desired value, and priority."""
-    allocation = portfolio.allocation
+    """Express noncash targets and aggregate cash in base-currency value.
+
+    With free FX, the minimum sum of cash-currency errors equals the error in
+    total cash. Settlement distributes that residual among currency targets.
+    """
     expressions = []
-    for branch, target in allocation.top.items():
-        coefficients = prices if branch == CASH else np.array([
-            price if position.leaf[0] == branch else 0.
-            for position, price in zip(positions, prices)])
-        desired = wealth * ((1 - target / 100) if branch == CASH else target / 100)
-        expressions.append((coefficients, desired, 'cash' if branch == CASH else 'top'))
-    targets = dict.fromkeys((position.leaf for position in positions), 0.)
-    targets.update(allocation.effective)
-    for key, target in targets.items():
-        if key[0] == CASH:
-            weight = allocation.children[CASH][key[1]] / 100
-            coefficients, desired = prices * weight, wealth * weight * (1 - allocation.top[CASH] / 100)
-        else:
-            coefficients = np.array([price if position.leaf == key else 0.
-                                     for position, price in zip(positions, prices)])
-            desired = wealth * target / 100
-        expressions.append((coefficients, desired, 'leaf'))
+    for category, name in dict.fromkeys(position.leaf for position in positions):
+        key = category, name
+        target = portfolio.allocation.weights[category].get(name, 0.)
+        coefficients = np.array([price if position.leaf == key else 0.
+                                 for position, price in zip(positions, prices)])
+        expressions.append((coefficients, wealth * target / 100, False))
+    cash_target = portfolio.allocation.totals[CASH]
+    expressions.append((prices, wealth * (1 - cash_target / 100), True))
     return expressions
 
 
@@ -156,13 +147,12 @@ def _constraints(portfolio, positions, prices, owned, wealth):
             row[count + group_count + index] = -1
             constrain(row, sign * shares)
 
-    tracking, cash_error, turnover, top_error = (np.zeros(size) for _ in range(4))
-    for index, (_, _, priority) in enumerate(expressions):
-        tracking[count + index] = priority == 'leaf'
-        top_error[count + index] = priority in ('top', 'cash')
-        cash_error[count + index] = priority == 'cash'
+    tracking, cash_error, turnover = (np.zeros(size) for _ in range(3))
+    for index, (_, _, is_cash) in enumerate(expressions):
+        tracking[count + index] = 1
+        cash_error[count + index] = is_cash
     turnover[count + group_count:] = prices
-    return rows, limits, (top_error, tracking, cash_error, turnover)
+    return rows, limits, (tracking, cash_error, turnover)
 
 
 def _optimize(portfolio, positions, prices, owned, wealth, allow_selling, deadline):
@@ -222,7 +212,7 @@ def _solve(objective, lower, upper, count, rows, limits, tolerance, *, deadline,
         if result.status not in (2, 4):
             break
     if result.status == 1:
-        raise PlanningError('Planning time limit reached. Increase the time limit and try again.')
+        raise PlanningError('Planning exceeded the 60-minute limit. Try again or simplify the portfolio.')
     if (result.status != 0 or result.x is None or len(result.x) != len(objective)
             or not np.all(np.isfinite(result.x))):
         raise PlanningError(f"Optimizer could not prove an optimal plan: {result.message}")
@@ -242,7 +232,8 @@ def _build_plan(portfolio, market, positions, prices, wealth, final):
     manual_trades = []
     final_manual = {holding.currency: holding for holding in portfolio.manual_holdings}
     final_shares = {holding.ticker: holding.shares for holding in portfolio.holdings}
-    allocation_parts = {key: [] for key in portfolio.allocation.effective}
+    allocation_parts = {(category, name): []
+                        for category, weights in portfolio.allocation.weights.items() for name in weights}
     allocation_parts.update({(TREASURY, holding.currency): [] for holding in portfolio.manual_holdings})
     for position, units, price in zip(positions, final, prices):
         holding = position.asset
@@ -262,7 +253,7 @@ def _build_plan(portfolio, market, positions, prices, wealth, final):
         allocation_parts.setdefault(position.leaf, []).append(units * price)
     allocation_values = {key: fsum(parts) for key, parts in allocation_parts.items()}
 
-    cash_targets = portfolio.allocation.children[CASH]
+    cash_targets = portfolio.allocation.weights[CASH]
     balances, conversions = _settle_cash(balances, market, tolerance, cash_targets)
     cash_value = fsum(market.value(value, currency) for currency, value in balances.items())
     if abs(fsum(allocation_values.values()) + cash_value - wealth) > tolerance:
@@ -279,7 +270,8 @@ def _build_plan(portfolio, market, positions, prices, wealth, final):
 def _settle_cash(balances, market, tolerance, targets):
     # Net trades, then fund the target currency balances and any opening debt.
     desired = dict.fromkeys(balances, 0.)
-    if targets:
+    target_total = fsum(targets.values())
+    if target_total:
         for currency, weight in targets.items():
             if weight == 0 and currency not in balances:
                 continue
@@ -287,9 +279,8 @@ def _settle_cash(balances, market, tolerance, targets):
             balances.setdefault(currency, 0.)
             desired.setdefault(currency, 0.)
         total = fsum(market.value(value, currency) for currency, value in balances.items())
-        if fsum(targets.values()) > 0:
-            desired.update({currency: max(0., total) * weight / 100 / market.rates[currency]
-                            for currency, weight in targets.items() if currency in balances})
+        desired.update({currency: max(0., total) * weight / target_total / market.rates[currency]
+                        for currency, weight in targets.items() if currency in balances})
     conversions = []
     for destination in sorted(balances):
         for source in sorted(balances):
@@ -305,7 +296,7 @@ def _settle_cash(balances, market, tolerance, targets):
             conversions.append(Conversion(source, destination, from_amount, to_amount))
     if any(market.value(value, currency) < -tolerance for currency, value in balances.items()):
         raise PlanningError("Sale proceeds and cash cannot fund the requested plan")
-    if targets and fsum(targets.values()) > 0 and any(
+    if target_total and any(
             abs(market.value(value - desired[currency], currency)) > tolerance
             for currency, value in balances.items()):
         raise PlanningError("Currency conversions did not meet the cash allocation")

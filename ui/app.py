@@ -1,6 +1,6 @@
 """Native Tkinter application; only the main thread touches widgets."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from math import fsum
 from pathlib import Path
 from queue import Empty, Queue
@@ -9,16 +9,22 @@ from time import monotonic
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from portfolio.models import CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, Portfolio, currency_code, identifier, number, parse_manual_amount
-from portfolio.planning import DEFAULT_TIME_LIMIT, rebalance
-from portfolio.storage import (fetch_snapshot, load_portfolio_with_signature, load_snapshot,
-                          save_portfolio, save_snapshot, SCRIPT_DIRECTORY, SNAPSHOT_DIRECTORY)
-from ui.reporting import current_values, format_plan
-from ui.widgets import DataTable, PieChart, RoundedEntry, whole_number
+from portfolio.models import (CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, Portfolio,
+                              allocation_name, currency_code, current_values, identifier, number, parse_manual_amount)
+from portfolio.metadata import fetch_asset_details
+from portfolio.planning import rebalance
+from portfolio.storage import (fetch_market_data, load_portfolio_with_signature,
+                               save_portfolio, RESOURCE_DIRECTORY)
+from ui.reporting import format_plan
+from ui.links import quote_url
+from ui.theme import configure_theme
+from ui.widgets import DataTable, PieChart, whole_number
 from ui.allocations import AllocationEditor
+from ui.assets import AssetsTable, LOOKUP_FIELDS, details_from_row, details_row
 from ui.plan import PlanView
 from ui.holdings import HoldingsView
 
+PRICE_REFRESH_SECONDS = 15 * 60
 MODES = ('Not allowed', 'Allowed')
 COMMON_CURRENCIES = tuple('AED AUD BRL CAD CHF CLP CNY COP CZK DKK EUR GBP HKD HUF IDR ILS INR '
                           'ISK JPY KRW MAD MXN MYR NOK NZD PHP PLN RON RSD SAR SEK SGD THB TRY '
@@ -27,10 +33,10 @@ COLORS = ('#2563eb', '#14b8a6', '#f59e0b', '#8b5cf6', '#ef4444', '#06b6d4',
           '#84cc16', '#ec4899', '#64748b', '#d97706', '#6366f1', '#10b981', '#a855f7')
 
 
-def launch(directory, *, base_currency='EUR', snapshot_path=None):
+def launch(directory, *, base_currency='EUR'):
     root = tk.Tk(className='PortfolioPlanner')
     try:
-        PortfolioApp(root, directory, base_currency=base_currency, snapshot_path=snapshot_path)
+        PortfolioApp(root, directory, base_currency=base_currency)
     except (ValueError, OSError) as error:
         messagebox.showerror('Cannot open portfolio', str(error), parent=root)
         root.destroy()
@@ -40,38 +46,35 @@ def launch(directory, *, base_currency='EUR', snapshot_path=None):
 
 
 class PortfolioApp:
-    def __init__(self, root, directory, *, base_currency='EUR', snapshot_path=None):
+    def __init__(self, root, directory, *, base_currency='EUR'):
         self.root = root
         self.directory = Path(directory).resolve()
         self.market = None
         self.plan = None
+        self.asset_lookups = set()
         self.dirty = False
         self.busy = False
         self.closed = False
         self.revision = 0
         self.job_id = 0
         self.timeout_id = None
+        self.next_price_refresh = monotonic() + PRICE_REFRESH_SECONDS
         self.target_error = ''
         self.events = Queue()
         self.base_currency = tk.StringVar(value=currency_code(base_currency))
         self.mode = tk.StringVar(value=MODES[0])
-        self.time_limit = tk.StringVar(value=f'{DEFAULT_TIME_LIMIT / 60:g}')
-        self.status = tk.StringVar(value='Load a price snapshot or refresh market prices to begin.')
-        self.summary = tk.StringVar(value='Total portfolio value: unavailable')
+        self.status = tk.StringVar(value='Fetching market prices…')
+        self.current_title = tk.StringVar(value='Current allocation · unavailable')
         self.chart_scope = tk.StringVar(value='All')
         self.source = tk.StringVar(value='Prices not loaded')
         self._build()
         portfolio = self._load_directory(self.directory)
-        if snapshot_path:
-            self._load_market(Path(snapshot_path))
         self.base_currency.trace_add('write', self._base_changed)
         self.mode.trace_add('write', self._request_changed)
-        self.time_limit.trace_add('write', self._request_changed)
         self.chart_scope.trace_add('write', lambda *_: self._refresh_charts())
         self.poll_id = self.root.after(80, self._poll)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
-        if snapshot_path is None:
-            self.refresh_prices(portfolio)
+        self.refresh_prices(portfolio, quiet=True)
 
     def portfolio(self):
         holdings, manual, cash = self._positions()
@@ -83,68 +86,92 @@ class PortfolioApp:
             self._finish_work()
             self.status.set(message)
 
-    def refresh_prices(self, portfolio=None):
+    def refresh_prices(self, portfolio=None, *, on_ready=None, quiet=False):
+        if self.busy or self.closed:
+            return
+        self.next_price_refresh = monotonic() + PRICE_REFRESH_SECONDS
         try:
-            if portfolio is None:
-                portfolio = self.portfolio()
+            portfolio = portfolio if portfolio is not None else self.portfolio()
             base = currency_code(self.base_currency.get())
         except ValueError as error:
-            self._error(error)
+            self._error(error, quiet=quiet)
             return
-        self._request_changed()
-        self._run('Fetching prices and exchange rates…', lambda: fetch_snapshot(portfolio, base),
-                  lambda market: self._accept_market(market, 'Market prices'), timeout=120_000)
 
-    def load_market(self):
-        try:
-            SNAPSHOT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-            path = filedialog.askopenfilename(title='Load price snapshot', initialdir=SNAPSHOT_DIRECTORY,
-                                              filetypes=[('JSON snapshot', '*.json')], parent=self.root)
-            if path:
-                self._load_market(Path(path))
-        except (ValueError, OSError) as error:
-            self._error(error)
+        def complete(market):
+            if self._price_age(market) >= PRICE_REFRESH_SECONDS:
+                raise ValueError('Fetched prices are already out of date. Generate a plan to retry.')
+            self._accept_market(market)
+            if on_ready:
+                on_ready(market)
 
-    def save_market(self):
-        if self.market is None:
-            self._error(ValueError('Load or refresh prices first.'))
-            return
-        try:
-            SNAPSHOT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-            path = filedialog.asksaveasfilename(title='Save price snapshot', initialdir=SNAPSHOT_DIRECTORY,
-                                               defaultextension='.json', parent=self.root)
-            if path:
-                save_snapshot(self.market, path)
-                self.status.set(f'Snapshot saved to {path}')
-        except (ValueError, OSError) as error:
-            self._error(error)
+        self._run('Fetching prices and exchange rates…', lambda: fetch_market_data(portfolio, base),
+                  complete, timeout=120_000, quiet=quiet)
 
     def generate_plan(self):
+        if self.busy or self.closed:
+            return
         try:
             portfolio = self.portfolio()
-            market = self.market
-            if market is None:
-                raise ValueError('Load or refresh prices before generating a plan.')
             mode = self.mode.get()
             if mode not in MODES:
                 raise ValueError('Choose whether selling is allowed.')
-            time_limit = number(float(self.time_limit.get()) * 60, 'Time limit', minimum=0)
-            if time_limit == 0:
-                raise ValueError('Time limit must be greater than zero')
-            work = lambda: rebalance(portfolio, market, allow_selling=mode == MODES[1], time_limit=time_limit)
         except ValueError as error:
             self._error(error)
             return
         self._request_changed()
-        def complete(plan):
-            self.plan = plan
-            context = f'Selling {mode.lower()} · {self.source.get()}'
-            self.plan_view.show_plan(plan, portfolio, market, context=context)
-            self.plan_report = f'{context}\n\n{format_plan(plan, portfolio.allocation)}'
-            self.export_button.configure(state='normal')
-            self.notebook.select(self.plan_page)
-            self.status.set('Plan ready. Current holdings have not been changed.')
-        self._run(f'Calculating trade recommendations… time limit {time_limit / 60:g} min', work, complete)
+        if self._prices_needed(portfolio):
+            self.refresh_prices(portfolio, on_ready=lambda market:
+                                self._calculate_plan(portfolio, market, mode))
+        else:
+            self._calculate_plan(portfolio, self.market, mode)
+
+    def lookup_assets(self, tickers=None):
+        if self.busy or self.closed:
+            return
+        rows = self.holdings_table.get_rows()
+        tickers = tickers if tickers is not None else [row['ticker'] for row in rows
+                  if any(not row.get(field, '') for field in LOOKUP_FIELDS)]
+        if not tickers:
+            self.status.set('Asset details are complete.')
+            return
+        self.asset_lookups.update(tickers)
+        job_id = self.job_id + 1
+
+        def fetch():
+            found, failed = {}, []
+            for ticker in tickers:
+                if self.closed or self.job_id != job_id:
+                    break
+                try:
+                    found[ticker] = fetch_asset_details(ticker)
+                except ValueError as error:
+                    failed.append(str(error))
+            return found, failed
+
+        def complete(result):
+            found, failed = result
+            rows, changed = self.holdings_table.get_rows(), False
+            for row in rows:
+                if row['ticker'] not in found:
+                    continue
+                for field, value in details_row(found[row['ticker']]).items():
+                    if not row.get(field, '') and value:
+                        row[field], changed = value, True
+            if changed:
+                self.holdings_table.set_rows(rows)
+                self.real_allocations.refresh()
+                self.assets_table.show_holdings(rows)
+                self.dirty = True
+                self.save_button.configure(text='Save inputs *')
+            message = ('Available asset details filled. Save inputs to keep them.' if changed else
+                       'No additional details found. Missing fields can be entered manually.')
+            if failed:
+                message += ' ' + failed[0]
+                if len(failed) > 1:
+                    message += f' ({len(failed) - 1} more lookups failed.)'
+            self.status.set(message)
+
+        self._run('Looking up asset details…', fetch, complete, timeout=120_000, quiet=True)
 
     def export_plan(self):
         if self.plan is None:
@@ -176,8 +203,8 @@ class PortfolioApp:
         path = filedialog.askdirectory(title='Open portfolio configuration folder', parent=self.root)
         if path:
             try:
-                self._load_directory(Path(path))
-                self.status.set('Portfolio loaded. Load or refresh its prices.')
+                portfolio = self._load_directory(Path(path))
+                self.refresh_prices(portfolio, quiet=True)
             except (ValueError, OSError) as error:
                 self._error(error)
 
@@ -192,59 +219,34 @@ class PortfolioApp:
 
     def _build(self):
         self.root.title('Portfolio planner')
-        self.icon = tk.PhotoImage(file=SCRIPT_DIRECTORY / 'assets' / 'portfolio-planner.png')
+        self.icon = tk.PhotoImage(file=RESOURCE_DIRECTORY / 'assets' / 'portfolio-planner.png')
         self.root.iconphoto(True, self.icon)
         self.root.geometry('1280x920')
         self.root.minsize(1050, 760)
-        self._configure_style()
+        configure_theme(self.root)
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
-        header = ttk.Frame(self.root, padding=(18, 12))
-        header.grid(row=0, column=0, sticky='ew')
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, text='Portfolio planner', style='Title.TLabel').grid(row=0, column=0, sticky='w')
-        self.open_button = ttk.Button(header, text='Open folder…', command=self.open_directory)
-        self.open_button.grid(row=0, column=1, padx=5)
-        self.save_button = ttk.Button(header, text='Save inputs', command=self.save)
-        self.save_button.grid(row=0, column=2, padx=5)
+        self.root.rowconfigure(0, weight=1)
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.grid(row=1, column=0, sticky='nsew', padx=14, pady=(0, 10))
+        self.notebook.grid(row=0, column=0, sticky='nsew', padx=14, pady=(12, 10))
         self.portfolio_page = ttk.Frame(self.notebook, padding=12)
         self.classes_page = ttk.Frame(self.notebook, padding=16)
+        self.assets_page = ttk.Frame(self.notebook, padding=16)
         self.plan_page = ttk.Frame(self.notebook, padding=16)
-        for page, title in ((self.portfolio_page, 'Rebalance'), (self.classes_page, 'Asset classes'),
-                            (self.plan_page, 'Trade plan')):
+        for page, title in ((self.portfolio_page, 'Home'), (self.classes_page, 'Asset classes'),
+                            (self.assets_page, 'Assets'), (self.plan_page, 'Trade plan')):
             self.notebook.add(page, text=title)
         self._portfolio_page()
         self._classes_page()
+        self._assets_page()
         self._plan_page()
         footer = ttk.Frame(self.root, padding=(18, 0, 18, 10))
-        footer.grid(row=2, column=0, sticky='ew')
+        footer.grid(row=1, column=0, sticky='ew')
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.status, wraplength=1050).grid(row=0, column=0, sticky='w')
         self.progress = ttk.Progressbar(footer, mode='indeterminate', length=120)
         self.progress.grid(row=0, column=1, padx=10)
         self.cancel_button = ttk.Button(footer, text='Cancel', command=self.cancel_work, state='disabled')
         self.cancel_button.grid(row=0, column=2)
-
-    def _configure_style(self):
-        style = ttk.Style(self.root)
-        style.theme_use('clam')
-        style.configure('.', font=('DejaVu Sans', 10))
-        style.configure('TFrame', background='#f1f5f9')
-        style.configure('TLabel', background='#f1f5f9', foreground='#172033')
-        trading_background = style.lookup('TLabelframe', 'background')
-        style.configure('Trading.TFrame', background=trading_background)
-        style.configure('Trading.TLabel', background=trading_background)
-        style.configure('Trading.TEntry', fieldbackground=trading_background)
-        style.configure('Title.TLabel', font=('DejaVu Sans', 20, 'bold'))
-        style.configure('Heading.TLabel', font=('DejaVu Sans', 12, 'bold'))
-        style.configure('TButton', padding=(10, 6))
-        style.configure('Primary.TButton', background='#2563eb', foreground='white')
-        style.map('Primary.TButton', background=[('disabled', '#cbd5e1'), ('active', '#1d4ed8')],
-                  foreground=[('disabled', '#64748b')])
-        style.configure('Treeview', rowheight=25)
-        style.configure('Treeview.Heading', font=('DejaVu Sans', 10, 'bold'))
 
     def _portfolio_page(self):
         page = self.portfolio_page
@@ -256,9 +258,10 @@ class PortfolioApp:
         self.matrix.columnconfigure((0, 1), weight=1, uniform='allocation')
         self.matrix.rowconfigure(1, weight=2, minsize=180)
         self.matrix.rowconfigure(2, weight=3, minsize=245)
-        for column, title in enumerate(('Target allocation', 'Current allocation')):
-            ttk.Label(self.matrix, text=title, style='Heading.TLabel').grid(
-                row=0, column=column, sticky='w', padx=(8 if column == 0 else 14, 0), pady=(0, 6))
+        ttk.Label(self.matrix, text='Target allocation', style='Heading.TLabel').grid(
+            row=0, column=0, sticky='w', padx=(8, 0), pady=(0, 6))
+        ttk.Label(self.matrix, textvariable=self.current_title, style='Heading.TLabel').grid(
+            row=0, column=1, sticky='w', padx=(14, 0), pady=(0, 6))
         self._build_allocation_charts(self.matrix)
         self._build_input_tables(self.matrix)
         controls = ttk.Frame(page, padding=9, relief='groove', borderwidth=1, style='Trading.TFrame')
@@ -267,36 +270,28 @@ class PortfolioApp:
         self.mode_box = ttk.Combobox(controls, textvariable=self.mode, values=MODES, state='readonly', width=13)
         self.mode_box.grid(row=0, column=1, sticky='w', padx=(0, 12))
         controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text='Time limit (min)', style='Trading.TLabel').grid(row=0, column=2, padx=(8, 6))
-        self.time_entry = RoundedEntry(controls, textvariable=self.time_limit, width=5, style='Trading.TEntry')
-        self.time_entry.grid(row=0, column=3, padx=(0, 12))
         self.generate_button = ttk.Button(controls, text='Generate plan', command=self.generate_plan,
                                           style='Primary.TButton')
-        self.generate_button.grid(row=0, column=4, padx=4)
+        self.generate_button.grid(row=0, column=2, padx=4)
 
     def _build_price_toolbar(self, page):
         toolbar = ttk.Frame(page)
-        toolbar.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        toolbar.columnconfigure(3, weight=1)
-        ttk.Label(toolbar, textvariable=self.summary, style='Heading.TLabel', justify='left', width=37).grid(
-            row=0, column=0, sticky='w', padx=(0, 16))
-        ttk.Label(toolbar, text='Base currency').grid(row=0, column=1)
-        self.base_entry = ttk.Combobox(toolbar, textvariable=self.base_currency, width=6, state='readonly',
-                                      values=('EUR', 'USD', 'HUF'))
-        self.base_entry.grid(row=0, column=2, padx=(6, 16))
-        ttk.Label(toolbar, text='Show').grid(row=0, column=4, padx=(8, 6))
+        toolbar.grid(row=0, column=0, sticky='ew', pady=(0, 12))
+        self.open_button = ttk.Button(toolbar, text='Open directory', command=self.open_directory,
+                                      style='Toolbar.TButton')
+        self.save_button = ttk.Button(toolbar, text='Save inputs', command=self.save, style='Toolbar.TButton')
+        for button in (self.open_button, self.save_button):
+            button.pack(side='left', padx=(0, 8))
+        ttk.Label(toolbar, text='Base currency').pack(side='left', padx=(4, 6))
+        self.base_entry = ttk.Combobox(toolbar, textvariable=self.base_currency, width=4, state='readonly',
+                                      values=('EUR', 'USD', 'HUF'), style='Toolbar.TCombobox')
+        self.base_entry.pack(side='left', padx=(0, 12))
+        ttk.Label(toolbar, text='Show').pack(side='left', padx=(0, 6))
         self.scope_box = ttk.Combobox(toolbar, textvariable=self.chart_scope,
-                                     values=('All', STOCK_MARKET, TREASURY, CASH), state='readonly', width=16)
-        self.scope_box.grid(row=0, column=5, sticky='e')
-        prices = ttk.Frame(toolbar)
-        prices.grid(row=1, column=0, columnspan=6, sticky='ew', pady=(8, 0))
-        self.refresh_button = ttk.Button(prices, text='Refresh prices', command=self.refresh_prices)
-        self.refresh_button.pack(side='left', padx=4)
-        self.load_prices_button = ttk.Button(prices, text='Load snapshot…', command=self.load_market)
-        self.load_prices_button.pack(side='left', padx=4)
-        self.save_prices_button = ttk.Button(prices, text='Save snapshot…', command=self.save_market)
-        self.save_prices_button.pack(side='left', padx=4)
-        ttk.Label(prices, textvariable=self.source).pack(side='right', padx=8)
+                                     values=('All', STOCK_MARKET, TREASURY, CASH), state='readonly', width=12,
+                                     style='Toolbar.TCombobox')
+        self.scope_box.pack(side='left', padx=(0, 12))
+        ttk.Label(toolbar, textvariable=self.source, wraplength=220).pack(side='left')
 
     def _allocation_panel(self, parent, row, column):
         panel = ttk.Frame(parent, padding=8, relief='groove', borderwidth=1)
@@ -313,19 +308,24 @@ class PortfolioApp:
         self.current_chart = PieChart(current)
         self.target_chart.grid(row=0, column=0, sticky='nsew')
         self.current_chart.grid(row=0, column=0, sticky='nsew')
+        self.cash_deficit_note = ttk.Label(current, text='Pie excludes cash deficit')
+        self.cash_deficit_note.grid(row=1, column=0, sticky='w', pady=(4, 0))
+        self.cash_deficit_note.grid_remove()
 
     def _build_input_tables(self, matrix):
         self.target_panel = self._allocation_panel(matrix, 2, 0)
-        self.target_table = AllocationEditor(self.target_panel, on_change=self._edited)
+        self.target_table = AllocationEditor(self.target_panel, on_change=self._edited,
+                                             currency_choices=self._currency_choices)
         self.target_table.grid(row=0, column=0, sticky='nsew')
         self.real_panel = self._allocation_panel(matrix, 2, 1)
         self.real_allocations = HoldingsView(self.real_panel)
         self.real_allocations.grid(row=0, column=0, sticky='nsew')
         self.holdings_table = DataTable(self.real_allocations, [('ticker', 'Ticker', 130), ('group', 'Asset class', 120), ('shares', 'Shares', 100)],
                                        rounded_columns=('shares',),
-                                       choices={'group': self._group_names}, validate=self._validate_holding,
-                                       locked_fields=self._locked_holding_fields, dialog_title='Stock holding',
-                                       can_delete=self._can_delete_holding, on_change=self._edited,
+                                       choices={'ticker': self._holding_tickers}, validate=self._validate_holding,
+                                       field_rows=(('ticker', 'shares'),),
+                                       locked_fields=lambda row: ('ticker',), dialog_title='Stock holding',
+                                       resolve_add=self._existing_holding, on_change=self._holdings_changed,
                                        sort_key=lambda row: (-int(row['shares']), row['ticker']))
         self.manual_table = DataTable(self.real_allocations, [('amount', 'Amount', 180), ('currency', 'Currency', 100)],
                                      dialog_title='MÁK balance',
@@ -349,14 +349,30 @@ class PortfolioApp:
                   wraplength=1000).pack(anchor='w', pady=(6, 14))
         self.class_table = DataTable(self.classes_page, [('group', 'Asset class', 230), ('main_ticker', 'Representative ticker', 260)],
                                      dialog_title='Asset class',
+                                     links={'main_ticker': lambda row: quote_url(row['main_ticker'])},
                                      validate=self._validate_class, can_delete=self._can_delete_class,
                                      on_change=self._classes_changed, height=14,
                                      sort_key=self._class_order)
         self.class_table.pack(fill='both', expand=True)
-        ttk.Label(self.classes_page, text='Enter MÁK balances directly on Rebalance in EUR or HUF.\n'
-                  'Stock market contains listed asset classes. MÁK and Cash each have their own currency targets.\n'
-                  'Add a cash row with zero amount to configure a new currency target.\n'
-                  'Unused allocations are hidden on Rebalance. Use Add below the targets to activate them.').pack(anchor='w', pady=(10, 0))
+        ttk.Label(self.classes_page, text='Enter MÁK balances directly on Home in EUR or HUF.\n'
+                  'Every target is a percentage of the whole portfolio; category totals are calculated automatically.\n'
+                  'Unused allocations are hidden on Home. Use Add below the targets to activate them.').pack(anchor='w', pady=(10, 0))
+
+    def _assets_page(self):
+        ttk.Label(self.assets_page,
+                  text='Use a price-provider ticker such as VWCE.DE. Available details fill automatically; '
+                       'asset classes and missing fields can be set manually.',
+                  wraplength=1100).pack(anchor='w', pady=(0, 10))
+        self.assets_table = AssetsTable(
+            self.assets_page, lookup=self.lookup_assets, save=self.save,
+            choices={'group': self._group_names, 'currency': lambda: ('', *self._currency_choices())},
+            validate=self._validate_asset, can_delete=self._can_delete_asset,
+            locked_fields=lambda row: ('ticker', 'group') if self._locked_holding_fields(row) else ('ticker',),
+            on_change=self._assets_changed)
+        self.assets_table.pack(fill='both', expand=True)
+        ttk.Label(self.assets_page, text='Double-click a ticker for Yahoo Finance or an ISIN for justETF. '
+                  'Prices use fetched quote currencies; — means no quote. Edit changes the saved asset details.',
+                  wraplength=1100).pack(anchor='w', pady=(10, 0))
 
     def _plan_page(self):
         self.plan_view = PlanView(self.plan_page)
@@ -364,20 +380,22 @@ class PortfolioApp:
         self.export_button = ttk.Button(self.plan_page, text='Export plan…', command=self.export_plan, state='disabled')
         self.export_button.pack(anchor='e', pady=(8, 0))
         self.plan_report = ''
-        self.plan_view.clear('Generate a plan from the Rebalance page.')
+        self.plan_view.clear('Generate a plan from the Home page.')
 
     def _class_order(self, row):
         rows = self.target_table.get_rows()
-        roots = {item['group']: float(item['target']) for item in rows if not item['parent']}
-        children = {item['group']: float(item['target']) for item in rows if item['parent'] == STOCK_MARKET}
-        weight = roots.get(STOCK_MARKET, 0) * children.get(row['group'], 0) / 100
+        weights = {item['group']: float(item['target']) for item in rows if item['parent'] == STOCK_MARKET}
+        weight = weights.get(row['group'], 0)
         return -weight, row['group']
 
     def _base_changed(self, *_):
+        self.cancel_work()
         self.market = None
-        self.source.set('Base currency changed · refresh prices')
+        self.assets_table.set_market(None)
+        self.source.set('Prices not loaded')
         self._request_changed()
         self._refresh_charts()
+        self.refresh_prices(quiet=True)
 
     def _request_changed(self, *_):
         self.revision += 1
@@ -390,10 +408,12 @@ class PortfolioApp:
         self.dirty = True
         self.save_button.configure(text='Save inputs *')
         self._request_changed()
-        self._sync_target_currencies()
         self._sync_manual_inputs()
         self.class_table.sort_rows()
+        self.assets_table.show_holdings(self.holdings_table.get_rows())
+        self.real_allocations.refresh()
         self._refresh_charts()
+        self.next_price_refresh = min(self.next_price_refresh, monotonic() + .5)
 
     def _group_names(self):
         return [row['group'] for row in self.class_table.get_rows()]
@@ -402,6 +422,18 @@ class PortfolioApp:
         return ('ticker', 'group') if row and any(
             item['main_ticker'] == row['ticker'] for item in self.class_table.get_rows()) else ()
 
+    def _holding_tickers(self):
+        return sorted(row['ticker'] for row in self.holdings_table.get_rows())
+
+    def _existing_holding(self, row):
+        return next((item for item in self.holdings_table.tree.get_children()
+                     if self.holdings_table.row(item)['ticker'] == row['ticker'].strip()), None)
+
+    def _holdings_changed(self, action, old, new):
+        if action == 'remove':
+            self.holdings_table.set_rows([*self.holdings_table.get_rows(), {**old, 'shares': '0'}])
+        self._edited()
+
     def _currency_choices(self):
         currencies = set(COMMON_CURRENCIES) | {self.base_currency.get()}
         currencies.update(row['currency'] for row in self.cash_table.get_rows())
@@ -409,17 +441,6 @@ class PortfolioApp:
         if self.market is not None:
             currencies.update(self.market.rates)
         return sorted(currencies)
-
-    def _sync_target_currencies(self):
-        rows = self.target_table.get_rows()
-        known = {(row['parent'], row['group']) for row in rows}
-        currencies = {row['currency'] for row in self.cash_table.get_rows()}
-        for parent, names in ((TREASURY, ('EUR', 'HUF')), (CASH, sorted(currencies))):
-            for name in names:
-                if (parent, name) not in known:
-                    rows.append({'parent': parent, 'group': name, 'target': '0'})
-        if len(rows) != len(known):
-            self.target_table.set_rows(rows)
 
     def _sync_manual_inputs(self):
         try:
@@ -435,21 +456,56 @@ class PortfolioApp:
         self.manual_table.set_rows(rows)
 
     def _validate_holding(self, row, old):
-        ticker, group = row['ticker'].strip(), row['group'].strip()
-        if group not in self._group_names():
-            raise ValueError('Choose an existing listed asset class.')
+        item = self._existing_holding(row)
+        if item is None:
+            raise ValueError('Choose a ticker from Assets. Add new tickers on the Assets page first.')
+        asset = self.holdings_table.row(item)
+        if old and old['ticker'] != asset['ticker']:
+            raise ValueError('Add a separate holding for a different asset.')
         try:
             shares = int(row['shares'])
         except ValueError as error:
             raise ValueError('Shares must be a whole number.') from error
-        holding = Holding(ticker, group, shares)
-        others = [item for item in self.holdings_table.get_rows() if item != old]
-        if any(item['ticker'] == ticker for item in others):
-            raise ValueError('This ticker already has a holding row.')
-        if old and any(item['main_ticker'] == old['ticker'] for item in self.class_table.get_rows()):
-            if ticker != old['ticker'] or group != old['group']:
-                raise ValueError('Change representative tickers on the Asset classes page; edit shares here.')
-        return {'ticker': ticker, 'group': group, 'shares': str(holding.shares)}
+        holding = Holding(asset['ticker'], asset['group'], shares)
+        return {**asset, 'shares': str(holding.shares)}
+
+    def _validate_asset(self, row, old):
+        ticker, group = identifier(row['ticker'].strip(), 'Ticker'), row['group'].strip()
+        if group not in self._group_names():
+            raise ValueError('Choose an existing asset class, or add one on Asset classes first.')
+        if old and ticker != old['ticker']:
+            raise ValueError('Add a separate asset for a different ticker.')
+        if any(item['ticker'] == ticker and (old is None or item['ticker'] != old['ticker'])
+               for item in self.holdings_table.get_rows()):
+            raise ValueError('This ticker already exists in Assets.')
+        if old and self._locked_holding_fields(old) and group != old['group']:
+            raise ValueError('Change representative tickers on the Asset classes page.')
+        return {**row, **details_row(details_from_row(row)), 'ticker': ticker, 'group': group}
+
+    def _can_delete_asset(self, row):
+        self._can_delete_holding(row)
+        if any(item['ticker'] == row['ticker'] and int(item['shares'])
+               for item in self.holdings_table.get_rows()):
+            raise ValueError('Set this asset’s shares to zero on Home before removing it.')
+
+    def _assets_changed(self, action, old, new):
+        rows = self.holdings_table.get_rows()
+        if old:
+            rows = [row for row in rows if row['ticker'] != old['ticker']]
+        if new:
+            rows.append({**new, 'shares': (old or {}).get('shares', '0')})
+        self.holdings_table.set_rows(rows)
+        self._edited()
+
+    def _lookup_missing_assets(self):
+        if (self.busy or self.notebook.select() != str(self.assets_page)
+                or self.root.tk.call('grab', 'current', self.root._w)):
+            return
+        tickers = [row['ticker'] for row in self.holdings_table.get_rows()
+                   if row['ticker'] not in self.asset_lookups
+                   and any(not row.get(field, '') for field in LOOKUP_FIELDS)]
+        if tickers:
+            self.lookup_assets(tickers)
 
     def _validate_cash(self, row, old):
         currency = currency_code(row['currency'].strip())
@@ -468,9 +524,7 @@ class PortfolioApp:
         return {'amount': str(holding.amount), 'currency': holding.currency}
 
     def _validate_class(self, row, old):
-        group = identifier(row['group'].strip(), 'Asset class')
-        if group in (CASH, TREASURY, STOCK_MARKET):
-            raise ValueError('This name is reserved for an allocation category.')
+        group = allocation_name(STOCK_MARKET, row['group'].strip())
         ticker = identifier(row['main_ticker'].strip(), 'Representative ticker')
         for item in self.class_table.get_rows():
             if item != old and (item['group'] == group or (ticker and item['main_ticker'] == ticker)):
@@ -516,7 +570,8 @@ class PortfolioApp:
     def _positions(self):
         classes = {row['group']: row['main_ticker'] for row in self.class_table.get_rows()}
         holdings = tuple(Holding(row['ticker'], row['group'], int(row['shares']),
-                                 row['ticker'] == classes.get(row['group'])) for row in self.holdings_table.get_rows())
+                                 row['ticker'] == classes.get(row['group']), details_from_row(row))
+                         for row in self.holdings_table.get_rows())
         cash = {row['currency']: float(row['amount']) for row in self.cash_table.get_rows()}
         manual = tuple(ManualHolding(parse_manual_amount(row['amount']), row['currency'])
                        for row in self.manual_table.get_rows())
@@ -530,15 +585,19 @@ class PortfolioApp:
         listed = [{'group': h.group, 'main_ticker': h.ticker} for h in portfolio.holdings if h.is_main]
         self.target_table.set_rows(_target_rows(portfolio))
         self.class_table.set_rows(listed)
-        self.holdings_table.set_rows([{'ticker': h.ticker, 'group': h.group, 'shares': str(h.shares)} for h in portfolio.holdings])
+        self.holdings_table.set_rows([{'ticker': h.ticker, 'group': h.group, 'shares': str(h.shares),
+                                       **details_row(h.details)} for h in portfolio.holdings])
+        self.assets_table.show_holdings(self.holdings_table.get_rows())
+        self.asset_lookups.clear()
         self.cash_table.set_rows([{'currency': currency, 'amount': str(amount)} for currency, amount in portfolio.cash.items()])
         self.manual_table.set_rows([{'currency': h.currency, 'amount': str(h.amount)} for h in portfolio.manual_holdings])
-        self._sync_target_currencies()
         self.market = None
+        self.assets_table.set_market(None)
         self.source.set('Prices not loaded')
         self.dirty = False
         self.save_button.configure(text='Save inputs')
         self._request_changed()
+        self.real_allocations.refresh()
         self._refresh_charts()
         return portfolio
 
@@ -551,26 +610,27 @@ class PortfolioApp:
     def _refresh_charts(self):
         scope = self.chart_scope.get()
         held = self._held_allocations()
-        self.target_table.set_holdings(held)
         self.target_table.set_scope(scope)
-        self.real_allocations.refresh()
         self.real_allocations.set_scope(scope)
         rows = self.target_table.get_rows()
-        targets = {row['group']: float(row['target']) for row in rows
-                   if row['parent'] == ('' if scope == 'All' else scope)}
+        targets = ({parent: fsum(float(row['target']) for row in rows if row['parent'] == parent)
+                    for parent in (STOCK_MARKET, TREASURY, CASH)} if scope == 'All' else
+                   {row['group']: float(row['target']) for row in rows if row['parent'] == scope})
         active = ({parent for parent, _ in held} if scope == 'All'
                   else {name for parent, name in held if parent == scope})
         active.update(name for name, target in targets.items() if target)
         colors = {name: COLORS[index % len(COLORS)] for index, name in enumerate(sorted(targets))}
         order = sorted(active, key=lambda name: (-targets.get(name, 0), name))
-        targets = {name: targets.get(name, 0) for name in order}
-        self._refresh_target_chart(targets, colors)
+        visible_targets = {name: targets[name] for name in sorted(targets, key=lambda name: (-targets[name], name))
+                           if scope == 'All' or targets[name] > 0}
+        self._refresh_target_chart(visible_targets, colors)
         self._refresh_current_chart(scope, order, colors)
 
     def _refresh_target_chart(self, targets, colors):
         try:
             self.target_table.allocation()
-            self.target_chart.set_data(targets, colors, empty_message='No targets in this category')
+            self.target_chart.set_data(targets, colors, empty_message='No targets in this category',
+                                       percent_values=True)
             if self.target_error and self.status.get() == self.target_error:
                 self.status.set('Targets valid. Changes not saved.' if self.dirty else 'Targets valid.')
             self.target_error = ''
@@ -580,10 +640,10 @@ class PortfolioApp:
             self.status.set(str(error))
 
     def _refresh_current_chart(self, scope, order, colors):
-        value_label = 'Total portfolio' if scope == 'All' else scope
+        self.cash_deficit_note.grid_remove()
         try:
             if self.market is None:
-                raise ValueError('Load or refresh prices to show current allocation')
+                raise ValueError('Waiting for automatic price update')
             branches = self._current_values(scope)
             values = ({parent: fsum(children.values()) for parent, children in branches.items()}
                       if scope == 'All' else branches[scope])
@@ -591,13 +651,12 @@ class PortfolioApp:
             deficit = any(value < 0 for value in values.values())
             values = {name: max(0., values.get(name, 0.)) for name in order}
             self.current_chart.set_data(values, colors, empty_message='No holdings in this category')
-            caption = f'{value_label} value: {whole_number(part)} {self.market.base_currency}'
+            self.current_title.set(f'Current allocation · {whole_number(part)} {self.market.base_currency}')
             if deficit:
-                caption += ' · Pie excludes cash deficit'
-            self.summary.set(caption)
+                self.cash_deficit_note.grid()
         except (ValueError, KeyError, OverflowError) as error:
             self.current_chart.set_data({}, colors, empty_message=str(error))
-            self.summary.set(f'{value_label} value: unavailable')
+            self.current_title.set('Current allocation · unavailable')
 
     def _current_values(self, scope='All'):
         values = current_values(*self._positions(), self.market, parent=None if scope == 'All' else scope)
@@ -606,18 +665,58 @@ class PortfolioApp:
             branches[parent][child] = value
         return branches
 
-    def _run(self, label, work, complete, *, timeout=None):
+    def _price_age(self, market):
+        return (datetime.now(timezone.utc) - market.fetched_at).total_seconds()
+
+    def _prices_needed(self, portfolio):
+        if (self.market is None or self.market.base_currency != self.base_currency.get()
+                or self._price_age(self.market) >= PRICE_REFRESH_SECONDS):
+            return True
+        try:
+            self.market.validate_portfolio(portfolio)
+        except ValueError:
+            return True
+        return False
+
+    def _refresh_due_prices(self):
+        if (self.busy or monotonic() < self.next_price_refresh
+                or self.root.tk.call('grab', 'current', self.root._w)):
+            return
+        self.next_price_refresh = monotonic() + 30  # Retry incomplete drafts without interrupting editing.
+        try:
+            portfolio = self.portfolio()
+        except ValueError:
+            return
+        if self._prices_needed(portfolio):
+            self.refresh_prices(portfolio, quiet=True)
+        else:
+            self.next_price_refresh = monotonic() + max(1, PRICE_REFRESH_SECONDS - self._price_age(self.market))
+
+    def _calculate_plan(self, portfolio, market, mode):
+        def complete(plan):
+            self.plan = plan
+            context = f'Selling {mode.lower()} · {self.source.get()}'
+            self.plan_view.show_plan(plan, portfolio, market, context=context)
+            self.plan_report = f'{context}\n\n{format_plan(plan, portfolio.allocation)}'
+            self.export_button.configure(state='normal')
+            self.notebook.select(self.plan_page)
+            self.status.set('Plan ready. Current holdings have not been changed.')
+        self._run('Calculating trade recommendations…',
+                  lambda: rebalance(portfolio, market, allow_selling=mode == MODES[1]),
+                  complete)
+
+    def _run(self, label, work, complete, *, timeout=None, quiet=False):
         if self.busy:
             return
         self.job_id += 1
         job_id = self.job_id
         revision = self.revision
-        self.job_label, self.job_started = label, monotonic()
+        self.job_label, self.job_started, self.job_quiet = label, monotonic(), quiet
         self._set_busy(True)
         self.status.set(label)
         if timeout:
             self.timeout_id = self.root.after(timeout, lambda: self.cancel_work(
-                'Price refresh timed out. Retry or load a snapshot.'))
+                f'{label.rstrip("…")} timed out. Please retry.'))
         def worker():
             try:
                 result = work()
@@ -634,18 +733,20 @@ class PortfolioApp:
                 break
             if job_id != self.job_id:
                 continue
+            quiet = self.job_quiet
             self._finish_work()
             if revision != self.revision:
-                self.status.set('Inputs changed during calculation. Refresh or generate a new plan.')
+                self.status.set('Inputs changed during calculation. Generate a new plan.')
             elif error:
-                self.status.set(str(error))
-                messagebox.showerror('Could not complete operation', str(error), parent=self.root)
+                self._error(error, quiet=quiet)
             else:
                 try:
                     complete(result)
                 except (ValueError, OSError) as error:
-                    self._error(error)
+                    self._error(error, quiet=quiet)
         if not self.closed:
+            self._refresh_due_prices()
+            self._lookup_missing_assets()
             if self.busy:
                 self.status.set(f'{self.job_label} · {monotonic() - self.job_started:.0f} s elapsed')
             self.poll_id = self.root.after(80, self._poll)
@@ -659,31 +760,26 @@ class PortfolioApp:
     def _set_busy(self, busy):
         self.busy = busy
         state = 'disabled' if busy else 'normal'
-        for button in (self.open_button, self.save_button, self.refresh_button, self.load_prices_button,
-                       self.save_prices_button, self.generate_button, self.time_entry):
+        for button in (self.open_button, self.save_button, self.generate_button):
             button.configure(state=state)
         for combo in (self.base_entry, self.mode_box):
             combo.configure(state='disabled' if busy else 'readonly')
-        for table in (self.class_table, self.target_table, self.real_allocations):
+        for table in (self.class_table, self.target_table, self.real_allocations, self.assets_table):
             table.set_enabled(not busy)
         self.cancel_button.configure(state='normal' if busy else 'disabled')
         self.progress.start(12) if busy else self.progress.stop()
 
-    def _accept_market(self, market, label):
+    def _accept_market(self, market):
+        if market.base_currency != self.base_currency.get():
+            raise ValueError('Fetched prices use the wrong base currency.')
         market.validate_portfolio(self.portfolio())
-        self._request_changed()
         self.market = market
-        stamp = (f'Fetched {datetime.fromisoformat(market.fetched_at.replace("Z", "+00:00")).astimezone():%Y-%m-%d %H:%M}'
-                 if market.fetched_at else 'Fetch time unknown')
-        self.source.set(f'{label} · {stamp}')
+        self.assets_table.set_market(market)
+        self.next_price_refresh = monotonic() + max(0, PRICE_REFRESH_SECONDS - self._price_age(market))
+        self.source.set(f'Fetched {market.fetched_at.astimezone():%Y-%m-%d %H:%M}')
         self._refresh_charts()
-        self.status.set('Prices ready. Review inputs and generate a plan.')
-
-    def _load_market(self, path):
-        market = load_snapshot(path)
-        if market.base_currency != currency_code(self.base_currency.get()):
-            raise ValueError('Snapshot currency differs from the selected base currency.')
-        self._accept_market(market, f'Snapshot: {path.name}')
+        self.status.set('Prices updated. Generate a new plan to use them.' if self.plan else
+                        'Prices ready. Review inputs and generate a plan.')
 
     def _may_discard(self):
         if not self.dirty:
@@ -691,15 +787,14 @@ class PortfolioApp:
         choice = messagebox.askyesnocancel('Unsaved inputs', 'Save your input changes first?', parent=self.root)
         return self.save() if choice else choice is False
 
-    def _error(self, error):
+    def _error(self, error, *, quiet=False):
         self.status.set(str(error))
-        messagebox.showerror('Check inputs', str(error), parent=self.root)
+        if not quiet:
+            messagebox.showerror('Check inputs', str(error), parent=self.root)
 
 
 
 
 def _target_rows(portfolio):
-    top, children = portfolio.allocation.top, portfolio.allocation.children
-    return ([{'parent': '', 'group': parent, 'target': str(value)} for parent, value in top.items()]
-            + [{'parent': parent, 'group': name, 'target': str(value)}
-               for parent, child in children.items() for name, value in child.items()])
+    return [{'parent': parent, 'group': name, 'target': str(value)}
+            for parent, weights in portfolio.allocation.weights.items() for name, value in weights.items()]

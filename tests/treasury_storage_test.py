@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, Portfolio
 import portfolio.storage as portfolio_io
-from portfolio.storage import (config_signature, fetch_snapshot, load_portfolio,
+from portfolio.storage import (config_signature, fetch_market_data, load_portfolio,
                           load_portfolio_with_signature, save_portfolio)
 
 
@@ -20,14 +20,11 @@ class TreasuryStorageTests(unittest.TestCase):
         self.directory = Path(temporary.name) / "config"
         self.portfolio = Portfolio(
             (Holding("A", "stock", 4),), AllocationTargets(
-                {STOCK_MARKET: 60, TREASURY: 40, CASH: 0},
-                {STOCK_MARKET: {"stock": 100}, TREASURY: {"EUR": 50, "HUF": 50}, CASH: {}}),
+                {STOCK_MARKET: {"stock": 60}, TREASURY: {"EUR": 20, "HUF": 20}, CASH: {}}),
             {"EUR": 20}, (ManualHolding(2000, "EUR"), ManualHolding(300000, "HUF")))
         self.listed_only = Portfolio((Holding("A", "stock", 4),), AllocationTargets(
-            {STOCK_MARKET: 100, TREASURY: 0, CASH: 0},
             {STOCK_MARKET: {"stock": 100}, TREASURY: {}, CASH: {}}), {})
         self.manual_only = Portfolio((), AllocationTargets(
-            {STOCK_MARKET: 0, TREASURY: 100, CASH: 0},
             {STOCK_MARKET: {}, TREASURY: {"EUR": 50, "HUF": 50}, CASH: {}}),
             {}, self.portfolio.manual_holdings)
 
@@ -172,20 +169,20 @@ class TreasuryStorageTests(unittest.TestCase):
         portfolio = Portfolio(self.portfolio.holdings, self.portfolio.allocation,
                               {"HUF": 1, "USD": 2}, self.portfolio.manual_holdings)
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
-            snapshot = fetch_snapshot(portfolio)
+            market = fetch_market_data(portfolio)
         self.assertEqual([call.args[0] for call in ticker.call_args_list],
                          ["A", "HUFEUR=X", "USDEUR=X"])
-        self.assertEqual(set(snapshot.quotes), {"A"})
-        self.assertEqual(dict(snapshot.rates), {"EUR": 1, "HUF": 0.0025, "USD": 0.9})
+        self.assertEqual(set(market.quotes), {"A"})
+        self.assertEqual(dict(market.rates), {"EUR": 1, "HUF": 0.0025, "USD": 0.9})
 
     def test_fetch_manual_only_needs_fx_but_no_asset_quotes(self):
         ticker = Mock(return_value=SimpleNamespace(fast_info={"last_price": 0.0025}))
         portfolio = self.manual_only
         with patch.dict("sys.modules", {"yfinance": SimpleNamespace(Ticker=ticker)}):
-            snapshot = fetch_snapshot(portfolio)
+            market = fetch_market_data(portfolio)
         ticker.assert_called_once_with("HUFEUR=X")
-        self.assertEqual(dict(snapshot.quotes), {})
-        self.assertEqual(dict(snapshot.rates), {"EUR": 1, "HUF": 0.0025})
+        self.assertEqual(dict(market.quotes), {})
+        self.assertEqual(dict(market.rates), {"EUR": 1, "HUF": 0.0025})
 
 
 if __name__ == "__main__":

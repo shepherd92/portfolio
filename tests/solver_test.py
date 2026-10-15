@@ -123,26 +123,25 @@ class SolverTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Native solver failed'):
                 solve()
 
-    def test_repaired_hierarchical_plan_has_no_native_debug_output(self):
+    def test_mixed_currency_plan_has_no_native_debug_output(self):
         # This model reached the stray C printf in SciPy's bundled HiGHS 1.12.
         # A subprocess captures native stdout without changing the GUI's FDs.
         program = dedent('''
             from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY,
-                                Holding, ManualHolding, MarketSnapshot, Portfolio, Quote)
+                                Holding, ManualHolding, MarketData, Portfolio, Quote)
             from portfolio.planning import rebalance
 
             allocation = AllocationTargets(
-                {STOCK_MARKET: 60, TREASURY: 25, CASH: 15},
-                {STOCK_MARKET: {'US': 60, 'EU': 40},
-                 TREASURY: {'EUR': 40, 'HUF': 60}, CASH: {'EUR': 100}})
+                {STOCK_MARKET: {'US': 36, 'EU': 24},
+                 TREASURY: {'EUR': 10, 'HUF': 15}, CASH: {'EUR': 15}})
             portfolio = Portfolio(
                 (Holding('US', 'US', 100), Holding('EU', 'EU', 50)), allocation, {'EUR': 63.11},
                 (ManualHolding(2500.75, 'EUR'),
                  ManualHolding(2500042.35, 'HUF')))
-            market = MarketSnapshot(
+            market = MarketData(
                 {'US': Quote(69.9, 'EUR'), 'EU': Quote(7.63, 'EUR')},
                 {'HUF': 1 / 399.7654321})
-            plan = rebalance(portfolio, market, allow_selling=True, time_limit=10)
+            plan = rebalance(portfolio, market, allow_selling=True)
             assert plan.trades and plan.manual_trades
             assert plan.cash_value >= 0
             assert abs(sum(plan.allocation_values.values()) - plan.wealth) < 1e-6

@@ -12,6 +12,12 @@ htmlcov/
 # Generated documentation
 docs/build/
 
-# Saved market prices and exchange rates
-/snapshots/
-config
+# Personal portfolio inputs
+config/
+
+# Local binaries and packaging intermediates
+/build/
+/dist/
+*.AppImage
+*.AppImage.sha256
+/PortfolioPlanner-x86_64.desktop
