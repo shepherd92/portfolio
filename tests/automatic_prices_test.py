@@ -1,7 +1,7 @@
 """Automatic market-data refresh and planning use no external network in tests."""
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, MarketData, Portfolio, Quote
 from portfolio.storage import save_portfolio
+from portfolio.market import BaseRate
 from ui.app import PortfolioApp
 
 
@@ -21,11 +22,15 @@ class AutomaticPricesTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.market = MarketData({'MAIN': Quote(10, 'EUR')}, {})
+        self.market = MarketData({'MAIN': Quote(10, 'EUR')}, {'HUF': .0025})
         portfolio = Portfolio((Holding('MAIN', 'Stocks', 2),),
-                              AllocationTargets({STOCK_MARKET: {'Stocks': 100}, TREASURY: {}, CASH: {'EUR': 0}}),
+                              AllocationTargets({STOCK_MARKET: {'Stocks': 100}, TREASURY: {}, CASH: {'EUR': 0}},
+                                                {'Stocks': 'Equities'}),
                               {'EUR': 10})
         save_portfolio(portfolio, directory.name)
+        rate = patch('ui.app.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1)))
+        self.rate = rate.start()
+        self.addCleanup(rate.stop)
         fetch = patch('ui.app.fetch_market_data', return_value=self.market)
         errors = patch('ui.app.messagebox.showerror')
         self.fetch, self.errors = fetch.start(), errors.start()
@@ -37,9 +42,10 @@ class AutomaticPricesTests(unittest.TestCase):
         self.addCleanup(self.close)
         self.finish_worker()
         self.fetch.reset_mock()
+        self.rate.reset_mock()
 
     def close(self):
-        self.app.dirty = False
+        self.app.dirty = self.app.calculator.dirty = False
         if not self.app.closed:
             self.app.close()
 
@@ -65,7 +71,7 @@ class AutomaticPricesTests(unittest.TestCase):
             (replace(fresh, fetched_at=now - timedelta(seconds=900)), portfolio, True),
             (MarketData({}, {}), portfolio, True),
             (MarketData(fresh.quotes, {'EUR': .9}, 'USD'), portfolio, True),
-            (fresh, replace(portfolio, cash={'EUR': 10, 'HUF': 1000}), True),
+            (replace(fresh, rates={}), replace(portfolio, cash={'EUR': 10, 'HUF': 1000}), True),
         ]
         with patch('ui.app.datetime') as clock:
             clock.now.return_value = now
@@ -83,7 +89,7 @@ class AutomaticPricesTests(unittest.TestCase):
                 self.fetch.reset_mock()
                 self.app.generate_plan()
                 self.finish_worker()
-                self.fetch.assert_called_once_with(portfolio, 'EUR')
+                self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',))
                 self.assertIs(self.app.market, self.market)
                 self.assertIsNotNone(self.app.plan)
                 self.assertIn('Plan ready', self.app.status.get())
@@ -102,12 +108,35 @@ class AutomaticPricesTests(unittest.TestCase):
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '10'}, {'currency': 'HUF', 'amount': '4000'}])
         self.app._edited()
         portfolio = self.app.portfolio()
+        self.app.market = replace(self.market, rates={})
         self.fetch.return_value = MarketData(self.market.quotes, {'HUF': .0025})
         self.app.generate_plan()
         self.finish_worker()
-        self.fetch.assert_called_once_with(portfolio, 'EUR')
+        self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',))
         self.assertIsNotNone(self.app.plan)
         self.assertEqual(self.app.portfolio().cash, {'EUR': 10, 'HUF': 4000})
+        self.errors.assert_not_called()
+
+    def test_native_income_quotes_refresh_display_without_rewriting_saved_income(self):
+        calculator = self.app.calculator
+        native = replace(calculator.settings(), monthly_income=100.25, income_currency='USD')
+        calculator._set_inputs(native)
+        calculator._changed()
+        self.assertTrue(calculator.save())
+        original = (self.app.directory / 'calculator.json').read_bytes()
+        self.assertTrue(self.app._prices_needed(self.app.portfolio()))
+        self.fetch.return_value = replace(self.market, rates={'EUR': 1, 'HUF': .0025, 'USD': .9})
+        with patch('ui.app.monotonic', return_value=100):
+            self.app.next_price_refresh = 100
+            self.app._refresh_due_prices()
+            self.finish_worker()
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF', 'USD'))
+        self.assertAlmostEqual(float(calculator._inputs['monthly_income'].get()), 90.225)
+        self.app._accept_market(replace(self.market, rates={'EUR': 1, 'HUF': .0025, 'USD': .95}))
+        self.assertAlmostEqual(float(calculator._inputs['monthly_income'].get()), 95.2375)
+        self.assertEqual(calculator.settings(), native)
+        self.assertEqual((self.app.directory / 'calculator.json').read_bytes(), original)
+        self.assertFalse(calculator.dirty)
         self.errors.assert_not_called()
 
     def test_failed_required_fetch_never_plans_with_stale_fallback(self):
@@ -201,17 +230,20 @@ class AutomaticPricesTests(unittest.TestCase):
         plan, report = self.app.plan, self.app.plan_report
         context, source = self.app.plan_view.status.get(), self.app.source.get()
         later = self.market.fetched_at + timedelta(minutes=16)
-        updated = MarketData({'MAIN': Quote(20, 'EUR')}, {}, fetched_at=later)
+        updated = MarketData({'MAIN': Quote(20, 'EUR')}, {'HUF': .0025}, fetched_at=later)
         self.fetch.return_value = updated
         with patch('ui.app.datetime') as clock, patch('ui.app.monotonic', return_value=100):
             clock.now.return_value = later
             self.app.next_price_refresh = 100
             self.app._refresh_due_prices()
             self.finish_worker()
-        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR')
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',))
         self.assertIs(self.app.market, updated)
         self.assertNotEqual(self.app.source.get(), source)
         self.assertIn('50 EUR', self.app.current_title.get())
+        self.assertEqual(self.app.calculator.portfolio_value.get(), '50')
+        self.assertEqual(self.app._calculator_total(), 20_000)
+        self.assertFalse(self.app.calculator.dirty)
         self.assertIs(self.app.plan, plan)
         self.assertEqual(self.app.plan_report, report)
         self.assertEqual(self.app.plan_view.status.get(), context)
@@ -234,7 +266,7 @@ class AutomaticPricesTests(unittest.TestCase):
     def test_new_held_ticker_schedules_deferred_refresh(self):
         self.app.holdings_table.set_rows([{'ticker': 'MAIN', 'group': 'Stocks', 'shares': '2'},
                                          {'ticker': 'NEW', 'group': 'Stocks', 'shares': '1'}])
-        self.fetch.return_value = MarketData({**self.market.quotes, 'NEW': Quote(5, 'EUR')}, {})
+        self.fetch.return_value = MarketData({**self.market.quotes, 'NEW': Quote(5, 'EUR')}, {'HUF': .0025})
         with patch('ui.app.monotonic', return_value=100):
             self.app._edited()
             self.assertEqual(self.app.next_price_refresh, 100.5)
@@ -243,7 +275,7 @@ class AutomaticPricesTests(unittest.TestCase):
         with patch('ui.app.monotonic', return_value=100.5):
             self.app._refresh_due_prices()
             self.finish_worker()
-        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR')
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',))
         self.assertEqual(self.app.market.price('NEW'), 5)
         self.errors.assert_not_called()
 
@@ -256,14 +288,97 @@ class AutomaticPricesTests(unittest.TestCase):
         self.assertIs(self.app.market, self.market)
         self.errors.assert_called_once()
 
+    def test_base_rate_refreshes_every_fifteen_minutes_without_opening_calculator(self):
+        for index, page in enumerate((self.app.portfolio_page, self.app.plan_page)):
+            with self.subTest(page=str(page)):
+                self.app.notebook.select(page)
+                self.app.next_base_rate_refresh = 1000 + index * 900
+                with patch('ui.app.monotonic', return_value=999 + index * 900):
+                    self.app._update_calculator()
+                    self.rate.assert_not_called()
+                with patch('ui.app.monotonic', return_value=1000 + index * 900):
+                    self.app._update_calculator()
+                    self.finish_worker()
+                    self.rate.assert_called_once_with()
+                    self.assertEqual(self.app.next_base_rate_refresh, 1900 + index * 900)
+                    self.app._update_calculator()
+                    self.rate.assert_called_once_with()
+                self.rate.reset_mock()
+        self.errors.assert_not_called()
+
+    def test_due_base_rate_refresh_waits_until_busy_and_modal_work_finishes(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.update()
+        dialog.grab_set()
+        try:
+            with patch('ui.app.monotonic', return_value=100):
+                self.app.next_base_rate_refresh = 100
+                self.app.busy = True
+                self.app._update_calculator()
+                self.app.busy = False
+                self.app._update_calculator()
+                self.rate.assert_not_called()
+                self.assertEqual(self.app.next_base_rate_refresh, 100)
+                dialog.destroy()
+                self.app._update_calculator()
+                self.finish_worker()
+                self.rate.assert_called_once_with()
+                self.assertEqual(self.app.next_base_rate_refresh, 1000)
+        finally:
+            self.app.busy = False
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+    def test_failed_base_rate_refresh_keeps_cached_rate_plan_and_backs_off(self):
+        self.app.generate_plan()
+        self.finish_worker()
+        plan, report, context = self.app.plan, self.app.plan_report, self.app.plan_view.status.get()
+        self.rate.side_effect = ValueError('MNB offline')
+        with patch('ui.app.monotonic', return_value=100):
+            self.app.next_base_rate_refresh = 100
+            self.app._update_calculator()
+            self.finish_worker()
+            self.app._update_calculator()
+            self.assertEqual(self.app.next_base_rate_refresh, 1000)
+        self.rate.assert_called_once_with()
+        self.errors.assert_not_called()
+        self.assertEqual(self.app.calculator.planning_settings().returns.mak, 5)
+        self.assertIn('cached', self.app.calculator.rate_description)
+        self.assertIs(self.app.plan, plan)
+        self.assertEqual(self.app.plan_report, report)
+        self.assertEqual(self.app.plan_view.status.get(), context)
+        self.assertTrue(self.app.export_button.instate(['!disabled']))
+
+    def test_successful_base_rate_refresh_keeps_completed_plan_and_original_rate_context(self):
+        self.app.generate_plan()
+        self.finish_worker()
+        plan, report, context = self.app.plan, self.app.plan_report, self.app.plan_view.status.get()
+        self.assertIn('5%', report)
+        self.rate.return_value = BaseRate(6.25, date(2026, 2, 1))
+        with patch('ui.app.monotonic', return_value=100):
+            self.app.next_base_rate_refresh = 100
+            self.app._update_calculator()
+            self.finish_worker()
+        self.rate.assert_called_once_with()
+        self.assertEqual(self.app.calculator.planning_settings().returns.mak, 6.25)
+        self.assertIn('6.25%', self.app.calculator.rate_description)
+        self.assertIs(self.app.plan, plan)
+        self.assertEqual(self.app.plan_report, report)
+        self.assertEqual(self.app.plan_view.status.get(), context)
+        self.assertTrue(self.app.export_button.instate(['!disabled']))
+        self.assertFalse(self.app.calculator.dirty)
+        self.errors.assert_not_called()
+
     def test_canceling_fetch_prevents_chained_plan_and_discards_late_prices(self):
         gate, completed = threading.Event(), threading.Event()
         self.addCleanup(gate.set)
-        def fetch(*_):
+        def fetch(*_, **kwargs):
             gate.wait(3)
             completed.set()
             return self.market
         self.fetch.side_effect = fetch
+        self.app.calculator.set_base_rate(5, 'effective 2026-01-01')
+        self.app.next_base_rate_refresh = time.monotonic() + 86400
         self.app.market = None
         with patch.object(self.app, '_calculate_plan') as calculate:
             self.app.generate_plan()

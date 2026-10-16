@@ -14,10 +14,11 @@ CASH = "Cash"
 STOCK_MARKET = "Stock market"
 TREASURY = "MÁK"
 ALLOCATION_BRANCHES = (STOCK_MARKET, TREASURY, CASH)
+MARKET_CATEGORIES = ('Equities', 'Gold', 'Bonds')
 
 
 def number(value, name, *, minimum=None):
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
         raise ValueError(f"{name} must be a finite number")
     try:
         value = float(value)
@@ -92,6 +93,7 @@ class AllocationTargets:
     """Every asset target is a percentage of total portfolio value."""
 
     weights: Mapping[str, Mapping[str, float]]
+    categories: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if set(self.weights) != set(ALLOCATION_BRANCHES):
@@ -107,18 +109,42 @@ class AllocationTargets:
             weights[branch] = MappingProxyType(values)
         total = fsum(value for values in weights.values() for value in values.values())
         if not isclose(total, 100, abs_tol=1e-8, rel_tol=0):
-            shown_total = Decimal(str(total)).normalize()
-            difference = abs(100 - shown_total).normalize()
-            change = f'{"add" if total < 100 else "reduce by"} {difference:f}%'
-            raise ValueError(f'Portfolio targets total {shown_total:f}%: {change}. Targets must sum to 100%.')
+            difference = abs(100 - total)
+            if difference < .005:
+                raise ValueError('Targets must sum to 100%; small differences can be hidden by display rounding.')
+            shown_total = f'{total:.2f}'.rstrip('0').rstrip('.')
+            shown_difference = f'{difference:.2f}'.rstrip('0').rstrip('.')
+            change = f'{"add" if total < 100 else "reduce by"} {shown_difference}%'
+            raise ValueError(f'Portfolio targets total {shown_total}%: {change}. Targets must sum to 100%.')
         object.__setattr__(self, "weights", MappingProxyType(weights))
+        if not isinstance(self.categories, Mapping):
+            raise ValueError('Investment categories must map stock classes to categories')
+        if self.categories.keys() - weights[STOCK_MARKET].keys():
+            raise ValueError('Only stock market asset classes can have investment categories')
+        categories = {group: self.categories.get(group, '') for group in weights[STOCK_MARKET]}
+        if any(category not in ('', *MARKET_CATEGORIES) for category in categories.values()):
+            raise ValueError('Investment category must be Equities, Gold, or Bonds')
+        object.__setattr__(self, 'categories', MappingProxyType(categories))
 
     @property
     def totals(self):
         return MappingProxyType({branch: fsum(values.values()) for branch, values in self.weights.items()})
 
 
-def parse_manual_amount(text):
+def parse_currency_amount(text, currency):
+    """Parse an entered balance, rejecting fractional HUF before float conversion."""
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError('Enter a finite currency amount') from error
+    if not amount.is_finite():
+        raise ValueError('Enter a finite currency amount')
+    if currency_code(currency) == 'HUF' and amount != amount.to_integral_value():
+        raise ValueError('HUF amounts must be whole numbers; decimals are not allowed')
+    return number(float(amount), 'Currency amount')
+
+
+def parse_manual_amount(text, currency=None):
     """Validate entered hundredths before float conversion can erase digits."""
     try:
         amount = Decimal(text)
@@ -126,6 +152,8 @@ def parse_manual_amount(text):
         raise ValueError("Manual asset value must be a decimal number") from error
     if not amount.is_finite() or amount < 0:
         raise ValueError("Manual asset value must be finite and nonnegative")
+    if currency is not None:
+        parse_currency_amount(text, currency)
     if amount > Decimal(MAX_SHARES) / 100:
         raise ValueError("Manual asset value exceeds the supported monetary range")
     cents = amount * 100
@@ -265,7 +293,6 @@ class Portfolio:
                 raise ValueError(f"Duplicate cash currency: {currency}")
             cash[currency] = number(value, "Cash")
         object.__setattr__(self, "holdings", holdings)
-        object.__setattr__(self, "allocation", allocation)
         object.__setattr__(self, "manual_holdings", tuple(sorted(manual, key=lambda item: item.currency)))
         object.__setattr__(self, "cash", MappingProxyType(cash))
 

@@ -80,13 +80,16 @@ class RefinementTests(unittest.TestCase):
             Quote(10**1000, 'EUR')
 
     def test_solver_success_cannot_hide_a_violated_budget(self):
-        portfolio = portfolio_fixture((Holding('A', 'group', 0),), {'group': 100}, {'EUR': 1})
-        market = MarketData({'A': Quote(10, 'EUR')}, {})
+        portfolio = portfolio_fixture((Holding('A', 'A', 0), Holding('B', 'B', 0)),
+                                      {'A': 50, 'B': 50}, {'EUR': 15})
+        market = MarketData({'A': Quote(10, 'EUR'), 'B': Quote(10, 'EUR')}, {})
         real_milp = planning.milp
 
         def bad_solution(*args, **kwargs):
             result = real_milp(*args, **kwargs)
-            result.x[0] = 1
+            # Each holding is individually affordable; their combined cost is not.
+            result.x[:2] = 1
+            result.x[2:] = 100  # Satisfy error/change constraints to isolate the budget.
             return result
 
         with patch.object(planning, 'milp', side_effect=bad_solution), self.assertRaises(PlanningError):

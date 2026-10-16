@@ -1,13 +1,20 @@
-all:
-	make test
+PYTHON ?= python3
+
+.PHONY: all test test-gui appimage coverage coverage_report
+
+all: test
 
 test:
-	python3 -m unittest discover -s tests -p "*_test.py" -v
+	$(PYTHON) -m unittest discover -s tests -p '*_test.py' -v
+
+test-gui:
+	REBALANCE_GUI_TESTS=1 xvfb-run -a $(PYTHON) -m unittest discover -s tests -p '*_test.py' -v
+
+appimage:
+	$(PYTHON) tools/build_appimage.py
 
 coverage:
-	coverage run -m unittest discover -s tests -p "*_test.py" -v
-
+	$(PYTHON) -m coverage run -m unittest discover -s tests -p '*_test.py' -v
 
 coverage_report:
-	coverage html
-
+	$(PYTHON) -m coverage html

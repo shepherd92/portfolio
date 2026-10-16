@@ -6,7 +6,7 @@ from tkinter import ttk
 import unittest
 from unittest.mock import patch
 
-from ui.widgets import DataTable
+from ui.table import DataTable
 
 
 @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1',
@@ -57,7 +57,7 @@ class WidgetEditingTests(unittest.TestCase):
                 self.root.update()
                 edit.assert_called_once_with(*args)
         self.table.set_enabled(False)
-        with patch('ui.widgets.show_modal') as modal, patch('ui.widgets.messagebox.askyesno') as confirm:
+        with patch('ui.table.show_modal') as modal, patch('ui.table.messagebox.askyesno') as confirm:
             for key in ('<Return>', '<F2>', '<Insert>', '<Delete>'):
                 self.table.tree.event_generate(key)
                 self.root.update()
@@ -80,7 +80,7 @@ class WidgetEditingTests(unittest.TestCase):
                         if isinstance(child, ttk.Button) and child['text'] == 'Save')
             save.invoke()
 
-        with patch('ui.widgets.show_modal', side_effect=edit):
+        with patch('ui.table.show_modal', side_effect=edit):
             self.table.edit_selected()
         self.root.update()
         self.assertEqual(self.table.row(item), {'ticker': 'MAIN', 'group': 'US', 'shares': '25'})
@@ -97,7 +97,7 @@ class WidgetEditingTests(unittest.TestCase):
             self.assertEqual(first.get(), '')
             dialog.destroy()
 
-        with patch('ui.widgets.show_modal', side_effect=cancel):
+        with patch('ui.table.show_modal', side_effect=cancel):
             self.table.add()
         self.assertEqual(len(self.table.get_rows()), 2)
         self.assertEqual(self.table.tree.selection(), (item,))
@@ -105,12 +105,12 @@ class WidgetEditingTests(unittest.TestCase):
 
     def test_delete_keeps_confirmation_and_selects_remaining_row(self):
         item = self.select()
-        with patch('ui.widgets.messagebox.askyesno', return_value=False) as confirm:
+        with patch('ui.table.messagebox.askyesno', return_value=False) as confirm:
             self.table.tree.event_generate('<Delete>')
             self.root.update()
             confirm.assert_called_once()
         self.assertTrue(self.table.tree.exists(item))
-        with patch('ui.widgets.messagebox.askyesno', return_value=True):
+        with patch('ui.table.messagebox.askyesno', return_value=True):
             self.table.tree.event_generate('<Delete>')
             self.root.update()
         self.assertFalse(self.table.tree.exists(item))

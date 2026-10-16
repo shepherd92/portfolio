@@ -29,7 +29,7 @@ def format_amount(value, places=0):
 
 
 def format_percent(value):
-    return f'{format_amount(value, 2)}%'
+    return f"{format_amount(value, 2).rstrip('0').rstrip('.')}%"
 
 
 def format_plan(plan, targets):
@@ -44,7 +44,7 @@ def format_plan(plan, targets):
                              f"{format_amount(fx.to_amount)} {fx.to_currency}")
         for trade in trades:
             lines.append(f"{action:4}  {format_amount(abs(trade.shares)):>6} {trade.ticker:12} "
-                         f"@ {format_amount(trade.price, 2)} {trade.currency}; "
+                         f"@ {format_amount(trade.price, 0 if trade.currency == 'HUF' else 2)} {trade.currency}; "
                          f"ending shares {format_amount(plan.final_shares[trade.ticker])}")
         for trade in plan.manual_trades:
             if (trade.amount > 0) == (action == 'BUY'):

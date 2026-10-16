@@ -1,21 +1,19 @@
-"""CSV portfolio storage and live market data fetching."""
+"""CSV portfolio and JSON calculator input storage."""
 
 import csv
 from dataclasses import asdict, fields
+from datetime import date
+from decimal import Decimal
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
-import sys
 import tempfile
 
+from portfolio.calculator import CalculatorSettings, Expense, MonthlyCost, ReturnAssumptions
 from portfolio.models import (AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding,
-                    MarketData, Portfolio, Quote, currency_code, parse_manual_amount)
-
-
-RESOURCE_DIRECTORY = Path(__file__).resolve().parents[1]
-SCRIPT_DIRECTORY = (Path(os.environ.get("APPIMAGE") or sys.executable).resolve().parent
-                    if getattr(sys, "frozen", False) else RESOURCE_DIRECTORY)
+                    Portfolio, currency_code, parse_currency_amount, parse_manual_amount)
 
 
 _ASSET_DETAIL_COLUMNS = tuple(field.name for field in fields(AssetDetails))
@@ -91,35 +89,64 @@ def load_portfolio_with_signature(directory):
             raise ValueError(f"{row['ticker']}: is_main must be True or False")
         holdings.append(Holding(row["ticker"].strip(), row["asset_group"].strip(),
                                 int(row["shares"]), flag == "true", _asset_details(row)))
-    manual_holdings = tuple(ManualHolding(parse_manual_amount(row["amount"]),
+    manual_holdings = tuple(ManualHolding(parse_manual_amount(row["amount"], row['currency'].strip()),
                                          row["currency"].strip()) for row in manual)
     portfolio = Portfolio(tuple(holdings), _read_allocation(groups),
-                          _unique(((currency_code(row["currency"].strip()), float(row["amount"]))
+                          _unique(((currency_code(row["currency"].strip()),
+                                    parse_currency_amount(row["amount"], row['currency'].strip()))
                                    for row in cash), "cash currency"),
                           manual_holdings)
     return portfolio, _signature(contents)
 
 
-def fetch_market_data(portfolio, base_currency="EUR"):
-    """Fetch each quote and each required currency-to-base rate exactly once."""
-    import yfinance as yf
+def load_settings(directory):
+    """Load calculator inputs and their exact save token; a missing file uses defaults."""
+    original = _read(Path(directory) / 'calculator.json')
+    if original is None:
+        return CalculatorSettings(), None
+    try:
+        values = json.loads(original, parse_float=Decimal, object_pairs_hook=_unique_object)
+        _keys(values, CalculatorSettings)
+        _keys(values['returns'], ReturnAssumptions)
+        values['returns'] = ReturnAssumptions(**values['returns'])
+        if not isinstance(values['monthly_costs'], list):
+            raise ValueError('Monthly costs must be a JSON list.')
+        costs = []
+        for row in values['monthly_costs']:
+            _keys(row, MonthlyCost)
+            costs.append(MonthlyCost(**row))
+        values['monthly_costs'] = tuple(costs)
+        if not isinstance(values['expenses'], list):
+            raise ValueError('Expenses must be a JSON list.')
+        expenses = []
+        for row in values['expenses']:
+            _keys(row, Expense)
+            due = date.fromisoformat(row['due']) if isinstance(row['due'], str) else None
+            if due is None or due.isoformat() != row['due']:
+                raise ValueError('Expense dates must use YYYY-MM-DD.')
+            expenses.append(Expense(row['name'], row['amount'], due, row['currency']))
+        return CalculatorSettings(**{**values, 'expenses': tuple(expenses)}), original
+    except (ValueError, TypeError, UnicodeError) as error:
+        raise ValueError(f'Invalid calculator.json: {error}') from error
 
-    base_currency = currency_code(base_currency)
-    quotes = {}
-    for holding in portfolio.required_holdings:
-        try:
-            info = yf.Ticker(holding.ticker).fast_info
-            quotes[holding.ticker] = Quote(info["last_price"], info["currency"])
-        except Exception as error:
-            raise ValueError(f"Could not price {holding.ticker}: {error}") from error
-    currencies = portfolio.required_currencies(quotes)
-    rates = {base_currency: 1.}
-    for currency in sorted(currencies - {base_currency}):
-        try:
-            rates[currency] = yf.Ticker(f"{currency}{base_currency}=X").fast_info["last_price"]
-        except Exception as error:
-            raise ValueError(f"Could not price {currency}/{base_currency}: {error}") from error
-    return MarketData(quotes, rates, base_currency)
+
+def save_settings(settings, directory, original):
+    """Atomically save calculator inputs without modifying any portfolio files."""
+    if not isinstance(settings, CalculatorSettings):
+        raise ValueError('Expected validated calculator settings.')
+    path = Path(directory) / 'calculator.json'
+    values = asdict(settings)
+    values['expenses'] = [{**asdict(expense), 'due': expense.due.isoformat()} for expense in settings.expenses]
+    contents = (json.dumps(values, ensure_ascii=False, allow_nan=False, indent=2) + '\n').encode('utf-8')
+    _check_original(path, original)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _stage(path, contents)
+    try:
+        _check_original(path, original)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return contents
 
 
 def _read_csv(name, contents):
@@ -144,13 +171,7 @@ def _read_csv(name, contents):
 
 def _config_bytes(directory):
     """Read only managed CSVs; a missing file has a distinct signature."""
-    result = {}
-    for name in _CSV_COLUMNS:
-        try:
-            result[name] = (directory / name).read_bytes()
-        except FileNotFoundError:
-            result[name] = None
-    return result
+    return {name: _read(directory / name) for name in _CSV_COLUMNS}
 
 
 def _signature(contents):
@@ -180,6 +201,8 @@ def _csv_bytes(name, contents, key, rows, original_keys=None):
             existing[value] = row
     if name == "asset.csv":
         columns.extend(column for column in _ASSET_DETAIL_COLUMNS if column not in columns)
+    if name == "asset_group.csv" and 'category' not in columns:
+        columns.append('category')
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
@@ -198,7 +221,8 @@ def _asset_details(row):
 
 
 def _allocation_rows(allocation):
-    return [{"parent": parent, "asset_group": name, "portfolio_allocation": str(target)}
+    return [{"parent": parent, "asset_group": name, "portfolio_allocation": str(target),
+             'category': allocation.categories.get(name, '') if parent == STOCK_MARKET else ''}
             for parent, weights in allocation.weights.items() for name, target in weights.items()]
 
 
@@ -209,6 +233,8 @@ def _allocation_origins(group_origins):
 
 
 def _read_allocation(rows):
+    if any(row['parent'].strip() != STOCK_MARKET and row.get('category', '').strip() for row in rows):
+        raise ValueError('Only stock market asset classes can have investment categories')
     values = _unique((((row["parent"].strip(), row["asset_group"].strip()),
                         float(row["portfolio_allocation"])) for row in rows), "allocation target")
     weights = {parent: {} for parent in (STOCK_MARKET, TREASURY, CASH)}
@@ -216,7 +242,9 @@ def _read_allocation(rows):
         if parent not in weights:
             raise ValueError(f"Unknown allocation parent: {parent}")
         weights[parent][name] = value
-    return AllocationTargets(weights)
+    categories = {row['asset_group'].strip(): row.get('category', '').strip()
+                  for row in rows if row['parent'].strip() == STOCK_MARKET}
+    return AllocationTargets(weights, categories)
 
 
 def _stage(path, contents):
@@ -281,5 +309,31 @@ def _unique(pairs, name):
     for key, value in pairs:
         if key in result:
             raise ValueError(f"Duplicate {name}: {key}")
+        result[key] = value
+    return result
+
+
+def _read(path):
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _check_original(path, original):
+    if _read(path) != original:
+        raise ValueError('Calculator inputs changed outside this application. Reload before saving.')
+
+
+def _keys(value, model):
+    if not isinstance(value, dict) or set(value) != {field.name for field in fields(model)}:
+        raise ValueError(f'{model.__name__} has missing or unsupported fields.')
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate field: {key}.')
         result[key] = value
     return result

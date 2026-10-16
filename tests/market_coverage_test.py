@@ -9,7 +9,8 @@ from unittest.mock import patch
 from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding,
                     ManualHolding, MarketData, Portfolio, Quote)
 from portfolio.planning import rebalance
-from portfolio.storage import fetch_market_data, load_portfolio, save_portfolio
+from portfolio.market import fetch_market_data
+from portfolio.storage import load_portfolio, save_portfolio
 
 
 def dormant_portfolio():

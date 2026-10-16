@@ -38,12 +38,11 @@ class AllocationModelTests(unittest.TestCase):
             allocation(stocks={'US': 60}, cash={'EUR': 50})
         with self.assertRaisesRegex(ValueError, 'sum to 100'):
             allocation(cash={'EUR': 0})
-        for cash, total, change in ((39.99999998, '99.99999998', 'add'),
-                                    (40.00000002, '100.00000002', 'reduce by')):
+        for cash in (39.99999998, 40.00000002):
             with self.subTest(cash=cash), self.assertRaises(ValueError) as error:
                 allocation(stocks={'US': 60}, cash={'EUR': cash})
             self.assertEqual(str(error.exception),
-                             f'Portfolio targets total {total}%: {change} 0.00000002%. Targets must sum to 100%.')
+                             'Targets must sum to 100%; small differences can be hidden by display rounding.')
 
     def test_category_totals_are_derived_from_absolute_children(self):
         self.assertEqual(allocation(bonds={'EUR': 0, 'HUF': 0}).totals[TREASURY], 0)

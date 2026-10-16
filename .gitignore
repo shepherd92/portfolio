@@ -14,10 +14,9 @@ docs/build/
 
 # Personal portfolio inputs
 config/
+calculator.json
+.calculator.*.tmp
 
 # Local binaries and packaging intermediates
 /build/
-/dist/
-*.AppImage
-*.AppImage.sha256
-/PortfolioPlanner-x86_64.desktop
+/appimage/

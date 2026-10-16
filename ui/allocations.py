@@ -4,10 +4,10 @@ import tkinter as tk
 from math import fsum, isclose
 from tkinter import messagebox, ttk
 
-from ui.reporting import plain_number
+from ui.reporting import plain_number, format_percent
 from ui.sorting import TreeSort
-from ui.widgets import AutoScrollbar, bind_shortcuts, retain_visible_selection, shade_allocation_groups, show_modal
-from portfolio.models import (ALLOCATION_BRANCHES, AllocationTargets, CASH, STOCK_MARKET, TREASURY,
+from ui.widgets import AutoScrollbar, PercentEntry, bind_shortcuts, retain_visible_selection, shade_allocation_groups, show_modal
+from portfolio.models import (ALLOCATION_BRANCHES, MARKET_CATEGORIES, AllocationTargets, CASH, STOCK_MARKET, TREASURY,
                               allocation_name, currency_code, percentage)
 
 
@@ -20,6 +20,7 @@ class AllocationEditor(ttk.Frame):
         self.currency_choices = currency_choices or (lambda: ('EUR', 'GBP', 'HUF', 'USD'))
         self._enabled, self._scope = True, 'All'
         self._rows, self._roots = {}, {}
+        self._categories, self._category_items, self._totals = {}, {}, {}
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(self, columns=('total',), selectmode='browse', height=height)
@@ -65,7 +66,14 @@ class AllocationEditor(ttk.Frame):
 
     def allocation(self):
         return AllocationTargets({parent: {row['group']: _percentage(row['target']) for row in self._rows.values()
-                                            if row['parent'] == parent} for parent in ALLOCATION_BRANCHES})
+                                            if row['parent'] == parent} for parent in ALLOCATION_BRANCHES},
+                                 self._categories)
+
+    def set_categories(self, categories):
+        if self._categories != categories:
+            self._categories = dict(categories)
+            selected = self._rows.get(next(iter(self.tree.selection()), None))
+            self._render(self.get_rows(), (selected['parent'], selected['group']) if selected else None)
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
@@ -95,8 +103,7 @@ class AllocationEditor(ttk.Frame):
             return self.tree.item(item, 'text')
         if item in self._rows:
             return self._rows[item]['target']
-        parent = self.tree.item(item, 'text')
-        return fsum(float(row['target']) for row in self._rows.values() if row['parent'] == parent)
+        return self._totals[item]
 
     def _filter_rows(self):
         for parent, item in self._roots.items():
@@ -106,7 +113,9 @@ class AllocationEditor(ttk.Frame):
                 self.tree.detach(item)
         for item, row in self._rows.items():
             if self._editable(row):
-                self.tree.move(item, self._roots[row['parent']], 'end')
+                parent = (self._category_items[self._categories.get(row['group']) or 'Unclassified']
+                          if row['parent'] == STOCK_MARKET else self._roots[row['parent']])
+                self.tree.move(item, parent, 'end')
             else:
                 self.tree.detach(item)
         self.sorting.apply()
@@ -115,21 +124,37 @@ class AllocationEditor(ttk.Frame):
 
     def _render(self, rows, selected=None):
         expanded = {parent: self.tree.item(item, 'open') for parent, item in self._roots.items()}
+        category_expanded = {name: self.tree.item(item, 'open') for name, item in self._category_items.items()}
         for item in (*self._rows, *self._roots.values()):
             if self.tree.exists(item):
                 self.tree.delete(item)
         self._rows.clear()
         self._roots.clear()
+        self._category_items.clear()
+        self._totals.clear()
         totals = {parent: fsum(float(row['target']) for row in rows if row['parent'] == parent)
                   for parent in ALLOCATION_BRANCHES}
         for parent in sorted(totals, key=lambda name: (-totals[name], name)):
-            root = self.tree.insert('', 'end', text=parent, values=(f'{_display_percentage(totals[parent])}%',),
-                                    open=expanded.get(parent, True))
+            root = self.tree.insert('', 'end', text=parent, values=(format_percent(totals[parent]),),
+                                    open=expanded.get(parent, True), tags=('category',))
             self._roots[parent] = root
+            self._totals[root] = totals[parent]
             children = sorted((row for row in rows if row['parent'] == parent),
                               key=lambda row: (-float(row['target']), row['group']))
+            if parent == STOCK_MARKET:
+                category_totals = {name: 0. for name in MARKET_CATEGORIES}
+                for row in children:
+                    if float(row['target']):
+                        name = self._categories.get(row['group']) or 'Unclassified'
+                        category_totals[name] = category_totals.get(name, 0.) + float(row['target'])
+                for name in sorted(category_totals, key=lambda name: (-category_totals[name], name)):
+                    item = self.tree.insert(root, 'end', text=name,
+                                            values=(format_percent(category_totals[name]),),
+                                            open=category_expanded.get(name, True), tags=('category',))
+                    self._category_items[name] = item
+                    self._totals[item] = category_totals[name]
             for row in children:
-                item = self.tree.insert(root, 'end', text=row['group'], values=(f'{_display_percentage(row["target"])}%',))
+                item = self.tree.insert(root, 'end', text=row['group'], values=(format_percent(row["target"]),))
                 self._rows[item] = dict(row)
                 if (row['parent'], row['group']) == selected:
                     self.tree.selection_set(item)
@@ -200,9 +225,9 @@ class AllocationEditor(ttk.Frame):
                                   state='readonly', width=32)
             choice.current(0)
             choice.pack(fill='x', pady=(0, 8))
-        ttk.Label(form, text='Percentage of the whole portfolio').pack(anchor='w')
+        ttk.Label(form, text='Percentage of the long-term allocation').pack(anchor='w')
         value = tk.StringVar(value='' if adding else plain_number(candidates[0]['target']))
-        editor = ttk.Entry(form, textvariable=value, width=24)
+        editor = PercentEntry(form, textvariable=value, width=24)
         editor.pack(fill='x', pady=8)
         helper = ttk.Label(form, justify='left', wraplength=360)
         helper.pack(anchor='w', pady=(0, 12))
@@ -216,8 +241,8 @@ class AllocationEditor(ttk.Frame):
                 helper.configure(text='Enter 0–100%. All allocations together must total 100%.')
                 return
             adjustment = ('complete' if isclose(remaining, 0, abs_tol=1e-8, rel_tol=0)
-                          else f'{"add" if remaining > 0 else "reduce by"} {_display_percentage(abs(remaining))}%')
-            helper.configure(text=f'Portfolio total after edit: {_display_percentage(100 - remaining)}% — {adjustment}')
+                          else f'{"add" if remaining > 0 else "reduce by"} {format_percent(abs(remaining))}')
+            helper.configure(text=f'Long-term total after edit: {format_percent(100 - remaining)} — {adjustment}')
 
         describe()
         value.trace_add('write', describe)
@@ -261,7 +286,3 @@ def _percentage(value):
         raise ValueError('Target percentage must be a finite number.') from error
     return percentage(value)
 
-
-def _display_percentage(value):
-    text = plain_number(format(float(value), '.8g'))
-    return text.rstrip('0').rstrip('.') if '.' in text else text

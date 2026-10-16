@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ui.widgets import DataTable
+from ui.table import DataTable
 from ui.holdings import HoldingsView
 from portfolio.models import CASH, STOCK_MARKET, TREASURY
 
@@ -31,6 +31,7 @@ class HoldingsViewTests(unittest.TestCase):
         self.tables[CASH].set_rows([{'amount': '-20.25', 'currency': 'EUR'},
                                    {'amount': '0', 'currency': 'USD'}])
         self.view.set_tables(self.tables)
+        self.view.set_categories({'US': 'Equities', 'EU': 'Equities'})
 
     def source_rows(self):
         return {category: table.get_rows() for category, table in self.tables.items()}
@@ -63,7 +64,9 @@ class HoldingsViewTests(unittest.TestCase):
         tree = self.view.tree
         roots = {tree.item(item, 'text'): item for item in tree.get_children()}
         self.assertEqual(list(roots), [STOCK_MARKET, TREASURY, CASH])
-        groups = {tree.item(item, 'text'): item for item in tree.get_children(roots[STOCK_MARKET])}
+        categories = tree.get_children(roots[STOCK_MARKET])
+        self.assertEqual([tree.item(item, 'text') for item in categories], ['Equities'])
+        groups = {tree.item(item, 'text'): item for item in tree.get_children(categories[0])}
         self.assertEqual(list(groups), ['US', 'EU'])
         leaves = tree.get_children(groups['US'])
         self.assertEqual([tree.item(item, 'values') for item in leaves],
@@ -86,7 +89,7 @@ class HoldingsViewTests(unittest.TestCase):
         tree = self.view.tree
         table, source_item = self.select(STOCK_MARKET, 2)
         self.view.set_scope(STOCK_MARKET)
-        root = self.view._branches[STOCK_MARKET,]
+        root = self.view._branches[STOCK_MARKET, None, 'Equities']
         compact = self.view._branches[STOCK_MARKET, 'EU']
         self.assertEqual(tree.selection(), (compact,))
         self.assertEqual(tree.parent(compact), root)
@@ -107,7 +110,7 @@ class HoldingsViewTests(unittest.TestCase):
 
         tree.selection_set(next(item for item, source in self.view._sources.items() if source == (table, added)))
         table.on_change = Mock()
-        with patch('ui.widgets.messagebox.askyesno', return_value=True):
+        with patch('ui.table.messagebox.askyesno', return_value=True):
             self.view._remove()
         table.on_change.assert_called_once_with('remove', {'ticker': 'NEW', 'group': 'EU', 'shares': '2'}, None)
         compact = self.view._branches[STOCK_MARKET, 'EU']
@@ -116,10 +119,10 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertFalse(tree.get_children(compact))
         self.assertEqual(tree.item(compact, 'text'), 'EU')
         self.assertEqual(tree.item(compact, 'values'), ('SOLO', '1', 'shares'))
-        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.view._branches[STOCK_MARKET,])],
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.view._branches[STOCK_MARKET, None, 'Equities'])],
                          ['US', 'EU'])
         self.assertEqual(self.view.scope, STOCK_MARKET)
-        with patch('ui.widgets.messagebox.askyesno', return_value=True):
+        with patch('ui.table.messagebox.askyesno', return_value=True):
             self.view._remove()
         table.on_change.assert_called_with('remove', {'ticker': 'SOLO', 'group': 'EU', 'shares': '1'}, None)
         self.assertFalse(table.tree.exists(source_item))
@@ -157,6 +160,40 @@ class HoldingsViewTests(unittest.TestCase):
             self.assertTrue(self.view.tree.grid_info())
             self.assertTrue(all(not table.grid_info() for table in self.tables.values()))
             self.assertEqual(self.source_rows(), original)
+
+    def test_categories_show_only_held_classes_without_changing_sources(self):
+        before = self.source_rows()
+        self.view.set_categories({'US': 'Equities', 'EU': 'Bonds', 'Unused': 'Gold'})
+        tree = self.view.tree
+        root = self.view._branches[STOCK_MARKET,]
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(root)], ['Equities', 'Bonds'])
+        for group, category in [('US', 'Equities'), ('EU', 'Bonds')]:
+            self.assertEqual(tree.parent(self.view._branches[STOCK_MARKET, group]),
+                             self.view._branches[STOCK_MARKET, None, category])
+        self.assertEqual(self.source_rows(), before)
+        self.view.set_categories({'US': 'Equities'})
+        self.assertIn((STOCK_MARKET, None, 'Unclassified'), self.view._branches)
+        self.assertNotIn((STOCK_MARKET, None, 'Bonds'), self.view._branches)
+
+    def test_reclassification_preserves_source_selection_sort_and_expansion(self):
+        tree = self.view.tree
+        source = self.select(STOCK_MARKET, 2)
+        self.view.set_scope(STOCK_MARKET)
+        self.view.sorting.sort('#0')
+        tree.item(self.view._branches[STOCK_MARKET, None, 'Equities'], open=False)
+        self.view.set_categories({'US': 'Equities', 'EU': 'Gold'})
+        self.assertEqual(self.view._sources[tree.selection()[0]], source)
+        self.assertFalse(tree.item(self.view._branches[STOCK_MARKET, None, 'Equities'], 'open'))
+        self.assertEqual(self.view.scope, STOCK_MARKET)
+        self.assertEqual(self.view.sorting.column, '#0')
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.view._branches[STOCK_MARKET,])],
+                         ['Equities', 'Gold'])
+        with patch.object(self.view, 'refresh') as refresh:
+            self.view.set_categories(dict(self.view._categories))
+        refresh.assert_not_called()
+        category = self.view._branches[STOCK_MARKET, None, 'Gold']
+        self.assertEqual(tree.item(category, 'tags'), ('category',))
+        self.assertEqual(tree.item(tree.selection()[0], 'tags'), ('plain',))
 
     def test_refresh_preserves_selection_by_source_item(self):
         source = self.select(CASH, 1)
@@ -268,7 +305,7 @@ class HoldingsViewTests(unittest.TestCase):
         table, item = self.select(CASH, 1)
         table.tree.selection_set(table.tree.get_children()[0])
         table.can_delete, table.on_change = Mock(), Mock()
-        with patch('ui.widgets.messagebox.askyesno', return_value=True):
+        with patch('ui.table.messagebox.askyesno', return_value=True):
             self.view._remove()
         table.can_delete.assert_called_once_with({'amount': '0', 'currency': 'USD'})
         table.on_change.assert_called_once_with('remove', {'amount': '0', 'currency': 'USD'}, None)
@@ -280,8 +317,8 @@ class HoldingsViewTests(unittest.TestCase):
         table, _ = self.select(STOCK_MARKET)
         original = self.source_rows()
         table.can_delete = Mock(side_effect=ValueError('Keep the representative'))
-        with patch('ui.widgets.messagebox.showerror') as error, \
-                patch('ui.widgets.messagebox.askyesno') as confirm:
+        with patch('ui.table.messagebox.showerror') as error, \
+                patch('ui.table.messagebox.askyesno') as confirm:
             self.view._remove()
         error.assert_called_once()
         confirm.assert_not_called()

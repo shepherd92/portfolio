@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from ui.allocations import AllocationEditor
-from ui.widgets import DataTable, show_modal
+from ui.table import DataTable
+from ui.widgets import show_modal
 from ui.holdings import HoldingsView
 from portfolio.models import CASH, STOCK_MARKET, TREASURY
 

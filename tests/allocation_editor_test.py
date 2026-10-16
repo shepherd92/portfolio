@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ui.allocations import AllocationEditor
-from portfolio.models import CASH, STOCK_MARKET, TREASURY
+from portfolio.models import CASH, MARKET_CATEGORIES, STOCK_MARKET, TREASURY
 
 
 @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1', 'GUI tests require a display and REBALANCE_GUI_TESTS=1')
@@ -29,6 +29,7 @@ class AllocationEditorTests(unittest.TestCase):
             {'parent': CASH, 'group': 'GBP', 'target': '2'},
         ]
         self.editor.set_rows(self.rows)
+        self.editor.set_categories({'US': 'Equities', 'EU': 'Equities', 'WATER': 'Equities'})
 
     def item(self, parent, group):
         return next(item for item, row in self.editor._rows.items()
@@ -36,7 +37,10 @@ class AllocationEditorTests(unittest.TestCase):
 
     def visible_names(self, parent=''):
         root = self.editor._roots[parent] if parent else ''
-        return [self.editor.tree.item(item, 'text') for item in self.editor.tree.get_children(root)]
+        children = self.editor.tree.get_children(root)
+        if parent == STOCK_MARKET:
+            children = [item for category in children for item in self.editor.tree.get_children(category)]
+        return [self.editor.tree.item(item, 'text') for item in children]
 
     def modal(self, action, inspect):
         errors = []
@@ -102,7 +106,7 @@ class AllocationEditorTests(unittest.TestCase):
 
     def test_category_roots_cannot_be_edited_or_removed(self):
         before = self.editor.get_rows()
-        for item in self.editor._roots.values():
+        for item in (*self.editor._roots.values(), *self.editor._category_items.values()):
             self.editor.tree.selection_set(item)
             self.root.update()
             self.assertTrue(self.editor.edit_button.instate(['disabled']))
@@ -129,7 +133,22 @@ class AllocationEditorTests(unittest.TestCase):
         self.editor._set_target(self.item(STOCK_MARKET, 'US'), value)
         item = self.item(STOCK_MARKET, 'US')
         self.assertEqual(self.editor._rows[item]['target'], value)
-        self.assertEqual(self.editor.tree.item(item, 'values'), ('45.123457%',))
+        self.assertEqual(self.editor.tree.item(item, 'values'), ('45.12%',))
+
+    def test_saving_untouched_percentage_does_not_replace_precise_target_with_display(self):
+        value = '45.123456789'
+        self.editor._set_target(self.item(STOCK_MARKET, 'US'), value)
+        self.changed.reset_mock()
+
+        def save(dialog, form):
+            entry = next(child for child in form.winfo_children() if isinstance(child, ttk.Entry))
+            self.assertEqual(entry.get(), '45.12%')
+            next(child for frame in form.winfo_children() for child in frame.winfo_children()
+                 if isinstance(child, ttk.Button) and child.cget('text') == 'Save').invoke()
+
+        self.modal(lambda: self.editor._edit(self.item(STOCK_MARKET, 'US')), save)
+        self.assertEqual(self.editor._rows[self.item(STOCK_MARKET, 'US')]['target'], value)
+        self.changed.assert_not_called()
 
     def test_allocation_requires_one_portfolio_total_of_100(self):
         self.editor._set_target(self.item(STOCK_MARKET, 'EU'), 10)
@@ -174,11 +193,55 @@ class AllocationEditorTests(unittest.TestCase):
         self.assertEqual(len(self.editor.get_rows()), len(self.rows))
 
     def test_all_categories_remain_visible_when_empty(self):
+        self.editor.set_categories({})
         self.editor.set_rows([{'parent': CASH, 'group': 'EUR', 'target': '100'}])
         self.assertEqual(set(self.visible_names()), {STOCK_MARKET, TREASURY, CASH})
         self.assertFalse(self.visible_names(STOCK_MARKET))
         self.assertEqual(self.editor.tree.item(self.editor._roots[STOCK_MARKET], 'values'), ('0%',))
         self.assertEqual(self.editor.allocation().totals[STOCK_MARKET], 0)
+
+    def test_stock_categories_derive_totals_and_preserve_absolute_targets(self):
+        before = self.editor.get_rows()
+        self.editor.set_categories({'US': 'Equities', 'EU': 'Bonds', 'WATER': 'Gold'})
+        tree = self.editor.tree
+        categories = self.editor._category_items
+        self.assertEqual(set(categories), set(MARKET_CATEGORIES))
+        self.assertEqual({name: tree.item(item, 'values') for name, item in categories.items()},
+                         {'Equities': ('45%',), 'Bonds': ('15%',), 'Gold': ('0%',)})
+        self.assertEqual(tree.parent(self.item(STOCK_MARKET, 'EU')), categories['Bonds'])
+        self.assertEqual(self.editor.allocation().categories,
+                         {'US': 'Equities', 'EU': 'Bonds', 'WATER': 'Gold'})
+        self.assertEqual(self.editor.get_rows(), before)
+        self.editor.sorting.sort('total')
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.editor._roots[STOCK_MARKET])],
+                         ['Gold', 'Bonds', 'Equities'])
+        self.editor._set_target(self.item(STOCK_MARKET, 'EU'), '50.123456789')
+        self.assertEqual(tree.item(self.editor._category_items['Bonds'], 'values'), ('50.12%',))
+        self.assertAlmostEqual(self.editor._sort_value(self.editor._category_items['Bonds'], 'total'), 50.123456789)
+
+    def test_unclassified_category_only_appears_for_positive_targets(self):
+        self.editor.set_categories({'US': 'Equities'})
+        self.assertIn('Unclassified', self.editor._category_items)
+        self.assertEqual(self.editor.tree.item(self.editor._category_items['Unclassified'], 'values'), ('15%',))
+        self.editor._set_target(self.item(STOCK_MARKET, 'EU'), 0)
+        self.assertNotIn('Unclassified', self.editor._category_items)
+        self.assertEqual(self.editor._rows[self.item(STOCK_MARKET, 'WATER')]['target'], '0')
+
+    def test_reclassification_retains_selection_scope_sort_and_other_expansion(self):
+        tree = self.editor.tree
+        self.editor.set_scope(STOCK_MARKET)
+        self.editor.sorting.sort('total')
+        tree.item(self.editor._category_items['Equities'], open=False)
+        tree.selection_set(self.item(STOCK_MARKET, 'EU'))
+        self.editor.set_categories({'US': 'Equities', 'EU': 'Bonds', 'WATER': 'Equities'})
+        self.assertEqual(tree.selection(), (self.item(STOCK_MARKET, 'EU'),))
+        self.assertFalse(tree.item(self.editor._category_items['Equities'], 'open'))
+        self.assertEqual(self.visible_names(), [STOCK_MARKET])
+        self.assertEqual(self.editor.sorting.column, 'total')
+        with patch.object(self.editor, '_render') as render:
+            self.editor.set_categories(dict(self.editor._categories))
+        render.assert_not_called()
+        self.changed.assert_not_called()
 
     def test_scope_and_expansion_survive_edits_and_reload(self):
         self.editor.tree.item(self.editor._roots[STOCK_MARKET], open=False)
@@ -273,7 +336,7 @@ class AllocationEditorTests(unittest.TestCase):
                 entry.insert(0, value)
                 descriptions.append(labels())
         self.modal(lambda: self.editor._edit(self.item(TREASURY, 'EUR')), inspect)
-        self.assertIn('Percentage of the whole portfolio', descriptions[0])
+        self.assertIn('Percentage of the long-term allocation', descriptions[0])
         self.assertIn('100% — complete', descriptions[0])
         self.assertIn('95% — add 5%', descriptions[1])
         self.assertIn('105% — reduce by 5%', descriptions[2])

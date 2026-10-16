@@ -6,6 +6,11 @@ import itertools
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Portfolio
 
 
+def calculator_allocation(stock=60, cash=0):
+    return AllocationTargets({STOCK_MARKET: {"Global": stock},
+                              TREASURY: {"HUF": 100 - stock - cash}, CASH: {"HUF": cash}}, {"Global": "Equities"})
+
+
 def portfolio_fixture(holdings, weights, cash, manual=()):
     """Declare fixture weights in total-portfolio percentages for readability."""
     stocks = {key: value for key, value in weights.items() if key not in (TREASURY, CASH)}

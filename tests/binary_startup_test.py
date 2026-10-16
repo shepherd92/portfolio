@@ -1,4 +1,4 @@
-"""A packaged app keeps editable inputs beside the binary, outside its resources."""
+"""Source and packaged entry points resolve the same external config directory."""
 
 import os
 from pathlib import Path
@@ -19,13 +19,12 @@ class BinaryStartupTests(unittest.TestCase):
         for frozen, appimage, expected in (
                 (False, '/images/ignored.AppImage', source),
                 (True, '', Path('/portable')),
-                (True, '/images/with spaces/planner.AppImage', Path('/images/with spaces'))):
+                (True, '/images/with spaces/appimage/planner.AppImage', Path('/images/with spaces'))):
             with self.subTest(frozen=frozen, appimage=appimage), \
                     patch.object(sys, 'frozen', frozen, create=True), \
                     patch.object(sys, 'executable', '/portable/AppRun'), \
                     patch.dict(os.environ, APPIMAGE=appimage):
-                values = runpy.run_path(str(source / 'portfolio' / 'storage.py'))
-                self.assertEqual(values['RESOURCE_DIRECTORY'], source)
+                values = runpy.run_path(str(source / 'main.py'))
                 self.assertEqual(values['SCRIPT_DIRECTORY'], expected)
 
     def test_first_binary_launch_creates_empty_inputs_once(self):
@@ -41,6 +40,24 @@ class BinaryStartupTests(unittest.TestCase):
             original = {path: path.read_bytes() for path in directory.iterdir()}
             main.main(['--base-currency', 'EUR'])
             self.assertEqual({path: path.read_bytes() for path in directory.iterdir()}, original)
+
+    def test_appimage_uses_root_config_and_explicit_path_overrides_it(self):
+        source = Path(main.__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(sys, 'frozen', True, create=True), \
+                patch.dict(os.environ, APPIMAGE=str(Path(temporary) / 'appimage' / 'planner.AppImage')), \
+                patch('ui.app.launch', return_value=0) as launch:
+            root = Path(temporary)
+            (root / 'config').mkdir()
+            values = runpy.run_path(str(source / 'main.py'))
+            values['main']([])
+            launch.assert_called_once_with(root / 'config', base_currency='EUR')
+            self.assertFalse((root / 'appimage' / 'config').exists())
+            launch.reset_mock()
+            custom = root / 'elsewhere'
+            values['main'](['--config', str(custom)])
+            launch.assert_called_once_with(custom, base_currency='EUR')
+            self.assertFalse(custom.exists())
 
     def test_custom_missing_config_is_not_created(self):
         with tempfile.TemporaryDirectory() as temporary, \

@@ -18,6 +18,7 @@ class HoldingsView(ttk.Frame):
         super().__init__(parent)
         self.scope = 'All'
         self._tables, self._sources, self._branches = {}, {}, {}
+        self._categories = {}
         self._enabled = True
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -66,6 +67,11 @@ class HoldingsView(ttk.Frame):
         self.scope = scope
         self._filter_rows()
 
+    def set_categories(self, categories):
+        if self._categories != categories:
+            self._categories = dict(categories)
+            self.refresh()
+
     def refresh(self, source=None):
         selected = next(iter(self.tree.selection()), None)
         selected_source = source or self._sources.get(selected)
@@ -85,8 +91,11 @@ class HoldingsView(ttk.Frame):
             counts = Counter(row['group'] for _, row in rows) if category == STOCK_MARKET else {}
             for source_item, row in rows:
                 if category == STOCK_MARKET:
+                    category_key = category, None, self._categories.get(row['group']) or 'Unclassified'
+                    category_item = (self._branches.get(category_key)
+                                     or self._branch(root, category_key, expanded))
                     key = category, row['group']
-                    group = self._branches.get(key) or self._branch(root, key, expanded)
+                    group = self._branches.get(key) or self._branch(category_item, key, expanded)
                     item = group if counts[row['group']] == 1 else self.tree.insert(group, 'end')
                     self.tree.item(item, values=(row['ticker'], table.display_value(row, 'shares'), 'shares'))
                 else:
@@ -109,7 +118,8 @@ class HoldingsView(ttk.Frame):
         self._update_buttons()
 
     def _branch(self, parent, key, expanded):
-        item = self.tree.insert(parent, 'end', text=key[-1], open=expanded.get(key, True))
+        item = self.tree.insert(parent, 'end', text=key[-1], open=expanded.get(key, True),
+                                tags=('category',) if len(key) != 2 else ())
         self._branches[key] = item
         return item
 

@@ -80,22 +80,6 @@ class StorageTests(unittest.TestCase):
             save_portfolio(portfolio, self.directory, signature)
         self.assertEqual(load_portfolio(self.directory).cash['EUR'], 999)
 
-    def test_group_rename_preserves_metadata(self):
-        portfolio = Portfolio(tuple(Holding(h.ticker, 'Equities', h.shares, h.is_main)
-                                    for h in self.portfolio.holdings),
-                              AllocationTargets({**self.allocation.weights, STOCK_MARKET: {'Equities': 100}}),
-                              self.portfolio.cash)
-        save_portfolio(portfolio, self.directory, group_origins={'Equities': 'stock'})
-        with (self.directory / 'asset_group.csv').open() as stream:
-            row = next(row for row in csv.DictReader(stream) if row['asset_group'] == 'Equities')
-        self.assertEqual(row['asset_group'], 'Equities')
-        self.assertEqual(row['note'], 'Keep group')
-
-    def test_new_group_reusing_deleted_name_does_not_inherit_metadata(self):
-        save_portfolio(self.portfolio, self.directory, group_origins={'stock': None})
-        with (self.directory / 'asset_group.csv').open() as stream:
-            self.assertEqual(next(row for row in csv.DictReader(stream)
-                                  if row['asset_group'] == 'stock')['note'], '')
 
     def test_deleted_file_also_invalidates_signature(self):
         signature = config_signature(self.directory)
@@ -192,7 +176,6 @@ class StorageTests(unittest.TestCase):
             with self.subTest(contents=contents), self.assertRaises(ValueError):
                 save_portfolio(self.portfolio, self.directory)
             self.assertEqual(self.contents(), existing)
-
 
 
 if __name__ == "__main__":

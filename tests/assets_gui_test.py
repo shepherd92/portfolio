@@ -1,5 +1,6 @@
 """The asset catalogue owns metadata; Home edits only existing share balances."""
 
+from datetime import date
 import os
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from portfolio.models import AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, MarketData, Portfolio, Quote
+from portfolio.market import BaseRate
 from portfolio.storage import load_portfolio, save_portfolio
 from ui.app import PortfolioApp
 
@@ -26,7 +28,8 @@ class AssetsGuiTests(unittest.TestCase):
                                          'Manual full name', 'BROKER MAIN')
         self.old_details = AssetDetails(exchange='Other venue', currency='GBP', ter=0,
                                         name='Original name', ibkr_name='BROKER OLD')
-        allocation = AllocationTargets({STOCK_MARKET: {'Stocks': 100, 'Bonds': 0}, TREASURY: {}, CASH: {}})
+        allocation = AllocationTargets({STOCK_MARKET: {'Stocks': 100, 'Bonds': 0}, TREASURY: {}, CASH: {}},
+                                       {'Stocks': 'Equities', 'Bonds': 'Bonds'})
         portfolio = Portfolio((Holding('MAIN', 'Stocks', 3, details=self.main_details),
                                Holding('OLD', 'Stocks', 2, False, self.old_details),
                                Holding('BOND', 'Bonds', 0)), allocation, {'EUR': 20})
@@ -35,6 +38,7 @@ class AssetsGuiTests(unittest.TestCase):
         self.root = tk.Tk()
         self.root.withdraw()
         for name, value in (('fetch_market_data', self.market), ('fetch_asset_details', AssetDetails()),
+                            ('fetch_base_rate', BaseRate(5, date(2026, 1, 1))),
                             ('messagebox.showerror', None)):
             mock = patch(f'ui.app.{name}', return_value=value)
             self.addCleanup(mock.stop)
@@ -48,13 +52,13 @@ class AssetsGuiTests(unittest.TestCase):
         self.assertEqual(tuple(table.tree['columns']),
                          ('ticker', 'group', 'name', 'isin', 'exchange', 'price', 'currency', 'ter', 'ibkr_name'))
         self.assertEqual(table.tree.set(self.item(table, 'MAIN'), 'ter'), '0.19%')
-        self.assertEqual(table.tree.set(self.item(table, 'OLD'), 'ter'), '0.00%')
+        self.assertEqual(table.tree.set(self.item(table, 'OLD'), 'ter'), '0%')
         self.assertEqual({row['ticker'] for row in table.get_rows()}, {'MAIN', 'OLD', 'BOND'})
         self.assertNotIn('BOND', self.visible_tickers())
         self.assertEqual(next(holding.details for holding in self.app.portfolio().holdings
                               if holding.ticker == 'MAIN'), self.main_details)
 
-    def test_ter_has_two_decimals_but_sorting_and_saving_keep_original_precision(self):
+    def test_ter_has_at_most_two_decimals_but_sorting_and_saving_keep_original_precision(self):
         table = self.app.assets_table
         for ticker, value in (('MAIN', '0.1949'), ('OLD', '0.1911')):
             self.edit(table, {'ter': value}, item=self.item(table, ticker))
@@ -98,7 +102,7 @@ class AssetsGuiTests(unittest.TestCase):
         table = self.app.holdings_table
         for ticker in ('MAIN', 'OLD'):
             table.tree.selection_set(self.item(table, ticker))
-            with patch('ui.widgets.messagebox.askyesno', return_value=True):
+            with patch('ui.table.messagebox.askyesno', return_value=True):
                 table.remove_selected()
         holdings = {holding.ticker: holding for holding in self.app.portfolio().holdings}
         self.assertEqual(holdings['MAIN'].shares, 0)
@@ -143,7 +147,7 @@ class AssetsGuiTests(unittest.TestCase):
                 self.app._can_delete_asset(table.row(self.item(table, ticker)))
         self.edit(self.app.holdings_table, {'shares': '0'}, item=self.item(self.app.holdings_table, 'OLD'))
         table.tree.selection_set(self.item(table, 'OLD'))
-        with patch('ui.widgets.messagebox.askyesno', return_value=True):
+        with patch('ui.table.messagebox.askyesno', return_value=True):
             table.remove_selected()
         self.assertNotIn('OLD', self.app._holding_tickers())
 
@@ -246,7 +250,7 @@ class AssetsGuiTests(unittest.TestCase):
                 dialog.destroy()
                 self.fail('The editor did not accept valid inputs.')
 
-        with patch('ui.widgets.show_modal', side_effect=interact):
+        with patch('ui.table.show_modal', side_effect=interact):
             table._edit(item)
 
     def poll(self):

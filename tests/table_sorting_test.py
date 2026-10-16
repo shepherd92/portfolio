@@ -9,7 +9,7 @@ from portfolio.models import CASH, STOCK_MARKET, TREASURY
 from ui.allocations import AllocationEditor
 from ui.holdings import HoldingsView
 from ui.sorting import TreeSort
-from ui.widgets import DataTable
+from ui.table import DataTable
 
 
 @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1',
@@ -75,17 +75,20 @@ class TableSortingTests(unittest.TestCase):
                  (TREASURY, 'HUF', '50'), (TREASURY, 'EUR', '5'),
                  (CASH, 'EUR', '10'), (CASH, 'GBP', '5')]]
         editor.set_rows(rows)
+        editor.set_categories({group: 'Equities' for group in ('US', 'EU', 'WATER', 'Unused')})
         tree = editor.tree
         stock = self.child(tree, '', STOCK_MARKET)
-        selected = self.child(tree, stock, 'EU')
+        equities = self.child(tree, stock, 'Equities')
+        selected = self.child(tree, equities, 'EU')
         tree.selection_set(selected)
         tree.focus(selected)
         tree.item(stock, open=False)
-        parents = {item: tree.parent(item) for root in tree.get_children()
-                   for item in (root, *tree.get_children(root))}
+        tree.item(equities, open=False)
+        parents = {item: tree.parent(item) for item in self.descendants(tree)}
         self.click(tree, 'total')
         self.assertEqual(self.names(tree), [CASH, STOCK_MARKET, TREASURY])
-        self.assertEqual(self.names(tree, stock), ['US', 'EU', 'WATER'])
+        self.assertEqual(self.names(tree, stock), ['Bonds', 'Gold', 'Equities'])
+        self.assertEqual(self.names(tree, equities), ['US', 'EU', 'WATER'])
         self.assertEqual({item: tree.parent(item) for item in parents}, parents)
         self.assertEqual(tree.selection(), (selected,))
         self.assertFalse(tree.item(stock, 'open'))
@@ -93,13 +96,15 @@ class TableSortingTests(unittest.TestCase):
         self.assertEqual(self.names(tree), [STOCK_MARKET])
         editor._set_target(selected, 1)
         stock = self.child(tree, '', STOCK_MARKET)
-        self.assertEqual(self.names(tree, stock), ['EU', 'US', 'WATER'])
+        equities = self.child(tree, stock, 'Equities')
+        self.assertEqual(self.names(tree, equities), ['EU', 'US', 'WATER'])
         self.assertEqual(tree.item(tree.selection()[0], 'text'), 'EU')
         self.assertFalse(tree.item(stock, 'open'))
+        self.assertFalse(tree.item(equities, 'open'))
         editor.set_scope('All')
         self.assertEqual(self.names(tree), [CASH, STOCK_MARKET, TREASURY])
-        self.assertEqual(self.names(tree, stock), ['EU', 'US', 'WATER'])
-        colors = [self.background(tree, item) for item in tree.get_children(stock)]
+        self.assertEqual(self.names(tree, equities), ['EU', 'US', 'WATER'])
+        colors = [self.background(tree, item) for item in tree.get_children(equities)]
         self.assertEqual(colors[0], colors[2])
         self.assertNotEqual(colors[0], colors[1])
         self.assertTrue(all(colors))
@@ -107,7 +112,7 @@ class TableSortingTests(unittest.TestCase):
         self.click(tree, '#0')
         self.assertEqual(self.names(tree), [CASH, TREASURY, STOCK_MARKET])
         self.click(tree, '#0')
-        self.assertEqual(self.names(tree, stock), ['WATER', 'US', 'EU'])
+        self.assertEqual(self.names(tree, equities), ['WATER', 'US', 'EU'])
         self.assertEqual(tree.item(tree.selection()[0], 'text'), 'EU')
 
     def test_holding_sort_preserves_sources_selection_and_native_precision_on_refresh(self):
@@ -122,6 +127,7 @@ class TableSortingTests(unittest.TestCase):
                      [('EUR', '2.49'), ('GBP', '2.01'), ('USD', '10')]]
         cash.set_rows(cash_rows)
         view.set_tables({STOCK_MARKET: stocks, CASH: cash})
+        view.set_categories({group: 'Equities' for group in ('US', 'EU', 'ASIA')})
         tree = view.tree
         cash_root = self.child(tree, '', CASH)
         selected = self.child(tree, cash_root, 'EUR')
@@ -130,8 +136,9 @@ class TableSortingTests(unittest.TestCase):
         source = view._sources[selected]
         self.click(tree, 'amount')
         stock = self.child(tree, '', STOCK_MARKET)
-        us = self.child(tree, stock, 'US')
-        self.assertEqual(self.names(tree, stock), ['EU', 'ASIA', 'US'])
+        equities = self.child(tree, stock, 'Equities')
+        us = self.child(tree, equities, 'US')
+        self.assertEqual(self.names(tree, equities), ['EU', 'ASIA', 'US'])
         self.assertEqual(self.values(tree, 'asset', us), ['MAIN', 'OLD'])
         self.assertEqual(self.names(tree, cash_root), ['GBP', 'EUR', 'USD'])
         self.click(tree, 'amount')
@@ -146,7 +153,8 @@ class TableSortingTests(unittest.TestCase):
         self.assertEqual(cash.get_rows(), cash_rows)
         view.set_scope('All')
         stock = self.child(tree, '', STOCK_MARKET)
-        self.assertEqual(self.values(tree, 'asset', self.child(tree, stock, 'US')), ['OLD', 'MAIN'])
+        equities = self.child(tree, stock, 'Equities')
+        self.assertEqual(self.values(tree, 'asset', self.child(tree, equities, 'US')), ['OLD', 'MAIN'])
 
     def click(self, tree, column):
         command = tree.heading(column, 'command')
@@ -161,6 +169,11 @@ class TableSortingTests(unittest.TestCase):
 
     def child(self, tree, parent, name):
         return next(item for item in tree.get_children(parent) if tree.item(item, 'text') == name)
+
+    def descendants(self, tree, parent=''):
+        for item in tree.get_children(parent):
+            yield item
+            yield from self.descendants(tree, item)
 
     def background(self, tree, item):
         return next((tree.tag_configure(tag, 'background') for tag in tree.item(item, 'tags')

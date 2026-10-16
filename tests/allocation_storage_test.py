@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding, Portfolio
-from portfolio.storage import (config_signature, fetch_market_data, load_portfolio,
-                          load_portfolio_with_signature, save_portfolio)
+from portfolio.storage import config_signature, load_portfolio, load_portfolio_with_signature, save_portfolio
+from portfolio.market import fetch_market_data
 
 
 class AllocationStorageTests(unittest.TestCase):
@@ -36,7 +36,7 @@ class AllocationStorageTests(unittest.TestCase):
         for row in rows:
             row["note"] = "US metadata" if row["parent"] == STOCK_MARKET else "Other metadata"
         with (self.directory / "asset_group.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["parent", "asset_group", "portfolio_allocation", "note"])
+            writer = csv.DictWriter(stream, fieldnames=["parent", "asset_group", "portfolio_allocation", "category", "note"])
             writer.writeheader()
             writer.writerows(rows)
 
@@ -95,7 +95,7 @@ class AllocationStorageTests(unittest.TestCase):
         for values in ({"parent": STOCK_MARKET, "asset_group": "US", "portfolio_allocation": "1"},
                        {"parent": "Other", "asset_group": "US", "portfolio_allocation": "1"},
                        {"parent": "", "asset_group": STOCK_MARKET, "portfolio_allocation": "0"}):
-            path.write_text(original + ",".join(values[column] for column in header) + "\n",
+            path.write_text(original + ",".join(values.get(column, '') for column in header) + "\n",
                             encoding="utf-8")
             before = self.contents()
             with self.assertRaises(ValueError):

@@ -127,7 +127,7 @@ class PlanView(ttk.Frame):
         action = 'BUY' if buying else 'SELL'
         self._insert(self.transactions, (
             action, asset, format_amount(quantity), unit,
-            f'{format_amount(price, 2)} {currency}' if price is not None else '',
+            f'{format_amount(price, 0 if currency == "HUF" else 2)} {currency}' if price is not None else '',
             money if buying else '', '' if buying else money, f'{format_amount(ending)} {unit}'), (
             action, asset, quantity, unit, price, amount if buying else None,
             None if buying else amount, ending))

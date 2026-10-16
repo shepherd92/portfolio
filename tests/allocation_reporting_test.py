@@ -32,14 +32,14 @@ class AllocationReportingTests(unittest.TestCase):
         stock = next(row for row in rows if row.startswith(STOCK_MARKET))
         treasury = next(row for row in rows if row.startswith(TREASURY))
         cash = next(row for row in rows if row.startswith('Cash '))
-        self.assertIn('60.00', stock)
-        self.assertIn('20.00', treasury)
-        self.assertIn('20.00', cash)
+        self.assertEqual(stock.split()[-2:], ['60%', '60%'])
+        self.assertEqual(treasury.split()[-2:], ['20%', '20%'])
+        self.assertEqual(cash.split()[-2:], ['20%', '20%'])
         us = next(row for row in rows if row.startswith('  US '))
-        self.assertEqual(us.split()[-1], '30.00%')
+        self.assertEqual(us.split()[-1], '30%')
         euros = [row for row in rows if row.startswith('  EUR ')]
         self.assertEqual(len(euros), 2)
-        self.assertEqual([row.split()[-1] for row in euros], ['15.00%', '10.00%'])
+        self.assertEqual([row.split()[-1] for row in euros], ['15%', '10%'])
         self.assertEqual(plan.cash['GBP'], 8)
 
     def test_inactive_rows_are_omitted_but_zero_value_targets_remain(self):
@@ -53,7 +53,7 @@ class AllocationReportingTests(unittest.TestCase):
         self.assertNotIn('MÁK', report)
         self.assertNotIn('HUF', report)
         self.assertIn('  US ', report)
-        self.assertIn('100.00%', report)
+        self.assertIn('100%', report)
 
     def test_zero_wealth_report_is_finite_and_keeps_requested_ratios(self):
         portfolio = self.portfolio(0)
@@ -63,7 +63,7 @@ class AllocationReportingTests(unittest.TestCase):
         self.assertIn('No trades.', report)
         self.assertNotIn('nan', report.lower())
         self.assertNotIn('inf', report.lower())
-        self.assertIn('30.00%', report)
+        self.assertIn('30%', report)
 
     def test_zero_targets_keep_remaining_holdings_and_offsetting_cash_balances(self):
         targets = AllocationTargets({STOCK_MARKET: {'US': 100, 'Held': 0},
@@ -77,10 +77,10 @@ class AllocationReportingTests(unittest.TestCase):
         held = next(row for row in allocation if row.startswith('  Held '))
         treasury = next(row for row in allocation if row.startswith(TREASURY))
         cash = next(row for row in allocation if row.startswith('Cash '))
-        self.assertEqual(held.split()[-3:], ['7', '5.51%', '0.00%'])
-        self.assertEqual(treasury.split()[-3:], ['20', '15.75%', '0.00%'])
-        self.assertEqual(cash.split()[-3:], ['0', '0.00%', '0.00%'])
-        self.assertTrue(any(row.split()[-3:] == ['-5', '-3.94%', '0.00%']
+        self.assertEqual(held.split()[-3:], ['7', '5.51%', '0%'])
+        self.assertEqual(treasury.split()[-3:], ['20', '15.75%', '0%'])
+        self.assertEqual(cash.split()[-3:], ['0', '0%', '0%'])
+        self.assertTrue(any(row.split()[-3:] == ['-5', '-3.94%', '0%']
                             for row in allocation if row.startswith('  EUR ')))
         self.assertIn('  -5 EUR', report)
         self.assertIn('  4 GBP', report)
@@ -135,6 +135,18 @@ class AllocationReportingTests(unittest.TestCase):
         self.assertNotRegex(trade, r'\d[eE][+-]?\d')
         self.assertEqual(plan.trades[0].price, 1e-8)
 
+    def test_huf_unit_price_is_whole_but_other_prices_keep_two_decimals(self):
+        targets = AllocationTargets({STOCK_MARKET: {'US': 100}, TREASURY: {}, CASH: {}})
+        trades = (Trade('HUNGARIAN', 1, 1234.5678, 'HUF'), Trade('EURO', 1, 12.34567, 'EUR'))
+        plan = Plan(trades, {'HUNGARIAN': 1, 'EURO': 1}, {}, (), 20, 'EUR',
+                    allocation_values={(STOCK_MARKET, 'US'): 20})
+        report = format_plan(plan, targets)
+        self.assertIn('@ 1\u202f235 HUF', report)
+        self.assertIn('@ 12.35 EUR', report)
+        self.assertEqual([trade.price for trade in plan.trades], [1234.5678, 12.34567])
+        self.assertEqual(format_percent(Decimal('12.3456789')), '12.35%')
+        self.assertEqual(format_percent(Decimal('12.3000')), '12.3%')
+
     def test_large_and_small_display_values_are_fixed_point_without_mutating_precision(self):
         cases = [(Decimal('1E+30'), '1\u202f000\u202f000\u202f000\u202f000\u202f000\u202f000\u202f000\u202f000\u202f000\u202f000'),
                  (Decimal('1234567.75'), '1\u202f234\u202f568'),
@@ -146,4 +158,4 @@ class AllocationReportingTests(unittest.TestCase):
                 self.assertNotRegex(format_amount(value, 2), r'\d[eE][+-]?\d')
                 self.assertEqual(value.as_tuple(), before)
         self.assertEqual(format_amount(Decimal('1234.567'), 2), '1\u202f234.57')
-        self.assertEqual(format_percent(Decimal('.000001')), '0.00%')
+        self.assertEqual(format_percent(Decimal('.000001')), '0%')

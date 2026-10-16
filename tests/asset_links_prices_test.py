@@ -1,5 +1,6 @@
 """Security links and live prices do not change editable portfolio inputs."""
 
+from datetime import date
 import os
 from pathlib import Path
 import tempfile
@@ -12,6 +13,7 @@ from unittest.mock import patch
 from portfolio.models import (AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY,
                               Conversion, Holding, ManualHolding, ManualTrade, MarketData,
                               Plan, Portfolio, Quote, Trade)
+from portfolio.market import BaseRate
 from portfolio.storage import load_portfolio, save_portfolio
 from ui.app import PortfolioApp
 from ui import links
@@ -54,7 +56,8 @@ class AssetLinksPricesTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         details = AssetDetails('IE00BK5BQT80', 'Manual venue', 'GBP', .1949, 'Manual name', 'Broker label')
-        targets = AllocationTargets({STOCK_MARKET: {'Stocks': 100}, TREASURY: {}, CASH: {}})
+        targets = AllocationTargets({STOCK_MARKET: {'Stocks': 100}, TREASURY: {}, CASH: {}},
+                                    {'Stocks': 'Equities'})
         self.portfolio = Portfolio((Holding('MAIN', 'Stocks', 1, details=details),
                                     Holding('OLD', 'Stocks', 1, False, details),
                                     Holding('EMPTY', 'Stocks', 0, False, details)),
@@ -64,6 +67,7 @@ class AssetLinksPricesTests(unittest.TestCase):
         self.root = tk.Tk()
         self.root.geometry('1500x900')
         for name, value in (('fetch_market_data', self.market), ('fetch_asset_details', AssetDetails()),
+                            ('fetch_base_rate', BaseRate(5, date(2026, 1, 1))),
                             ('messagebox.showerror', None)):
             mocked = patch(f'ui.app.{name}', return_value=value)
             mocked.start()

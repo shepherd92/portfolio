@@ -1,12 +1,12 @@
-"""Editable security catalogue; share balances remain on Home."""
+"""Editable security catalogue; share balances remain on Portfolio."""
 
 from dataclasses import asdict, fields
 from tkinter import ttk
 
 from portfolio.models import AssetDetails
 from ui.links import isin_url, quote_url
-from ui.reporting import format_amount, format_percent, plain_number
-from ui.widgets import DataTable
+from ui.reporting import format_amount, plain_number
+from ui.table import DataTable
 
 DETAIL_FIELDS = tuple(field.name for field in fields(AssetDetails))
 LOOKUP_FIELDS = tuple(name for name in DETAIL_FIELDS if name != 'ibkr_name')
@@ -37,7 +37,7 @@ class AssetsTable(DataTable):
             ('ter', 'TER', 80), ('ibkr_name', 'IBKR name', 230)],
             field_rows=(('ticker', 'group'), ('name',), ('isin', 'exchange'),
                         ('currency', 'ter'), ('ibkr_name',)), dialog_title='asset',
-            sort_key=lambda row: (row['group'], row['ticker']), numeric_columns=('ter', 'price'),
+            sort_key=lambda row: (row['group'], row['ticker']), numeric_columns=('ter', 'price'), percent_columns=('ter',),
             links={'ticker': lambda row: quote_url(row['ticker']),
                    'isin': lambda row: isin_url(row['isin'])}, **options)
         self.tree.column('ter', anchor='e')
@@ -50,11 +50,9 @@ class AssetsTable(DataTable):
     def display_value(self, row, key):
         quote = self._quotes.get(row['ticker'])
         if key == 'price':
-            return format_amount(quote.price, 2) if quote else '—'
+            return format_amount(quote.price, 0 if quote.currency == 'HUF' else 2) if quote else '—'
         if key == 'currency' and quote:
             return quote.currency
-        if key == 'ter' and row[key]:
-            return format_percent(row[key])
         return super().display_value(row, key)
 
     def sort_value(self, row, key):

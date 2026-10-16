@@ -13,6 +13,15 @@ API reference
 .. automodule:: portfolio.storage
    :members:
 
+.. automodule:: portfolio.calculator
+   :members:
+
+.. automodule:: portfolio.funding
+   :members:
+
+.. automodule:: portfolio.market
+   :members:
+
 .. automodule:: ui.reporting
    :members:
 
@@ -23,6 +32,12 @@ API reference
    :members:
 
 .. automodule:: ui.widgets
+   :members:
+
+.. automodule:: ui.table
+   :members:
+
+.. automodule:: ui.charts
    :members:
 
 Allocation editor
@@ -41,4 +56,10 @@ Holdings view
 -------------
 
 .. automodule:: ui.holdings
+   :members:
+
+Savings calculator
+------------------
+
+.. automodule:: ui.calculator
    :members:

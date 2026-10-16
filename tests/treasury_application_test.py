@@ -1,5 +1,6 @@
 """Manual-value validation and user-visible CLI recommendations."""
 
+from datetime import date
 import io
 from pathlib import Path
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from main import main
+from portfolio.market import BaseRate
 from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding,
                     ManualTrade, MarketData, Plan, Portfolio, Quote)
 from portfolio.planning import rebalance
@@ -82,7 +84,9 @@ class TreasuryApplicationTests(unittest.TestCase):
             portfolio = Portfolio((), allocation(treasury=50, cash=50), {},
                                   (ManualHolding(100, 'EUR'),))
             save_portfolio(portfolio, directory)
-            with (patch('yfinance.Ticker', side_effect=AssertionError('Unexpected market request')),
+            with (patch('main.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
+                  patch('portfolio.market.fetch_exchange_rate', return_value=.0025),
+                  patch('yfinance.Ticker', side_effect=AssertionError('Unexpected stock quote request')),
                   patch('sys.stdout', new_callable=io.StringIO) as output):
                 status = main(['--config', str(directory),
                                'rebalance', '--allow-selling'])
@@ -95,21 +99,23 @@ class TreasuryApplicationTests(unittest.TestCase):
         market = MarketData({'ETF': Quote(10, 'EUR')}, {'USD': .5})
         report = format_plan(rebalance(portfolio, market), portfolio.allocation)
         self.assertIn('Planned wealth: 100 EUR', report)
-        self.assertRegex(report, r'Cash\s+40\s+40.00%\s+40.00%')
-        self.assertRegex(report, r'Stocks\s+60\s+60.00%\s+60.00%')
+        self.assertRegex(report, r'Cash\s+40\s+40%\s+40%')
+        self.assertRegex(report, r'Stocks\s+60\s+60%\s+60%')
         self.assertEqual(report.count('Cash balances:'), 1)
 
-    def test_all_cash_cli_needs_no_quotes_or_network(self):
+    def test_all_cash_cli_needs_no_stock_quotes(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             save_portfolio(Portfolio((), allocation(cash=100), {'EUR': 100}), directory)
-            with (patch('yfinance.Ticker', side_effect=AssertionError('Unexpected market request')),
+            with (patch('main.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
+                  patch('portfolio.market.fetch_exchange_rate', return_value=.0025),
+                  patch('yfinance.Ticker', side_effect=AssertionError('Unexpected stock quote request')),
                   patch('sys.stdout', new_callable=io.StringIO) as output):
                 result = main(['--config', str(directory), 'rebalance'])
             self.assertEqual(result, 0)
             self.assertIn('Planned wealth: 100 EUR', output.getvalue())
             self.assertIn('No trades.', output.getvalue())
-            self.assertRegex(output.getvalue(), r'Cash\s+100\s+100.00%\s+100.00%')
+            self.assertRegex(output.getvalue(), r'Cash\s+100\s+100%\s+100%')
 
     def test_fx_only_report_does_not_say_no_trades(self):
         portfolio = Portfolio((), allocation(cash=100), {'EUR': -10, 'USD': 40})

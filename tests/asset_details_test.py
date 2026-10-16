@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from portfolio.models import AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, Portfolio
-from portfolio.storage import config_signature, fetch_market_data, load_portfolio, save_portfolio
+from portfolio.storage import config_signature, load_portfolio, save_portfolio
+from portfolio.market import fetch_market_data
 
 
 class AssetDetailsTests(unittest.TestCase):
