@@ -235,7 +235,7 @@ class RecommendationTests(unittest.TestCase):
 class ExpectedReturnTests(unittest.TestCase):
     def setUp(self):
         self.today = date(2025, 1, 1)
-        self.returns = ReturnAssumptions(equities=8, gold=2, bonds=4, mak=5)
+        self.returns = ReturnAssumptions(equities=8, gold=2, bonds=4, mak_huf=5)
         self.weights = {'Equities': 60, 'Gold': 20, 'Bonds': 20}
 
     def calculate(self, **values):
@@ -267,12 +267,12 @@ class ExpectedReturnTests(unittest.TestCase):
     def test_market_return_and_overall_return_use_amount_weighted_current_mix(self):
         result = self.calculate()
         self.assertAlmostEqual(result.market_return, 6)
-        self.assertEqual(result.mak_return, 5)
+        self.assertEqual(result.mak_huf_return, 5)
         self.assertAlmostEqual(result.expected_return, 5.6)
         self.assertAlmostEqual(estimate_market_return(self.returns, self.weights), result.market_return)
         self.assertAlmostEqual(estimate_market_return(self.returns, {'Equities': 6, 'Gold': 2, 'Bonds': 2}),
                                result.market_return)
-        changed = self.calculate(returns=ReturnAssumptions(equities=9, gold=9, bonds=9, mak=5))
+        changed = self.calculate(returns=ReturnAssumptions(equities=9, gold=9, bonds=9, mak_huf=5))
         self.assertEqual(changed.market_return, 9)
         self.assertAlmostEqual(changed.expected_return, 7.4)
         changed_mix = recommend(CalculatorSettings(returns=self.returns),
@@ -281,7 +281,7 @@ class ExpectedReturnTests(unittest.TestCase):
         self.assertAlmostEqual(changed_mix.expected_return, 6.8)
 
     def test_cash_can_offset_a_higher_mak_return_in_the_overall_portfolio(self):
-        settings = CalculatorSettings(returns=ReturnAssumptions(equities=16 / 3, mak=5.5))
+        settings = CalculatorSettings(returns=ReturnAssumptions(equities=16 / 3, mak_huf=5.5))
         invested = recommend(settings, self.today, allocation(stock=10), total=1_000_000)
         with_cash = recommend(settings, self.today, allocation(stock=10, cash=2.8), total=1_000_000)
         self.assertAlmostEqual(invested.expected_return, 5.483333333333333)

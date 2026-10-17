@@ -152,7 +152,7 @@ class PortfolioApp:
             self._error(error)
             return
         self._request_changed()
-        if settings.returns.mak is None and (self.calculator.needs_base_rate
+        if settings.returns.mak_huf is None and (self.calculator.needs_base_rate
                                              or monotonic() >= self.next_base_rate_refresh):
             self._refresh_calculator_rate(on_ready=self.generate_plan)
             return
@@ -1005,8 +1005,9 @@ class PortfolioApp:
             settings = self.calculator.planning_settings()
             as_of = getattr(settings, 'as_of', as_of)
             rate_context = (self.calculator.rate_description
-                            if self.calculator.settings().returns.mak is None
-                            else f'MÁK return assumption: {format_percent(settings.returns.mak)}')
+                            if self.calculator.settings().returns.mak_huf is None
+                            else f'MÁK HUF return: {format_percent(settings.returns.mak_huf)}')
+            rate_context += f' · MÁK EUR return: {format_percent(settings.returns.mak_eur)}'
         except ValueError as error:
             self._error(error)
             return

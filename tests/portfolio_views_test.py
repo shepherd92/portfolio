@@ -23,7 +23,7 @@ class PortfolioViewTests(unittest.TestCase):
     def test_mak_whole_target_adds_huf_reserves_without_changing_long_term_eur_mix(self):
         self.fixture.set_targets(stock={'Stocks': 60, 'Bonds': 0}, treasury={'EUR': 40, 'HUF': 0})
         self.app.calculator._set_inputs(CalculatorSettings(
-            emergency_months=3, cash_months=2, returns=ReturnAssumptions(mak=5),
+            emergency_months=3, cash_months=2, returns=ReturnAssumptions(mak_huf=5),
             outgoings=(CashFlow('Living', 1, date.today(), 'EUR', 'monthly'),)))
         self.app._refresh_charts()
         page = self.app.allocation_pages[TREASURY]

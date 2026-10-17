@@ -461,7 +461,7 @@ class TargetMixGuiTests(unittest.TestCase):
         self.assertEqual(loaded_wealth, wealth)
         settings = CalculatorSettings(outgoings=(CashFlow('Living', 100, date(2026, 1, 1), frequency='monthly'),),
                                       emergency_months=1, cash_months=1,
-                                      returns=ReturnAssumptions(equities=6, bonds=2, gold=0, mak=5))
+                                      returns=ReturnAssumptions(equities=6, bonds=2, gold=0, mak_huf=5))
         today = date(2026, 1, 16)
         settings = linked_settings(settings, loaded_wealth, today, {'EUR': 400})
         market = MarketData({name: Quote(1, 'HUF') for name in ('US', 'EU', 'Water')},

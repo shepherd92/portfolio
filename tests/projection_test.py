@@ -16,7 +16,7 @@ ALLOCATION = AllocationTargets({STOCK_MARKET: {'World': 60}, TREASURY: {'HUF': 4
 
 
 def settings(**values):
-    return CalculatorSettings(returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak=0), **values)
+    return CalculatorSettings(returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak_huf=0), **values)
 
 
 def total_at(result, index):
@@ -51,7 +51,7 @@ class ProjectionTests(unittest.TestCase):
                     emergency_months=0, cash_months=0, horizon_years=10,
                     incomes=(CashFlow('Bonus', 100000, deadline),),
                     outgoings=(CashFlow('Goal', 1000, due),),
-                    returns=ReturnAssumptions(equities=stock_return, mak=mak_return),
+                    returns=ReturnAssumptions(equities=stock_return, mak_huf=mak_return),
                 )
                 row = recommend(inputs, today, ALLOCATION, total=1e10).rows[2]
                 result = project(inputs, today, ALLOCATION, total=row.amount, years=10)
@@ -63,13 +63,32 @@ class ProjectionTests(unittest.TestCase):
                 self.assertFalse(result.shortfalls)
                 self.assertFalse(result.deadline_shortfalls)
 
+    def test_receipt_on_shared_deadline_recovers_shortfalls_proportionally(self):
+        today, deadline, due = date(2026, 1, 1), date(2026, 2, 1), date(2026, 4, 1)
+        expenses = (CashFlow('A', 40, due), CashFlow('B', 60, due))
+        for ordered in (expenses, expenses[::-1]):
+            with self.subTest(order=[expense.name for expense in ordered]):
+                inputs = settings(emergency_months=0, cash_months=0,
+                                  incomes=(CashFlow('Salary', 50, deadline),), outgoings=ordered)
+                recommendation = recommend(inputs, today, ALLOCATION, total=0)
+                contributions = {expense.payment.name: expense.contributions[0][1]
+                                 for expense in recommendation.expenses}
+                self.assertAlmostEqual(contributions['A'], 20)
+                self.assertAlmostEqual(contributions['B'], 30)
+                result = project(inputs, today, ALLOCATION, total=0, years=1)
+                for shortfalls in (result.deadline_shortfalls, result.shortfalls):
+                    self.assertEqual(len(shortfalls), 2)
+                    self.assertAlmostEqual(sorted(amount for _, amount in shortfalls)[0], 20)
+                    self.assertAlmostEqual(sorted(amount for _, amount in shortfalls)[1], 30)
+                self.assertEqual(total_at(result, -1), 0)
+
     def test_small_income_commitment_still_grows_to_fund_its_expense(self):
         inputs = CalculatorSettings(
             incomes=(CashFlow('Salary', 100, date(2026, 1, 1), frequency='monthly'),),
             emergency_months=0,
             cash_months=0,
             horizon_years=100,
-            returns=ReturnAssumptions(equities=60, mak=60),
+            returns=ReturnAssumptions(equities=60, mak_huf=60),
             outgoings=(CashFlow('Goal', 1000000, date(2125, 12, 1)),),
         )
         today = date(2026, 1, 1)
@@ -80,7 +99,7 @@ class ProjectionTests(unittest.TestCase):
 
     def test_combined_expense_growth_overflow_is_a_validation_error(self):
         inputs = CalculatorSettings(
-            returns=ReturnAssumptions(equities=100, mak=100),
+            returns=ReturnAssumptions(equities=100, mak_huf=100),
             outgoings=tuple((CashFlow(str(index), 1e+308, date(2030, 1, 1)) for index in range(5))),
         )
         today = date(2026, 1, 1)
@@ -97,7 +116,7 @@ class ProjectionTests(unittest.TestCase):
                 CashFlow('Car', 10000, date(2028, 8, 30)),
             ),
         )
-        inputs = replace(inputs, returns=ReturnAssumptions(equities=8, mak=4))
+        inputs = replace(inputs, returns=ReturnAssumptions(equities=8, mak_huf=4))
         expected = recommend(inputs, TODAY, ALLOCATION, total=20000)
         result = project(inputs, TODAY, ALLOCATION, total=20000, years=3)
         for name, amount in ((STOCK_MARKET, expected.stock), (TREASURY, expected.mak), (CASH, expected.cash)):
@@ -194,7 +213,7 @@ class ProjectionTests(unittest.TestCase):
     def test_discounted_expense_and_committed_income_grow_to_exact_payment(self):
         due = date(2030, 8, 1)
         inputs = settings(emergency_months=0, cash_months=0, incomes=(CashFlow('Salary', 100, TODAY, frequency='monthly'),), outgoings=(CashFlow('Goal', 20000, due),))
-        inputs = replace(inputs, returns=ReturnAssumptions(equities=9, mak=5))
+        inputs = replace(inputs, returns=ReturnAssumptions(equities=9, mak_huf=5))
         recommendation = recommend(inputs, TODAY, ALLOCATION, total=50000)
         initial = recommendation.rows[2].amount
         result = project(inputs, TODAY, ALLOCATION, total=initial, years=5)
@@ -255,7 +274,7 @@ class ProjectionTests(unittest.TestCase):
             incomes=(CashFlow('Salary', 100, TODAY, frequency='monthly'),),
             outgoings=(CashFlow('Living costs', 100, date.min, frequency='monthly'), CashFlow('Goal', 1000, due)),
         )
-        inputs = replace(inputs, returns=ReturnAssumptions(equities=5, mak=100))
+        inputs = replace(inputs, returns=ReturnAssumptions(equities=5, mak_huf=100))
         initial = recommend(inputs, TODAY, ALLOCATION, total=1000)
         self.assertGreater(initial.shortfall, 0)
         result = project(inputs, TODAY, ALLOCATION, total=1000, years=2)
@@ -305,7 +324,7 @@ class ProjectionTests(unittest.TestCase):
             cash_months=2,
             outgoings=(CashFlow('Living costs', 100, date.min, frequency='monthly'),),
         )
-        inputs = replace(inputs, returns=ReturnAssumptions(equities=6, mak=5))
+        inputs = replace(inputs, returns=ReturnAssumptions(equities=6, mak_huf=5))
         result = project(inputs, TODAY, ALLOCATION, total=800, years=1)
         self.assertEqual(set(result.purpose['Emergency fund']), {600})
         self.assertEqual(set(result.purpose['Monthly living costs']), {200})
@@ -317,9 +336,9 @@ class ProjectionTests(unittest.TestCase):
                                          TREASURY: {'EUR': 30}, CASH: {'EUR': 10}},
                                         {'Shares': 'Equities', 'Gold': 'Gold', 'Bonds': 'Bonds'})
         inputs = replace(settings(emergency_months=0, cash_months=0),
-                         returns=ReturnAssumptions(equities=10, gold=2, bonds=4, mak=5))
+                         returns=ReturnAssumptions(equities=10, gold=2, bonds=4, mak_huf=5, mak_eur=2))
         result = project(inputs, TODAY, allocation, total=10000, years=1)
-        annual = .3 * 10 + .2 * 2 + .1 * 4 + .3 * 5
+        annual = .3 * 10 + .2 * 2 + .1 * 4 + .3 * 2
         expected = 10000 * exp(log1p(annual / 100) * 365 / 365.2425)
         self.assertAlmostEqual(total_at(result, -1), expected)
 
@@ -358,12 +377,12 @@ class ProjectionTests(unittest.TestCase):
             inputs,
             emergency_months=10,
             cash_months=0,
-            returns=ReturnAssumptions(equities=5, mak=5),
+            returns=ReturnAssumptions(equities=5, mak_huf=5),
             outgoings=(CashFlow('Living costs', 10 ** 307, date.min, frequency='monthly'),),
         )
         with self.assertRaisesRegex(ValueError, 'numeric range'):
             project(large, TODAY, ALLOCATION, total=1.79e308, years=1)
-        inputs = replace(inputs, returns=ReturnAssumptions(equities=1e300, mak=1e300))
+        inputs = replace(inputs, returns=ReturnAssumptions(equities=1e300, mak_huf=1e300))
         with self.assertRaisesRegex(ValueError, 'numeric range'):
             project(inputs, TODAY, ALLOCATION, total=1000, years=100)
 

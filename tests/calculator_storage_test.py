@@ -38,8 +38,9 @@ class CalculatorStorageTests(unittest.TestCase):
         self.assertEqual(values['outgoings'][1]['start'], '2028-02')
         self.assertEqual(values['outgoings'][0], {
             'name': 'Living costs', 'amount': 100_000, 'currency': 'HUF',
-            'start': '2026-01', 'frequency': 'monthly', 'count': None, 'end': None})
-        self.assertIsNone(values['returns']['mak'])
+            'start': '2026-01', 'frequency': 'monthly', 'count': None, 'end': None,
+            'appreciation_percent': 0})
+        self.assertIsNone(values['returns']['mak_huf'])
         self.assertNotIn('total', values)
         self.assertNotIn('monthly_costs', values)
         self.assertNotIn('expenses', values)
@@ -74,6 +75,44 @@ class CalculatorStorageTests(unittest.TestCase):
         self.assertEqual(json.loads(token)['incomes'][0]['currency'], 'GBP')
         self.assertEqual([row['frequency'] for row in json.loads(token)['incomes']],
                          ['monthly', 'once', 'monthly', 'annual'])
+
+    def test_appreciation_round_trip_keeps_base_amounts_and_derived_huf_precision(self):
+        settings = CalculatorSettings(
+            incomes=(CashFlow('Salary', 1001, date(2026, 1, 1), frequency='monthly', appreciation_percent=3.125),),
+            outgoings=(CashFlow('Annual cost', 1200, date(2026, 1, 1), frequency='annual', count=3,
+                                appreciation_percent=-2.75),
+                       CashFlow('Purchase', 5000, date(2028, 1, 1), appreciation_percent=7.5)))
+        token = save_settings(settings, self.directory, None)
+        loaded, original = load_settings(self.directory)
+        self.assertEqual((loaded, original), (settings, token))
+        self.assertEqual(loaded.incomes[0].amount, 1001)
+        self.assertEqual(loaded.outgoings[0].amount, 1200)
+        self.assertAlmostEqual(loaded.incomes[0].amount_on(date(2027, 1, 1)), 1001 * 1.03125)
+        self.assertNotEqual(loaded.incomes[0].amount_on(date(2026, 2, 1)),
+                            round(loaded.incomes[0].amount_on(date(2026, 2, 1))))
+        self.assertAlmostEqual(loaded.outgoings[0].amount_on(date(2028, 1, 1)), 1200 * .9725 ** 2)
+        self.assertEqual(loaded.outgoings[1].amount_on(date(2030, 1, 1)), 5000)
+        self.assertEqual(json.loads(token)['outgoings'][0]['appreciation_percent'], -2.75)
+        self.assertEqual(self.path.read_bytes(), token)
+
+    def test_missing_and_invalid_appreciation_are_rejected_without_rewriting_file(self):
+        token = save_settings(self.settings, self.directory, None)
+        for kind in ('incomes', 'outgoings'):
+            for value in (None, True, -100, -101, 1000.01, 'unknown', float('nan'), float('inf')):
+                data = json.loads(token)
+                data[kind][0]['appreciation_percent'] = value
+                contents = json.dumps(data).encode()
+                self.path.write_bytes(contents)
+                with self.subTest(kind=kind, value=value), self.assertRaisesRegex(ValueError, 'Invalid calculator.json'):
+                    load_settings(self.directory)
+                self.assertEqual(self.path.read_bytes(), contents)
+            data = json.loads(token)
+            del data[kind][0]['appreciation_percent']
+            contents = json.dumps(data).encode()
+            self.path.write_bytes(contents)
+            with self.subTest(kind=kind, missing=True), self.assertRaisesRegex(ValueError, 'Invalid calculator.json'):
+                load_settings(self.directory)
+            self.assertEqual(self.path.read_bytes(), contents)
 
     def test_external_edit_creation_deletion_and_edit_during_save_are_guarded(self):
         token = save_settings(self.settings, self.directory, None)
@@ -145,8 +184,8 @@ class CalculatorStorageTests(unittest.TestCase):
         valid = json.loads(token)
         cases = [b'not json', b'\xff', b'[]', b'{}', b'{"incomes":[],"incomes":[]}',
                  json.dumps({**valid, 'unknown': 100}).encode(),
-                 json.dumps({**valid, 'returns': {'mak': 6}}).encode(),
-                 json.dumps({**valid, 'returns': {**valid['returns'], 'mak': True}}).encode(),
+                 json.dumps({**valid, 'returns': {'mak_huf': 6}}).encode(),
+                 json.dumps({**valid, 'returns': {**valid['returns'], 'mak_huf': True}}).encode(),
                  json.dumps({**valid, 'outgoings': {}}).encode(),
                  json.dumps({**valid, 'incomes': {}}).encode()]
         row = valid['outgoings'][0]

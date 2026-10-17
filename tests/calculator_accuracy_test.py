@@ -71,7 +71,7 @@ class ExpenseProjectionAccuracyTests(unittest.TestCase):
     def test_corrected_reserve_leaves_only_the_true_long_term_remainder(self):
         settings = CalculatorSettings(
             horizon_years=1,
-            returns=ReturnAssumptions(mak=-99.9),
+            returns=ReturnAssumptions(mak_huf=-99.9),
             outgoings=(CashFlow('One-year cost', 1000000, date(2027, 12, 16)),),
         )
         result = recommend(settings, date(2026, 10, 16), allocation(), total=3_000_000)

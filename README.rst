@@ -127,7 +127,7 @@ for 15 minutes. Calculations and displays share them; currency changes reuse nat
 quotes and derive cross-rates from shared EUR rates. Concurrent requests for the same
 input share one result. Partial successes survive a failed refresh; errors are not cached.
 The oldest underlying quote/rate determines freshness. Nothing is saved as a market
-price snapshot; a new launch fetches data again. Manual MÁK return mode skips MNB polling.
+price snapshot; a new launch fetches data again. Manual HUF MÁK return mode skips MNB polling.
 The status shows elapsed time during background work. Cancel restores the
 editors and discards late results; a price refresh stops waiting after two minutes.
 Portfolio's Summary has four aligned panels under **Target allocation**
@@ -362,13 +362,17 @@ Savings calculator
 **Calculator** shows Stock market, MÁK, and Cash recommendations. It uses Portfolio’s
 long-term mix and never changes Portfolio targets or holdings. Its current reserve,
 income, expense, and return inputs are used by Generate plan; editing them
-invalidates the previous plan. The layout has three rows: **Settings** (reserves and horizon)
-on the top left and **Portfolio summary** on the top right; the combined **Income and outgoings**
-table on the middle left, with monthly cash flow above single-expense funding on the right;
-recommended allocations across the bottom. The summary contains current portfolio value,
-overall annual return and monthly saving ratio. Return assumptions are edited on
-**Portfolio → Stock market → Allocations** and **Portfolio → MÁK**. The projection
-button is on **Portfolio → Summary**.
+invalidates the previous plan. Three pages appear in the left navigation:
+
+* **Inputs** places **Settings** above **Income and outgoings**. Linked payments
+  remain available beside the manually entered schedules.
+* **Funding** contains one expandable **Monthly funding calendar**, combining
+  monthly cash flow, expense commitments and cash-ready deadlines.
+* **Results** contains **Recommended overall allocations** and **Portfolio summary**,
+  including current investment value, overall annual return and monthly saving ratio.
+
+Return assumptions are edited on **Portfolio → Stock market → Allocations** and
+**Portfolio → MÁK**. The projection button is on **Portfolio → Summary**.
 
 The first column identifies **Income** or **Outgoing**. Each row has a name,
 amount per payment, currency and schedule. Choose **Once**, **Monthly**, or
@@ -376,18 +380,18 @@ amount per payment, currency and schedule. Choose **Once**, **Monthly**, or
 Recurring schedules have an optional inclusive end month or a payment count.
 Count includes the first payment; annual payments repeat in the same month each year.
 Ongoing schedules have no end. The month picker shows a year above a 4 × 3 month grid;
-the monthly summary uses the same picker. Finite schedules support up to 1 200 payments.
+the calendar start month uses the same picker. Finite schedules support up to 1 200 payments.
 
 For calculation, all payments occur on the first day of their selected month.
 Income in the current month is already accounted for in Portfolio cash; future
 income starts next month or at its later scheduled start. Past recurring payments
 are assumed paid; overdue single payments remain outstanding until removed or rescheduled.
 
-**Monthly cash flow** summarizes a selectable calendar month. It separates
-**Recurring** payments (including finite instalments) from **Single** payments
+The **Funding** calendar summarizes each displayed month. Its detail rows separate
+**Recurring** payments (including finite instalments) from **Once** payments
 and shows Income, Outgoings and Net. This makes a large purchase or bonus visible
 without presenting it as a typical recurring cost. Net may be negative. Selecting
-a month changes only this summary and the saving ratio, not the calculation date or saved inputs.
+a month changes only the calendar view and saving ratio, not the calculation date or saved inputs.
 The saving ratio is (Recurring income − Recurring outgoings) ÷ Recurring income × 100.
 It excludes one-time income and outgoings, may be negative, and displays — when recurring
 income is zero. Annual payments count in their selected month, as in the cash-flow table;
@@ -395,13 +399,13 @@ the ratio is separate from the ongoing annual-cost budget used in projections.
 
 Active outgoing rows without an end define the living-cost budget and fixed reserves.
 Ongoing annual costs contribute one twelfth of their annual amount each month.
-Their full annual bill still appears in its scheduled month in the monthly summary.
+Their full annual bill still appears in its scheduled month in the funding calendar.
 This is a monthly budget approximation: the projection spreads these costs instead
 of withdrawing the full bill again. Annual income is received only in its scheduled month. Finite instalments, including loans,
 are reserved as dated obligations and are not deducted from the budget twice.
-Enter loan instalments including interest and fees; the app does not calculate
-loan amortization. Each outgoing has its own currency dropdown.
-The monthly summary and Portfolio value use the shared **Base currency** above the tabs. Current exchange rates convert inputs to HUF before
+Enter manual instalments including interest and fees. Use **Loans** for outstanding
+debt and interest tracking instead of also entering the same payments here. Each outgoing has its own currency dropdown.
+The funding calendar and Portfolio value use the shared **Base currency** above the tabs. Current exchange rates convert inputs to HUF before
 calculating savings and reserves. **Portfolio value** always uses the actual current
 holdings and fetched quotes. Changing Base currency refreshes quotes and updates all displays. Displayed values use whole
 currency units, while calculations retain the exact valuation. Portfolio value is read-only
@@ -418,7 +422,17 @@ The separate bank cash buffer holds that monthly total times cash months
 and two cash months reserve eight months of living costs in total.
 **Years to 100% stock market** (initially seven) is measured to the date an
 expense must be fully funded in cash, rather than its payment date.
-Add each expense's expected nominal amount and currency **at its due date**.
+For a single expense, enter its expected nominal amount and currency **at its due date**.
+For recurring income or outgoings, enter the amount in the **Begins** month and
+optionally set **Appreciation**, an annual percentage (initially 0%). The model uses::
+
+    payment = Begins amount × (1 + appreciation / 100)^(elapsed months / 12)
+
+This applies to both monthly and annual schedules. For example, 1,000 at 3%
+becomes 1,030 twelve months after Begins. Negative rates model decreasing payments.
+A single payment uses its entered amount. Appreciation is applied before currency
+conversion and is separate from investment returns. No raises or inflation are
+inferred beyond the rates you enter.
 HUF inputs require whole amounts; other currencies accept fractions and retain
 them internally while displaying whole amounts. Bank cash and all reserved
 MÁK stay in HUF even when the input spending currency is different.
@@ -440,28 +454,45 @@ ongoing monthly budget, including one twelfth of annual ongoing costs. A monthly
 zero savings rather than a portfolio withdrawal, as before.
 
 Single payments and finite instalments use the remaining income once through
-their funding schedules. Future-start ongoing costs increase buffer requirements
-at their start date; future income needed for those buffers is not also promised
-to expenses. The estimate assumes nominal amounts and does not predict raises or inflation.
+their funding schedules. Ongoing costs use their appreciated amounts for each
+month's budget, with annual amounts divided by twelve. New or growing ongoing
+costs increase buffer requirements; future income needed for those buffers is not
+also promised to expenses. Falling costs cancel unpaid buffer top-up needs, and
+projections release excess buffer holdings to the long-term allocation.
 
 A future receipt on an expense's cash deadline is available for that expense;
 later income cannot fund it.
-Each payment funds the earliest defensive funding gap, growing at
-the MÁK assumption only until that deadline. Any unused part of a payment can
-fund later expenses.
+Receipts first cover additional fixed buffers, then the earliest defensive
+cash deadline. Expenses with that same deadline share savings proportionally to
+their remaining defensive capacities; entry order does not determine their share.
+Assigned principal grows at the HUF MÁK assumption until that deadline. Once the
+deadline group is covered, any remainder can fund later expenses.
 After all planned expenses are covered, unused savings can follow the long-term
 allocation. An expense whose cash deadline has arrived receives no future income.
 
-**Single expense funding** shows only single outgoing payments. Recurring instalments
-still affect the overall recommendation and projection, even when beyond the
-selected projection horizon. Ongoing costs determine the fixed buffers.
-**Future income** shows the payment amount covered by future savings and MÁK growth
-by the cash deadline. First the full expense is discounted and split by its time
-horizon. Future income reduces only the MÁK reserve needed today; it never reduces
-the resulting stock-market amount. For example, with zero returns, a 100-unit
-expense split into 60 Stock market and 40 MÁK, with 20 of future savings, needs
-60 Stock market and 20 MÁK today. The other 20 arrives later. Savings and current
-MÁK earn the assumed return until the cash deadline.
+The **Monthly funding calendar** shows scheduled Income, Outgoings and Net alongside the recurring Saving ratio, eligible Savings, Committed savings and
+Unassigned savings. Expand a month to inspect recurring versus once flows, the
+ongoing living-cost budget, covered linked obligations, fixed-buffer additions,
+individual expense assignments and cash-ready deadlines. Months with no income
+remain visible. The current month's receipts are already recorded in holdings
+and cannot be committed again. The month/range controls change only the display.
+
+Calendar assignments are **saving principal**, without forecast interest. They
+sum to the expense commitment for that month. Fixed-buffer commitments plus
+expense commitments plus unassigned savings equal eligible savings. Scheduled
+net can differ from eligible savings: annual ongoing costs are budgeted monthly,
+and finite payments already have their own funded reserves. Unassigned amounts
+are future savings, not money already available in today's portfolio.
+
+Select an expense row to inspect its current Cash, MÁK and Stock market reserve.
+Trade plan → Calculations gives the full reserve, assigned future principal,
+projected interest by the deadline and the discounted reserve credit. Both once
+and finite recurring payments use the same funding calculation. First the full
+expense is discounted and split by its time horizon. Future income reduces only
+the defensive reserve needed today; it preserves the calculated stock amount.
+With zero returns, a 100-unit expense split into 60 Stock market and 40 MÁK,
+with 20 of future savings, needs 60 Stock market and 20 MÁK today. The remaining
+20 arrives later.
 
 Future income is capped at the defensive funding need. A distant expense starting
 at 100% Stock market has no defensive amount to replace. When the MÁK return exceeds
@@ -473,8 +504,9 @@ describe today's portfolio: future income is never added to its current value.
 
 The **Expected annual returns** table on **Portfolio → Stock market → Allocations**
 contains Equities, Bond and Gold assumptions and read-only weights from the
-long-term targets. **Portfolio → MÁK** has a single expected annual return field
-beside **Use MNB base rate**. Cash earns zero in the model.
+long-term targets. **Portfolio → MÁK** has independent HUF and EUR expected annual
+return fields. **Use MNB base rate** applies only to HUF. The EUR field starts at
+0% (no assumed growth) and is manually editable. Cash earns zero in the model.
 Stock market return is always calculated from the first three categories,
 normalizing their target weights within Stock market. Changes to those targets,
 their categories, or their return assumptions immediately update calculations.
@@ -482,7 +514,7 @@ Positive stock targets need a category on the Asset classes tab. Initial
 illustrative assumptions are 6% equities, 2% gold, and 3% bond ETFs; these are
 planning inputs, not forecasts specific to the instruments or HUF.
 
-MÁK uses the current `MNB base rate
+HUF MÁK uses the current `MNB base rate
 <https://www.mnb.hu/Jegybanki_alapkamat_alakulasa>`_ by default. The calculator
 fetches it at startup and refreshes it every 15 minutes while idle, regardless of
 the selected tab. Planning also refreshes a missing or stale rate. If an update
@@ -498,8 +530,8 @@ expense's cash deadline. It subtracts emergency, bank cash, and
 expense reserves from savings, applies the long-term split to the remainder,
 and sums the resulting amounts. The overall expected annual return uses this
 recommended allocation **today**; it is not the expense's lifetime return.
-The **Recommended overall allocations** table at the bottom shows Stock market,
-MÁK, and Cash amounts and shares, with their weighted overall annual return.
+The **Results** page shows Stock market, MÁK and Cash amounts and shares, with
+their weighted overall annual return in Portfolio summary.
 This uses the recommended allocation, not the current holdings on Portfolio.
 If required reserves exceed savings, the recommendation first funds bank
 cash, then expense cash by deadline, then emergency MÁK and expense MÁK by deadline, then expense Stock market
@@ -508,13 +540,17 @@ to expected returns. Reserved MÁK is always HUF; the long-term portion follows
 Portfolio’s currency split. It shows actual
 funded amounts and reports the unfunded shortfall separately.
 
-Returns are nominal HUF modelling assumptions, including the shared MÁK
-assumption for long-term EUR holdings; they are not currency-specific bond yields.
+Emergency reserves, defensive expense reserves and assigned future savings use
+the HUF MÁK return. Only the long-term EUR MÁK portion uses the independent EUR
+return. Overall annual return weights the recommended Stock market, HUF MÁK and
+EUR MÁK values, all converted to HUF, by their respective returns; Cash contributes
+zero. Projection uses the same split for long-term growth and HUF growth for
+protected reserves. These are nominal return assumptions, not fetched bond yields.
 There is no forecast exchange-rate drift. A foreign-currency expense’s HUF cost
 changes when the fetched exchange rate changes.
-There are no automatic additions for inflation, fees, taxes, or early-redemption
-costs. Enter future expenses after any inflation adjustment
-and adjust returns as needed. Expected growth is uncertain and does not guarantee
+There are no inferred additions for inflation, fees, taxes, or early-redemption
+costs. Include them in your entered amounts or explicit cash-flow appreciation,
+and adjust investment returns separately. Expected growth is uncertain and does not guarantee
 an expense will be funded. This is a deterministic scenario calculator, not a
 probability-of-success model or an automatic choice between MÁK and bond ETFs.
 

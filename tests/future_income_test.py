@@ -14,7 +14,7 @@ class FutureIncomeTests(unittest.TestCase):
 
     def settings(self, as_of=date(2025, 1, 1), income=100, **values):
         defaults = dict(incomes=self.income(income, as_of),
-                        returns=ReturnAssumptions(equities=0, mak=0))
+                        returns=ReturnAssumptions(equities=0, mak_huf=0))
         return CalculatorSettings(**(defaults | values))
 
     def test_no_surplus_matches_zero_income_and_does_not_model_withdrawals(self):
@@ -32,13 +32,13 @@ class FutureIncomeTests(unittest.TestCase):
             with self.subTest(income=income):
                 result = recommend(replace(settings, incomes=self.income(income, today)), today, allocation(), total=10000)
                 self.assertEqual(result.rows, expected.rows)
-                self.assertEqual((result.market_return, result.mak_return, result.shortfall),
-                                 (expected.market_return, expected.mak_return, expected.shortfall))
+                self.assertEqual((result.market_return, result.mak_huf_return, result.shortfall),
+                                 (expected.market_return, expected.mak_huf_return, expected.shortfall))
                 self.assertEqual(result.receipts, ())
         self.assertEqual([row.income_funded for row in expected.rows], [None, None, 0, 0, None])
         without_expenses = replace(settings, outgoings=())
-        self.assertEqual(recommend(replace(without_expenses, incomes=self.income(1000, today)), today, allocation(), total=10000),
-                         recommend(without_expenses, today, allocation(), total=10_000))
+        self.assertEqual(recommend(replace(without_expenses, incomes=self.income(1000, today)), today, allocation(), total=10000).rows,
+                         recommend(without_expenses, today, allocation(), total=10_000).rows)
 
     def test_monthly_income_starts_next_month_and_includes_the_cash_deadline(self):
         cases = ((date(2025, 1, 31), date(2025, 3, 31), 0),
@@ -85,7 +85,7 @@ class FutureIncomeTests(unittest.TestCase):
             self.assertAlmostEqual(row.amount, 100)
         self.assertEqual(result.total, 10_000)
 
-    def test_same_month_expenses_share_income_once_in_input_order(self):
+    def test_same_month_expenses_share_income_proportionally(self):
         today = date(2025, 1, 28)
         expenses = (CashFlow('First', 100, date(2025, 4, 30)),
                     CashFlow('Second', 100, date(2025, 4, 28)))
@@ -95,10 +95,9 @@ class FutureIncomeTests(unittest.TestCase):
         baseline = recommend(replace(settings, incomes=()), today, allocation(), total=10000)
         result = recommend(settings, today, allocation(), total=10000)
         first, second = result.rows[2:-1]
-        first_defensive = baseline.rows[2].mak
-        self.assertAlmostEqual(first.income_funded, first_defensive)
-        self.assertAlmostEqual(first.mak, 0)
-        self.assertAlmostEqual(second.income_funded, 100 - first_defensive)
+        self.assertAlmostEqual(first.income_funded, 50)
+        self.assertAlmostEqual(second.income_funded, 50)
+        self.assertAlmostEqual(first.mak, baseline.rows[2].mak - 50)
         for old, new in zip(baseline.rows[2:-1], result.rows[2:-1]):
             self.assertEqual(new.stock, old.stock)
         self.assertAlmostEqual(first.income_funded + second.income_funded, 100)
@@ -111,7 +110,7 @@ class FutureIncomeTests(unittest.TestCase):
                     CashFlow('Middle', 100000, date(2025, 6, 16)))
         for rate in (-20, 0, 12):
             with self.subTest(mak_return=rate):
-                settings = self.settings(today, returns=ReturnAssumptions(equities=7, mak=rate), outgoings=expenses)
+                settings = self.settings(today, returns=ReturnAssumptions(equities=7, mak_huf=rate), outgoings=expenses)
                 result = recommend(settings, today, allocation(), total=1000000)
                 baseline = recommend(replace(settings, incomes=()), today, allocation(), total=1000000)
                 covered = {}
@@ -145,7 +144,7 @@ class FutureIncomeTests(unittest.TestCase):
         self.assertAlmostEqual(row.stock, 100 * stock_fraction)
         self.assertAlmostEqual(row.mak, 100 * (1 - stock_fraction) - 20)
         self.assertEqual((row.amount, row.income_funded), (80, 20))
-        with_interest = replace(settings, returns=ReturnAssumptions(equities=10, mak=10))
+        with_interest = replace(settings, returns=ReturnAssumptions(equities=10, mak_huf=10))
         row = recommend(with_interest, today, allocation(), total=1000).rows[2]
         reserve = 100 / 1.1 ** (182 / 365.2425)
         income_today = 20 / 1.1 ** (121 / 365.2425)
@@ -178,14 +177,14 @@ class FutureIncomeTests(unittest.TestCase):
             with self.subTest(rate=rate):
                 settings = self.settings(
                     today, income=10000, horizon_years=1,
-                    returns=ReturnAssumptions(mak=rate),
+                    returns=ReturnAssumptions(mak_huf=rate),
                     outgoings=(CashFlow('Distant cost', 100000, date(2126, 12, 16)),),
                 )
                 result = recommend(settings, today, allocation(), total=1000000)
                 baseline = recommend(replace(settings, incomes=()), today, allocation(), total=1000000)
                 self.assertEqual(result.rows, baseline.rows)
-                self.assertEqual((result.market_return, result.mak_return, result.shortfall),
-                                 (baseline.market_return, baseline.mak_return, baseline.shortfall))
+                self.assertEqual((result.market_return, result.mak_huf_return, result.shortfall),
+                                 (baseline.market_return, baseline.mak_huf_return, baseline.shortfall))
                 self.assertTrue(result.receipts)
                 self.assertEqual(baseline.receipts, ())
                 self.assertEqual(result.expenses[0].contributions, ())

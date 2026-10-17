@@ -22,7 +22,7 @@ class FundingTests(unittest.TestCase):
         self.market = MarketData({'US': Quote(1, 'EUR'), 'EU': Quote(1, 'EUR')},
                                  {'EUR': 1, 'HUF': .0025})
         self.settings = CalculatorSettings(
-            returns=ReturnAssumptions(equities=0, mak=0),
+            returns=ReturnAssumptions(equities=0, mak_huf=0),
             outgoings=(
                 CashFlow('Rent', 60, date.min, frequency='monthly'),
                 CashFlow('Food', 40, date.min, frequency='monthly'),
@@ -97,11 +97,11 @@ class FundingTests(unittest.TestCase):
     def test_long_term_cash_and_its_zero_return_are_separate_from_protected_cash(self):
         allocation = AllocationTargets({STOCK_MARKET: {'US': 40, 'EU': 20},
                                          TREASURY: {'EUR': 10, 'HUF': 10}, CASH: {'EUR': 20}}, {'US': 'Equities', 'EU': 'Equities'})
-        settings = replace(self.settings, returns=ReturnAssumptions(equities=10, mak=5))
+        settings = replace(self.settings, returns=ReturnAssumptions(equities=10, mak_huf=5))
         result = prepare_allocation(replace(self.portfolio, allocation=allocation), self.market, settings, self.today)
         recommendation = result.recommendation
         self.assertEqual((recommendation.stock, recommendation.mak, recommendation.cash), (120, 640, 240))
-        self.assertAlmostEqual(recommendation.expected_return, 4.4)
+        self.assertAlmostEqual(recommendation.expected_return, 4.3)
         self.assertEqual(result.minimum_values[CASH, 'HUF'], .5)
         self.assertEqual(self.target_values(result)[CASH, 'EUR'], 40)
 

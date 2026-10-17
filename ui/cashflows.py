@@ -10,23 +10,28 @@ from ui.dates import MonthEntry
 from ui.help import HELP, add_help, info_label
 from ui.reporting import plain_number
 from ui.table import DataTable
-from ui.widgets import RoundedEntry
+from ui.widgets import PercentEntry, RoundedEntry
 
 
 _FREQUENCIES = {'once': 'Once', 'monthly': 'Monthly', 'annual': 'Annually'}
 
 
 class CashFlowTable(DataTable):
-    def __init__(self, parent, *, currency_choices, on_change, extra_columns=(), percent_columns=()):
+    def __init__(self, parent, *, currency_choices, on_change, extra_columns=(), percent_columns=(), appreciation=True):
+        self._appreciation = appreciation
+        growth = (('appreciation_percent', 'Appreciation', 110),) if appreciation else ()
         columns = [('kind', 'Type', 80), ('name', 'Name', 150), ('amount', 'Amount', 95),
-                   ('currency', 'Currency', 90), *extra_columns, ('frequency', 'Schedule', 85),
+                   ('currency', 'Currency', 90), *growth, *extra_columns, ('frequency', 'Schedule', 85),
                    ('start', 'Begins', 105), ('ending', 'Ends', 115)]
         super().__init__(parent, columns, height=4, rounded_columns=('amount',),
-                         percent_columns=percent_columns,
+                         percent_columns=(*percent_columns, *(('appreciation_percent',) if appreciation else ())),
                          validate=self._validate, on_change=on_change, dialog_title='cash flow',
                          field_rows=(('kind',), ('name',), ('amount', 'currency'), ('frequency',),
-                                     ('start',), ('ending',), ('count', 'end')))
+                                     ('start',), ('ending',), ('count', 'end'),
+                                     *((('appreciation_percent',),) if appreciation else ())))
         self._currency_choices = currency_choices
+        if appreciation:
+            self.tree.column('appreciation_percent', anchor='e')
 
     def cashflows(self, kind):
         return tuple(self._cashflow(row) for row in self.get_rows() if row['kind'] == kind)
@@ -36,6 +41,8 @@ class CashFlowTable(DataTable):
                        for flow in flows])
 
     def display_value(self, row, key):
+        if key == 'appreciation_percent' and self._appreciation and row['frequency'] == 'once':
+            return '—'
         if key == 'frequency':
             return _FREQUENCIES[row[key]]
         if key == 'ending':
@@ -47,13 +54,19 @@ class CashFlowTable(DataTable):
         return super().display_value(row, key)
 
     def sort_value(self, row, key):
+        if key == 'appreciation_percent' and self._appreciation and row['frequency'] == 'once':
+            return None
         return self.display_value(row, key) if key in ('frequency', 'ending') else super().sort_value(row, key)
+
+    def _normalize(self, row):
+        return super()._normalize({'appreciation_percent': '0', **row})
 
     def _edit_fields(self, form, old):
         initial = dict(old or {})
         initial.setdefault('kind', 'Outgoing')
         initial.setdefault('start', date.today().isoformat()[:7])
         initial.setdefault('currency', 'HUF')
+        initial.setdefault('appreciation_percent', '0')
         initial['frequency'] = _FREQUENCIES[initial.get('frequency', 'once')]
         initial['ending'] = 'Number of payments' if initial.get('count') else 'End month' if initial.get('end') else 'Ongoing'
         specifications = (('kind', 'Type', 0, 0, 2), ('name', 'Name', 1, 0, 2),
@@ -61,6 +74,8 @@ class CashFlowTable(DataTable):
                           ('frequency', 'Schedule', 3, 0, 2), ('start', 'Begins', 4, 0, 2),
                           ('ending', 'Ends', 5, 0, 2), ('count', 'Number of payments', 6, 0, 2),
                           ('end', 'End month', 6, 0, 2))
+        if self._appreciation:
+            specifications += (('appreciation_percent', 'Annual appreciation', 7, 0, 2),)
         choices = {'kind': ('Income', 'Outgoing'), 'currency': self._currency_choices(),
                    'frequency': tuple(_FREQUENCIES.values()),
                    'ending': ('Ongoing', 'Number of payments', 'End month')}
@@ -72,7 +87,8 @@ class CashFlowTable(DataTable):
             if key in choices:
                 editor = ttk.Combobox(form, textvariable=variable, values=choices[key], state='readonly', width=24)
             else:
-                entry = MonthEntry if key in ('start', 'end') else RoundedEntry if key == 'amount' else ttk.Entry
+                entry = (MonthEntry if key in ('start', 'end') else RoundedEntry if key == 'amount'
+                         else PercentEntry if key == 'appreciation_percent' else ttk.Entry)
                 editor = entry(form, textvariable=variable, width=32 if span == 2 else 20)
             editors[key] = editor
             editor.grid(row=2 * row + 1, column=column, columnspan=span, sticky='ew',
@@ -86,6 +102,8 @@ class CashFlowTable(DataTable):
                                  ('end', recurring and variables['ending'].get() == 'End month')):
                 for widget in (labels[key], editors[key]):
                     widget.grid() if visible else widget.grid_remove()
+            if self._appreciation:
+                editors['appreciation_percent'].configure(state='normal' if recurring else 'disabled')
             editors['amount'].set_integer_only(variables['currency'].get() == 'HUF')
 
         for key in ('frequency', 'ending', 'currency'):
@@ -117,13 +135,18 @@ class CashFlowTable(DataTable):
             count = int(row['count']) if row.get('count') else None
         except ValueError as error:
             raise ValueError('Number of payments must be a whole number.') from error
+        try:
+            appreciation = float(str(row.get('appreciation_percent', 0)).rstrip('%').strip())
+        except ValueError as error:
+            raise ValueError('Annual appreciation must be a valid percentage.') from error
         return CashFlow(row['name'].strip(), parse_currency_amount(row['amount'], currency),
                         MonthEntry.validate_month(row['start']), currency, row['frequency'], count,
-                        MonthEntry.validate_month(row['end']) if row.get('end') else None)
+                        MonthEntry.validate_month(row['end']) if row.get('end') else None, appreciation)
 
     @staticmethod
     def _row(flow, kind):
         return dict(kind=kind, name=flow.name, amount=plain_number(flow.amount), currency=flow.currency,
                     frequency=flow.frequency, start=flow.start.isoformat()[:7],
                     count='' if flow.count is None else str(flow.count),
-                    end='' if flow.end is None else flow.end.isoformat()[:7], ending='')
+                    end='' if flow.end is None else flow.end.isoformat()[:7], ending='',
+                    appreciation_percent=plain_number(flow.appreciation_percent))

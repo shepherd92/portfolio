@@ -27,6 +27,8 @@ class PropertyCashFlow:
 
     def __post_init__(self):
         _flow(self.flow)
+        if self.flow.appreciation_percent:
+            raise ValueError('Set property cash-flow appreciation on the property payment, not its nested schedule.')
         if self.direction not in ('income', 'outgoing'):
             raise ValueError('Property cash-flow direction must be income or outgoing.')
         if self.occupancy not in ('always', 'rented', 'vacant'):
@@ -324,7 +326,7 @@ def _schedules(settings, start, end):
 
 
 def _pay(item, flow, role, day, pensions, loans, interest_due):
-    amount, principal, interest = flow.amount, 0., 0.
+    amount, principal, interest = flow.amount_on(day), 0., 0.
     if isinstance(item, Property):
         source, direction, essential = 'Properties', role.direction, True
         vacancy = item.vacancy_percent / 100

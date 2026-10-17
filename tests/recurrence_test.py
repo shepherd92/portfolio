@@ -12,7 +12,7 @@ from portfolio.projection import project
 TODAY = date(2026, 1, 1)
 ALLOCATION = AllocationTargets({STOCK_MARKET: {'World': 60}, TREASURY: {'HUF': 40}, CASH: {}},
                                {'World': 'Equities'})
-NO_GROWTH = ReturnAssumptions(equities=0, bonds=0, gold=0, mak=0)
+NO_GROWTH = ReturnAssumptions(equities=0, bonds=0, gold=0, mak_huf=0)
 
 
 class RecurrenceTests(unittest.TestCase):
@@ -156,7 +156,7 @@ class RecurrenceTests(unittest.TestCase):
         rates = {'EUR': 400}
         self.assertEqual(inputs.monthly_spending(rates, as_of=TODAY), 0)
         self.assertEqual(inputs.monthly_spending(rates, as_of=date(2026, 7, 1)), 400)
-        self.assertEqual(inputs.buffer_increases(TODAY, rates), ((date(2026, 7, 1), 3200),))
+        self.assertEqual(inputs.buffer_changes(TODAY, rates), ((date(2026, 7, 1), 3200),))
         projection = project(inputs, TODAY, ALLOCATION, total=10000, rates=rates, years=1)
         self.assertEqual(fsum(values[-1] for values in projection.portfolio.values()),
                          10000 + 5 * 1000 + 7 * 600)

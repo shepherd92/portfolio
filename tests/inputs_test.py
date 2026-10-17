@@ -102,7 +102,7 @@ class InputTests(unittest.TestCase):
             CashFlow('Food', 200, today, frequency='monthly'),
             CashFlow('Purchase', 1, today + timedelta(days=100), 'GBP')),
             incomes=(CashFlow('Income', 5, today, 'USD', 'monthly'),),
-            returns=ReturnAssumptions(mak=0), cash_months=4)
+            returns=ReturnAssumptions(mak_huf=0), cash_months=4)
         save_settings(settings, self.directory, None)
         market = MarketData(self.market.quotes, {'HUF': .0025, 'USD': .9, 'GBP': 1.2})
         before = {path.name: path.read_bytes() for path in self.directory.iterdir()}

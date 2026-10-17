@@ -33,7 +33,7 @@ class WealthAppTests(unittest.TestCase):
                                        {'Global': 'Equities'})
         self.portfolio = Portfolio((Holding('ETF', 'Global', 5),), allocation, {'EUR': 50})
         save_portfolio(self.portfolio, self.directory)
-        calculator = CalculatorSettings(returns=ReturnAssumptions(mak=5), emergency_months=0, cash_months=0)
+        calculator = CalculatorSettings(returns=ReturnAssumptions(mak_huf=5), emergency_months=0, cash_months=0)
         save_settings(calculator, self.directory, None)
         self.wealth = WealthSettings(
             properties=(Property('flat', 'Apartment', 100000, 'EUR', 3, 1,
@@ -165,9 +165,9 @@ class WealthAppTests(unittest.TestCase):
     def test_linked_payments_are_in_monthly_totals_and_open_the_source(self):
         calculator = self.app.calculator
         calculator._month.set(self.next_month.isoformat()[:7])
-        self.assertEqual(calculator.monthly_summary.set('Income', 'recurring'), format_amount(1000))
-        self.assertEqual(calculator.monthly_summary.set('Outgoings', 'recurring'), '500')
-        self.assertEqual(calculator.monthly_summary.set('Net', 'recurring'), '500')
+        self.assertEqual(calculator.calendar.tree.set(calculator._month.get() + '/scheduled/recurring', 'income'), format_amount(1000))
+        self.assertEqual(calculator.calendar.tree.set(calculator._month.get() + '/scheduled/recurring', 'outgoings'), '500')
+        self.assertEqual(calculator.calendar.tree.set(calculator._month.get() + '/scheduled/recurring', 'net'), '500')
         self.assertEqual(calculator._saving_ratio.get(), '50%')
         rows = calculator.linked_payments.get_children()
         self.assertEqual(len(rows), 2)

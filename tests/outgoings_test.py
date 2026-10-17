@@ -18,7 +18,7 @@ ALLOCATION = AllocationTargets({STOCK_MARKET: {'World': 60}, TREASURY: {'HUF': 4
 def settings(*outgoings, income=0, currency='HUF', **values):
     incomes = (CashFlow('Salary', income, TODAY, currency, 'monthly'),) if income else ()
     return CalculatorSettings(incomes=incomes, outgoings=outgoings,
-                              returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak=0), **values)
+                              returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak_huf=0), **values)
 
 
 def total_at(projection, index):
@@ -162,9 +162,9 @@ class CashFlowTests(unittest.TestCase):
         payment = settings(CashFlow('Goal', 200, date(2026, 7, 1))).scheduled_payments(TODAY)
         receipts = ((date(2026, 2, 1), 0), (date(2026, 3, 1), 100),
                     (date(2026, 4, 1), 0), (date(2026, 5, 1), 100))
-        gaps, commitments = expense_income(payment, [200], receipts, 0, 0)
-        self.assertEqual(gaps, [0])
-        self.assertEqual(set(commitments), {date(2026, 3, 1), date(2026, 5, 1)})
+        schedule = expense_income(payment, [200], receipts, 0, 0)
+        self.assertEqual(schedule.gaps, (0,))
+        self.assertEqual(set(schedule.payments), {date(2026, 3, 1), date(2026, 5, 1)})
 
     def test_month_summary_separates_finite_recurring_and_single_cash_flows(self):
         inputs = CalculatorSettings(
@@ -219,7 +219,7 @@ class CashFlowTests(unittest.TestCase):
         early = CashFlow('Early', 100, date(2026, 3, 1))
         on_time = CashFlow('On time', 100, date(2026, 4, 15))
         inputs = CalculatorSettings(incomes=(bonus,), outgoings=(early, on_time), emergency_months=0,
-                                    cash_months=0, returns=ReturnAssumptions(equities=0, mak=0))
+                                    cash_months=0, returns=ReturnAssumptions(equities=0, mak_huf=0))
         rows = recommend(inputs, TODAY, ALLOCATION, total=1000).rows[2:-1]
         self.assertEqual(rows[0].income_funded, 0)
         self.assertAlmostEqual(rows[1].income_funded, 100 - rows[1].stock)
@@ -234,7 +234,7 @@ class CashFlowTests(unittest.TestCase):
         inputs = CalculatorSettings(incomes=(CashFlow('Contract', 2.5, date(2026, 1, 31), 'EUR', 'monthly', count=2),
                                              CashFlow('Bonus', 1, date(2026, 3, 15), 'GBP')),
                                     outgoings=(CashFlow('Living', 200, TODAY, frequency='monthly'),),
-                                    returns=ReturnAssumptions(equities=0, mak=0))
+                                    returns=ReturnAssumptions(equities=0, mak_huf=0))
         rates = {'EUR': 400, 'GBP': 500}
         self.assertEqual(inputs.income_receipts(TODAY, date(2026, 12, 31), rates),
                          ((date(2026, 2, 1), 800), (date(2026, 3, 1), 300)))

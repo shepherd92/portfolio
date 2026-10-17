@@ -75,7 +75,10 @@ Navigation and shared editors
 
 Main tabs are Portfolio, Calculator, Loans, Trade plan and About. Portfolio
 contains Summary, Stock market, MÁK, Cash, Properties and Pension funds. Stock
-market contains Allocations, Asset classes and Assets. The global controls
+market contains Allocations, Asset classes and Assets. Calculator uses the same
+left navigation style for Inputs, Funding and Results. Inputs stacks Settings and
+Income/outgoings; Funding has one expandable monthly calendar; Results contains
+recommended allocations and the portfolio summary. The global controls
 remain above all tabs. Summary compares target and current shares of gross assets,
 with fixed property and pension values in both pies. Its target table exposes
 only category totals; category pages provide local mixes and canonical holdings. Asset metadata
@@ -123,14 +126,19 @@ Savings recommendations
 The calculator uses validated native-currency inputs and a supplied valuation
 date. ``CashFlow`` is shared by ``CalculatorSettings.incomes`` and ``outgoings``.
 It carries a name, native amount, currency, payment month or first recurring month,
-frequency and optional payment count or inclusive end month. Single outgoing payments and
+frequency, annual appreciation and optional payment count or inclusive end month. Single outgoing payments and
 finite monthly and annual schedules expand into ``Payment`` records with their source index.
 All start/end values normalize to the first of their month; recurring occurrences
 step by 1 or 12 months. Storage uses YYYY-MM for every schedule, including single payments. UI MonthEntry selects a year and month together. Past recurring payments are treated
 as paid; overdue single payments remain outstanding. All finite payments are included,
 not only those within the chart horizon. Income has its own currency.
+``CashFlow.amount_on(day)`` grows the Begins amount by
+``(1 + appreciation_percent / 100) ** (elapsed_calendar_months / 12)``.
+Single payments retain their entered due amount. Native-currency growth precedes
+conversion, with no intermediate HUF rounding. Receipts, finite payment expansion,
+monthly totals and projections use this same calculation.
 ``CalculatorSettings.monthly_spending(rates, as_of=day)`` sums active ongoing
-cost budgets in HUF: monthly amounts plus annual amounts divided by 12.
+cost budgets in HUF: appreciated monthly amounts plus appreciated annual amounts divided by 12.
 Ongoing annual costs are spread over monthly budgets, not also paid as expense pots.
 The calendar summary still shows their full bill in the annual payment month.
 Annual income remains a dated receipt in its scheduled month. Finite instalments use the payment ledger and are not also
@@ -144,8 +152,12 @@ the Stock market return always uses ``s = sum(a_k*r_k)/sum(a_k)`` over Equities,
 Bonds, and Gold. Positive unclassified targets block estimation. The return table
 shows each category's absolute Portfolio target weight; this is not saved as a
 second allocation. With no stock targets the estimate is zero, and a funded stock
-expense requires a stock target mix. MÁK's annual assumption ``m`` is either explicitly entered or resolved from
-the MNB base rate in memory before calculation.
+expense requires a stock target mix. ``ReturnAssumptions.mak_huf`` is either
+explicitly entered or resolved from the MNB base rate in memory before calculation.
+``mak_eur`` is independently editable and defaults to zero; it never uses the MNB
+rate. Emergency reserves, defensive expense amounts and assigned future savings grow
+at ``mak_huf``; the expense baseline blends it with the Stock market return. Long-term
+MÁK growth weights the two rates by the saved HUF/EUR target proportions.
 The app fetches that reference at startup and every 15 minutes while idle on any
 tab. Automatic updates preserve manually entered rates and completed plans;
 each plan retains the rate used when it was generated.
@@ -157,12 +169,16 @@ date. Each future month's combined income first covers its ongoing-cost budget;
 only positive remaining income enters the investment ledger. All flows use month-start dates, so current-month income and ongoing costs are
 already recorded after that day. Future-month budgets include the full ongoing
 monthly spending budget, including annual costs divided by 12.
-Monthly deficits do not create withdrawals. Future fixed-buffer increases withhold
-income before it can be assigned to expense commitments.
+Monthly deficits do not create withdrawals. ``buffer_changes`` records monthly
+changes in the active living budget times the combined reserve months through
+the funding horizon. Positive changes withhold income before expense commitments;
+negative changes cancel unpaid top-up needs without inventing additional income.
 A payment
 on a cash deadline is available before the required transfer. Expenses consume payments in
-deadline order, while result rows keep the user's input order. Each payment
-grows at the MÁK rate until the cash deadline for the expense consuming it. The needed contribution
+deadline order, while result rows keep the user's input order. Equal-deadline
+expenses share each receipt in proportion to their remaining defensive capacities.
+Because their deadlines match, the growth factor from a shared receipt is identical.
+Each assigned payment grows at the HUF MÁK rate until that cash deadline. The needed contribution
 is that expense's remaining defensive capacity discounted to the payment date; any unused
 part of the same payment remains available for the next expense. No income is
 counted twice or applied after an expense's cash deadline. The emergency reserve
@@ -203,10 +219,13 @@ accepts integers from zero to 120. Even a lower value keeps the two-month minimu
 expense deadline. Rows are emergency, bank cash, expenses, and long-term allocation.
 Remaining wealth uses Portfolio’s long-term weights, including its MÁK currency mix
 and optional cash targets. Summed stock/MÁK/cash amounts determine the
-recommendation; cash earns zero in the weighted annual return. Negative return assumptions above -100% are supported. A funding
+recommendation. ``Recommendation.mak_huf`` and ``mak_eur`` are HUF-equivalent
+amounts: all protected MÁK plus the long-term HUF share, and the long-term EUR share,
+respectively. ``expected_return`` weights these and Stock market by their own
+returns; cash earns zero. Negative return assumptions above -100% are supported. A funding
 shortfall funds bank cash first, then expense cash, then MÁK, then Stock market, all capped
 at current wealth. Within each side, funding prioritizes the emergency reserve
-and then expenses by due date. Required but unfunded reserves are reported
+and then expenses by cash deadline. Required but unfunded reserves are reported
 separately; displayed funded rows always sum to available wealth.
 Calculator input JSON is separate from CSV signatures and saved atomically with
 its own original-bytes check. JSON decimals remain exact until whole-HUF
@@ -227,7 +246,11 @@ the two validated model lists remain separate. Summary values use the shared dis
 
 ``project`` starts from ``recommend`` and maintains disjoint long-term, emergency,
 living-cost cash, and per-expense pots. Portfolio and Purpose series partition the
-same wealth. Expense contributions use the shared ``expense_income`` payment ledger,
+same wealth. ``recommend`` exposes a ``FundingSchedule`` from ``expense_income``:
+remaining defensive capacities and an ``IncomeAssignment`` for each receipt.
+Each assignment partitions eligible HUF principal into fixed buffers, expense
+(index, principal) pairs and uncommitted savings. ``project`` consumes that same
+recommendation schedule without rerunning the assignment algorithm. The ledger is
 anchored to the original valuation date; evaluating arbitrary event dates never resets
 salary timing. Each expense preserves its full baseline glidepath, less the
 MÁK-grown defensive contribution promised from future income, plus deposits already
@@ -236,14 +259,21 @@ funded reserve enters totals. Income deposits grow in MÁK until their cash dead
 and then stay in cash. Partial current funding scales the stock-backed baseline
 and keeps any extra defensive amount in MÁK. The long-term pot
 uses its weighted annual return; emergency earnings are released to it at event dates.
-Events include monthly savings, ongoing-cost start dates, cash deadlines, actual
-payment dates, and the horizon. Ongoing starts change savings and fixed buffer targets.
+Events include monthly savings, ongoing-cost start dates, month starts for appreciating
+ongoing costs, cash deadlines, actual payment dates, and the horizon. New or changing
+ongoing costs update savings and fixed buffer targets. Shrinking targets release excess
+buffer holdings to long-term investment.
 Repeated dates record cash-flow jumps and both sides of transfers into expense cash.
 Only actual receipts increase wealth; only paid
 expenses reduce it. Shortfalls at cash deadlines and unpaid amounts on due dates remain
 separate. The four purpose pots never overlap or include expected future receipts.
-The funding UI displays only single outgoing payments, selected by source index,
-never by name. Hidden recurring commitments still participate in all calculations.
+``funding_calendar`` combines scheduled monthly totals with this captured schedule,
+including no-income months and dated deadline/payment milestones. It never
+reassigns savings or mixes future principal with today's reserves. Expense indices
+identify repeated or identical names. ``ui/funding_calendar.py`` renders the
+read-only tree and the selected expense's reserve explanation; it does no planning.
+The requested calendar end extends receipt evidence, not allocation horizons or
+expense eligibility. All finite payments remain in the recommendation.
 Currency conversion applies once to output series using constant current FX rates.
 ``ui/projection.py`` draws these series as stacked areas on a native Tk canvas and
 opens from Portfolio Summary without blocking editing in the main window. Display order

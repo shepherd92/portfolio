@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import date
 from decimal import Decimal
 from math import exp, expm1, fsum, isfinite, log, log1p
+from itertools import groupby
 from numbers import Integral
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, currency_code, number
@@ -21,6 +22,7 @@ class CashFlow:
     frequency: str = 'once'
     count: int | None = None
     end: date | None = None
+    appreciation_percent: float = 0
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name.strip():
@@ -55,6 +57,29 @@ class CashFlow:
         object.__setattr__(self, 'name', self.name.strip())
         object.__setattr__(self, 'amount', amount)
         object.__setattr__(self, 'currency', currency)
+        appreciation = number(self.appreciation_percent, 'Annual cash-flow appreciation')
+        if not -100 < appreciation <= 1000:
+            raise ValueError('Annual cash-flow appreciation must be greater than -100% and at most 1,000%.')
+        object.__setattr__(self, 'appreciation_percent', appreciation)
+
+    def amount_on(self, day):
+        """Nominal payment in this month; Begins holds the entered amount.
+
+        Growth uses elapsed whole months, including between annual payments.
+        One-time payments already specify their nominal due amount.
+        """
+        _validate_date(day)
+        months = max(0, (day.year - self.start.year) * 12 + day.month - self.start.month)
+        if not months or not self.appreciation_percent or self.frequency == 'once':
+            return self.amount
+        growth = _log_gross_blend(self.appreciation_percent, self.appreciation_percent, 0.) * months / 12
+        try:
+            amount = self.amount * exp(growth)
+        except OverflowError as error:
+            raise ValueError(f'{self.name}: appreciated payment exceeds the supported numeric range.') from error
+        if not isfinite(amount) or amount <= 0:
+            raise ValueError(f'{self.name}: appreciated payment exceeds the supported numeric range.')
+        return amount
 
     @property
     def interval_months(self):
@@ -140,17 +165,18 @@ class MonthlyTotals:
 
 @dataclass(frozen=True)
 class ReturnAssumptions:
-    """Illustrative nominal annual percentages; None MÁK means use a fetched rate."""
+    """Illustrative nominal annual percentages; None HUF uses the MNB base rate."""
 
     equities: float = 6
     gold: float = 2
     bonds: float = 3
-    mak: float | None = None
+    mak_huf: float | None = None
+    mak_eur: float = 0
 
     def __post_init__(self):
         for item in fields(self):
             value = getattr(self, item.name)
-            if item.name == 'mak' and value is None:
+            if item.name == 'mak_huf' and value is None:
                 continue
             value = _annual_return(value, f'{item.name.capitalize()} expected return')
             object.__setattr__(self, item.name, value)
@@ -184,7 +210,7 @@ class CalculatorSettings:
         as_of = date.today() if as_of is None else as_of
         _validate_date(as_of)
         try:
-            return fsum(huf_value(outgoing.amount, outgoing.currency, rates) / outgoing.interval_months
+            return fsum(huf_value(outgoing.amount_on(as_of), outgoing.currency, rates) / outgoing.interval_months
                         for outgoing in self.outgoings if outgoing.ongoing and outgoing.start <= as_of)
         except OverflowError as error:
             raise ValueError('Monthly spending exceeds the supported numeric range.') from error
@@ -196,7 +222,7 @@ class CalculatorSettings:
         try:
             for entries in (self.incomes, self.outgoings):
                 for recurring in (True, False):
-                    values.append(fsum(huf_value(entry.amount, entry.currency, rates) for entry in entries
+                    values.append(fsum(huf_value(entry.amount_on(start), entry.currency, rates) for entry in entries
                                        if (entry.frequency != 'once') == recurring and any(entry.dates(start, end))))
         except OverflowError as error:
             raise ValueError('Monthly cash flows exceed the supported numeric range.') from error
@@ -239,15 +265,41 @@ class CalculatorSettings:
             for month in range(outgoing.payment_count):
                 due = month_after(outgoing.start, month * outgoing.interval_months)
                 if outgoing.frequency == 'once' or due >= as_of:
-                    payments.append(Payment(outgoing.name, outgoing.amount, due, outgoing.currency, index))
+                    payments.append(Payment(outgoing.name, outgoing.amount_on(due), due, outgoing.currency, index))
         return tuple(payments)
 
-    def buffer_increases(self, as_of, rates=None):
-        """Future ongoing costs create new fixed buffers when their payments start."""
+    def buffer_changes(self, as_of, rates=None, *, end=None):
+        """Future signed changes in living-cost buffers, applied before expenses.
+
+        Growing recurring costs increase both fixed buffers monthly. Declining
+        costs release invested reserves in the projection, not additional income
+        that can be promised today to expense commitments.
+        """
         _validate_date(as_of)
         months = self.emergency_months + self.cash_months
-        return tuple(sorted((outgoing.start, huf_value(outgoing.amount, outgoing.currency, rates) / outgoing.interval_months * months)
-                            for outgoing in self.outgoings if outgoing.ongoing and outgoing.start > as_of))
+        ongoing = [outgoing for outgoing in self.outgoings if outgoing.ongoing]
+        if not months or not ongoing:
+            return ()
+        if end is None:
+            end = max(month_after(as_of, 12) or date.max, *(entry.start for entry in ongoing))
+        _validate_date(end)
+        days = {entry.start for entry in ongoing if as_of < entry.start <= end}
+        if any(entry.appreciation_percent for entry in ongoing):
+            day = month_after(as_of.replace(day=1), 1)
+            while day is not None and day <= end:
+                days.add(day)
+                day = month_after(day, 1)
+        changes = []
+        previous = Decimal(str(self.monthly_spending(rates, as_of=as_of))) * months
+        for day in sorted(days):
+            target = Decimal(str(self.monthly_spending(rates, as_of=day))) * months
+            change = float(target - previous)
+            if not isfinite(change):
+                raise ValueError('Fixed buffers exceed the supported numeric range.')
+            if change:
+                changes.append((day, change))
+            previous = target
+        return tuple(changes)
 
     @property
     def currencies(self):
@@ -281,15 +333,49 @@ class ExpenseFunding:
 
 
 @dataclass(frozen=True)
+class IncomeAssignment:
+    """One future receipt's HUF principal, assigned once without forecast interest."""
+    day: date
+    available: float
+    buffer_reserved: float
+    expenses: tuple[tuple[int, float], ...]
+    uncommitted: float
+
+
+@dataclass(frozen=True)
+class FundingSchedule:
+    gaps: tuple[float, ...]
+    entries: tuple[IncomeAssignment, ...]
+
+    @property
+    def payments(self):
+        return {entry.day: entry.expenses for entry in self.entries if entry.expenses}
+
+
+@dataclass(frozen=True)
+class FundingMonth:
+    day: date
+    totals: MonthlyTotals
+    budget: IncomeBudget
+    assignment: IncomeAssignment | None
+    deadlines: tuple[int, ...] = ()
+    due_expenses: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class Recommendation:
     rows: tuple[AllocationRow, ...]
     market_return: float
-    mak_return: float
+    mak_huf_return: float
+    mak_eur_return: float
+    long_term_mak_eur_fraction: float = 0.
     shortfall: Decimal = Decimal(0)
     expenses: tuple[ExpenseFunding, ...] = ()
     receipts: tuple[tuple[date, float], ...] = ()
-    buffer_increases: tuple[tuple[date, float], ...] = ()
+    buffer_changes: tuple[tuple[date, float], ...] = ()
     income_budgets: tuple[IncomeBudget, ...] = ()
+    funding_schedule: FundingSchedule = FundingSchedule((), ())
+    calendar_end: date = date.min
 
     @property
     def total(self):
@@ -302,6 +388,21 @@ class Recommendation:
     @property
     def mak(self):
         return fsum(row.mak for row in self.rows)
+
+    @property
+    def mak_eur(self):
+        """Recommended EUR MÁK value expressed in HUF at fixed current FX."""
+        return self.rows[-1].mak * self.long_term_mak_eur_fraction
+
+    @property
+    def mak_huf(self):
+        return fsum((*[row.mak for row in self.rows[:-1]],
+                     self.rows[-1].mak * (1 - self.long_term_mak_eur_fraction)))
+
+    @property
+    def long_term_mak_return(self):
+        return ((1 - self.long_term_mak_eur_fraction) * self.mak_huf_return
+                + self.long_term_mak_eur_fraction * self.mak_eur_return)
 
     @property
     def cash(self):
@@ -321,8 +422,39 @@ class Recommendation:
 
     @property
     def expected_return(self):
-        return (self.stock_percent / 100 * self.market_return
-                + self.mak_percent / 100 * self.mak_return)
+        if not self.total:
+            return 0.
+        return fsum((self.stock / self.total * self.market_return,
+                     self.mak_huf / self.total * self.mak_huf_return,
+                     self.mak_eur / self.total * self.mak_eur_return))
+
+
+def funding_calendar(settings, as_of, recommendation, rates=None):
+    """Monthly cash movements beside the exact receipt assignments used for targets.
+
+    Scheduled totals contain actual annual payments; the funding budget spreads
+    ongoing annual living costs over twelve months. This month's receipts are
+    already included in holdings and are never assigned as future savings.
+    Overdue expenses and passed deadlines remain visible in the opening month;
+    their original dates stay on the expense evidence.
+    """
+    budgets = {budget.day: budget for budget in recommendation.income_budgets}
+    assignments = {entry.day: entry for entry in recommendation.funding_schedule.entries}
+    first_month = day = as_of.replace(day=1)
+    months = []
+    while day <= recommendation.calendar_end:
+        totals = settings.monthly_totals(day.year, day.month, rates)
+        budget = budgets.get(day, IncomeBudget(day, totals.income,
+                            settings.monthly_spending(rates, as_of=day), 0.))
+        deadlines = tuple(index for index, expense in enumerate(recommendation.expenses)
+                          if max(first_month, expense.deadline.replace(day=1)) == day)
+        due = tuple(index for index, expense in enumerate(recommendation.expenses)
+                    if max(first_month, expense.payment.due.replace(day=1)) == day)
+        months.append(FundingMonth(day, totals, budget, assignments.get(day), deadlines, due))
+        day = month_after(day, 1)
+        if day is None:
+            break
+    return tuple(months)
 
 
 def huf_value(amount, currency, rates=None):
@@ -350,10 +482,9 @@ def gross_income_by_date(incomes, as_of, end, rates=None):
     """Group scheduled future income in HUF before any spending is deducted."""
     gross = {}
     for income in incomes:
-        amount = huf_value(income.amount, income.currency, rates)
         for day in income.dates(as_of, end):
             if day > as_of:
-                gross.setdefault(day, []).append(amount)
+                gross.setdefault(day, []).append(huf_value(income.amount_on(day), income.currency, rates))
     return gross
 
 
@@ -399,7 +530,7 @@ def payment_cash_date(payment, cash_months):
     return payment.cash_due or expense_cash_date(payment.due, cash_months)
 
 
-def recommend(settings, as_of, allocation, *, total, rates=None):
+def recommend(settings, as_of, allocation, *, total, rates=None, funding_end=None):
     """Discount expenses under a declining-stock glidepath, without forecasting FX.
 
     Analytic integration compounds the arithmetic blended annual return
@@ -416,9 +547,9 @@ def recommend(settings, as_of, allocation, *, total, rates=None):
     if hasattr(settings, 'wealth'):
         settings.validate_context(as_of, rates)
     total = number(total, 'Portfolio value', minimum=0)
-    mak_return = settings.returns.mak
+    mak_return = settings.returns.mak_huf
     if mak_return is None:
-        raise ValueError('Fetch the MNB base rate or enter a MÁK expected annual return.')
+        raise ValueError('Fetch the MNB base rate or enter a MÁK HUF expected annual return.')
     weights = return_weights(allocation)
     market_weights = {name: weight for name, weight in weights.items() if name != TREASURY}
     market_return = estimate_market_return(settings.returns, market_weights)
@@ -434,22 +565,28 @@ def recommend(settings, as_of, allocation, *, total, rates=None):
             AllocationRow('Bank cash buffer', float(cash), 0., 0., float(cash))]
     expenses = settings.scheduled_payments(as_of)
     amounts = [huf_value(expense.amount, expense.currency, rates) for expense in expenses]
-    last_deadline = max((payment_cash_date(expense, settings.cash_months) for expense in expenses), default=as_of)
-    income_budgets = settings.income_budgets(as_of, last_deadline, rates)
+    calendar_end = month_after(as_of, 12) or date.max
+    if funding_end is not None:
+        _validate_date(funding_end)
+        calendar_end = max(calendar_end, funding_end)
+    calendar_end = max(calendar_end, *(expense.due for expense in expenses)) if expenses else calendar_end
+    if hasattr(settings, 'wealth'):
+        settings.validate_context(as_of, rates, calendar_end)
+    income_budgets = settings.income_budgets(as_of, calendar_end, rates)
     receipts = tuple((budget.day, budget.surplus) for budget in income_budgets if budget.surplus)
     capacities = [expense_income_capacity(amount, max(0, (payment_cash_date(expense, settings.cash_months) - as_of).days),
                                          days, mak_return if expense.defensive else market_return, mak_return,
                                          defensive=expense.defensive)
                   for expense, amount in zip(expenses, amounts)]
-    buffer_increases = settings.buffer_increases(as_of, rates)
-    gaps, payments = expense_income(expenses, capacities, receipts, mak_return, settings.cash_months,
-                                    buffer_increases=buffer_increases)
+    buffer_changes = settings.buffer_changes(as_of, rates, end=calendar_end)
+    schedule = expense_income(expenses, capacities, receipts, mak_return, settings.cash_months,
+                              buffer_changes=buffer_changes)
     contributions = [[] for expense in expenses]
-    for day, assignments in payments.items():
+    for day, assignments in schedule.payments.items():
         for index, principal in assignments:
             contributions[index].append((day, principal))
     calculations = []
-    for index, (expense, future, capacity, gap) in enumerate(zip(expenses, amounts, capacities, gaps)):
+    for index, (expense, future, capacity, gap) in enumerate(zip(expenses, amounts, capacities, schedule.gaps)):
         deadline = payment_cash_date(expense, settings.cash_months)
         remaining_days = max(0, (deadline - as_of).days)
         fraction = 0. if expense.defensive else min(1., remaining_days / days)
@@ -476,8 +613,11 @@ def recommend(settings, as_of, allocation, *, total, rates=None):
     mak = amount * (mix[TREASURY] / 100)
     cash = amount * (mix[CASH] / 100)
     rows.append(AllocationRow('Long-term allocation', amount, stock, mak, cash))
-    result = Recommendation(tuple(rows), market_return, mak_return, shortfall,
-                            tuple(calculations), tuple(receipts), tuple(buffer_increases), income_budgets)
+    treasury_weight = mix[TREASURY]
+    eur_fraction = allocation.weights[TREASURY].get('EUR', 0.) / treasury_weight if treasury_weight else 0.
+    result = Recommendation(tuple(rows), market_return, mak_return, settings.returns.mak_eur, eur_fraction,
+                            shortfall, tuple(calculations), tuple(receipts), tuple(buffer_changes),
+                            income_budgets, schedule, calendar_end)
     if result.stock and not fsum(market_weights.values()):
         raise ValueError('Set a Stock market mix on Portfolio to invest the stock portion of planned expenses.')
     return result
@@ -517,49 +657,51 @@ def expense_income_capacity(amount, days, horizon_days, market_return, mak_retur
     return amount * (1 - fraction) * exp(min(0., log(reserve) - log(amount) + growth))
 
 
-def expense_income(expenses, amounts, receipts, mak_return, cash_months, *, buffer_increases=()):
-    """Return unfilled defensive capacities and dated income commitments.
+def expense_income(expenses, amounts, receipts, mak_return, cash_months, *, buffer_changes=()):
+    """Allocate future principal once: buffers, earlier deadlines, then uncommitted.
 
-    Payments map receipt dates to (expense index, principal) pairs. Each future
-    payment is used once, only by expenses whose cash deadline permits it.
-    Receipts are chronological (date, investable net amount) pairs.
-    New fixed buffers take priority over expense commitments as ongoing costs start.
+    Equal-deadline expenses share each receipt in proportion to their remaining
+    defensive funding needs at that deadline. Interest changes the principal
+    needed, never the ordering. Receipts on the deadline are eligible.
     """
-    gaps, payments = list(amounts), {}
-    if not receipts:
-        return gaps, payments
+    gaps, entries = list(amounts), []
     annual_growth = _log_gross_blend(mak_return, mak_return, 0.)
-    receipts = iter(receipts)
-    increases = iter(buffer_increases)
-    increase = next(increases, None)
+    deadline = lambda index: payment_cash_date(expenses[index], cash_months)
+    groups = [(day, tuple(indices)) for day, indices in
+              groupby(sorted(range(len(gaps)), key=deadline), key=deadline)]
+    changes = iter(sorted(buffer_changes))
+    change = next(changes, None)
     buffer_gap = 0.
-
-    def next_receipt():
-        nonlocal increase, buffer_gap
-        receipt = next(receipts, None)
-        if receipt is None:
-            return None, 0.
-        day, income = receipt
-        while increase is not None and increase[0] <= day:
-            buffer_gap += increase[1]
-            increase = next(increases, None)
+    for day, income in receipts:
+        while change is not None and change[0] <= day:
+            buffer_gap = max(0., buffer_gap + change[1])
+            change = next(changes, None)
         reserved = min(income, buffer_gap)
         buffer_gap -= reserved
-        return day, income - reserved
-
-    payment_date, available = next_receipt()
-    for index in sorted(range(len(gaps)), key=lambda index: payment_cash_date(expenses[index], cash_months)):
-        deadline = payment_cash_date(expenses[index], cash_months)
-        while gaps[index] and payment_date is not None and payment_date <= deadline:
-            if available:
-                growth = (deadline - payment_date).days / 365.2425 * annual_growth
-                gaps[index], principal = _use_payment(gaps[index], available, growth)
-                available = max(0., available - principal)
+        available = income - reserved
+        payments = []
+        for cash_date, indices in groups:
+            if cash_date < day or not available:
+                continue
+            active = [index for index in indices if gaps[index] > 0]
+            if not active:
+                continue
+            # Scale the group before summing to avoid overflow when several
+            # individually valid capacities approach the floating-point limit.
+            scale = max(gaps[index] for index in active)
+            scaled_total = fsum(gaps[index] / scale for index in active)
+            shares = [gaps[index] / scale / scaled_total for index in active]
+            growth = (cash_date - day).days / 365.2425 * annual_growth
+            group_available = available
+            principals = []
+            for index, share in zip(active, shares):
+                gaps[index], principal = _use_payment(gaps[index], group_available * share, growth)
                 if principal:
-                    payments.setdefault(payment_date, []).append((index, principal))
-            if not available:
-                payment_date, available = next_receipt()
-    return gaps, payments
+                    principals.append(principal)
+                    payments.append((index, principal))
+            available = max(0., available - fsum(principals))
+        entries.append(IncomeAssignment(day, income, reserved, tuple(payments), available))
+    return FundingSchedule(tuple(gaps), tuple(entries))
 
 
 def month_after(value, months):

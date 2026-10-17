@@ -6,7 +6,7 @@ from decimal import Decimal
 from math import ceil, isfinite
 from pathlib import Path
 import tkinter as tk
-from tkinter import font, ttk
+from tkinter import ttk
 
 from portfolio.calculator import CalculatorSettings, ReturnAssumptions, huf_value, recommend, return_weights
 from portfolio.storage import load_settings, save_settings
@@ -14,9 +14,9 @@ from portfolio.models import CASH, STOCK_MARKET, TREASURY
 from ui.reporting import format_amount, format_percent, plain_number
 from ui.sorting import TreeSort
 from ui.help import HELP, add_help, info_label
-from ui.theme import ALTERNATE_BACKGROUND
 from ui.widgets import AutoScrollbar, PercentEntry
 from ui.cashflows import CashFlowTable
+from ui.funding_calendar import FundingCalendar
 from ui.dates import MonthEntry
 
 
@@ -35,9 +35,9 @@ class CalculatorView(ttk.Frame):
         self._autosave_id, self._save_error = None, ''
         self._base_rate, self._rate_error, self._rate_date = None, '', ''
         self._inputs = {name: tk.StringVar(self) for name in
-                        ('emergency_months', 'cash_months', 'horizon_years', 'equities', 'gold', 'bonds', 'mak')}
+                        ('emergency_months', 'cash_months', 'horizon_years', 'equities', 'gold', 'bonds', 'mak_huf', 'mak_eur')}
         self._month = tk.StringVar(self, value=date.today().isoformat()[:7])
-        self._monthly_values = {}
+        self._recommendation = None
         self._auto_rate = tk.BooleanVar(self, value=True)
         self.portfolio_value = tk.StringVar(self)
         self.message = tk.StringVar(self)
@@ -46,7 +46,7 @@ class CalculatorView(ttk.Frame):
         self.return_weights = {name: tk.StringVar(self) for name in ('Equities', 'Bonds', 'Gold')}
         self._return_rows, self._return_weight_values = {}, {}
         self._return_sort, self._return_descending = None, False
-        self._entries, self._values, self._summary_values = [], {}, {}
+        self._entries, self._summary_values = [], {}
         self._build()
         self._build_returns(return_parents)
         self.message.trace_add('write', self._show_message)
@@ -54,7 +54,7 @@ class CalculatorView(ttk.Frame):
         for variable in self._inputs.values():
             variable.trace_add('write', self._changed)
         self._auto_rate.trace_add('write', self._rate_mode_changed)
-        self._month.trace_add('write', self._refresh_monthly_summary)
+        self._month.trace_add('write', lambda *_: self.refresh())
         self.refresh()
 
     def load(self, directory):
@@ -140,32 +140,33 @@ class CalculatorView(ttk.Frame):
         if self._load_error:
             raise ValueError(self._load_error)
         settings = self.settings()
-        if settings.returns.mak is None:
+        if settings.returns.mak_huf is None:
             if self._base_rate is None:
                 raise ValueError(self._rate_error or 'Fetching MNB base rate…')
-            settings = replace(settings, returns=replace(settings.returns, mak=self._base_rate))
+            settings = replace(settings, returns=replace(settings.returns, mak_huf=self._base_rate))
         return self._link_settings(settings)
 
     def refresh(self):
         self._clear_result()
         self.portfolio_value.set('—')
-        self._refresh_monthly_summary()
+        self._refresh_cashflow_views()
         currency = self._currency.get()
         self.allocation_summary.heading('amount', text=f'Amount ({currency})')
-        self._funding_panel.configure(text=f'Single expense funding · {currency}')
-        self._funding_panel.help_label.label.configure(text=f'Single expense funding · {currency}')
         try:
             total = self._get_total()
             rates = self._get_rates()
-            display_rate = huf_value(1, self._currency.get(), rates)
+            display_rate = huf_value(1, currency, rates)
             self.portfolio_value.set(format_amount(total / display_rate))
             allocation = self._get_allocation()
             self._return_weight_values = return_weights(allocation)
             for category, variable in self.return_weights.items():
                 variable.set(format_percent(self._return_weight_values[category]))
             self._sort_return_rows()
-            settings = self.settings()
-            result = recommend(self.planning_settings(), date.today(), allocation, total=total, rates=rates)
+            settings = self.planning_settings()
+            result = recommend(settings, date.today(), allocation, total=total, rates=rates,
+                               funding_end=self.calendar.end_month)
+            self._recommendation = result
+            self.calendar.show_recommendation(settings, result, rates, display_rate)
         except ValueError as error:
             self.message.set(self._save_error or str(error))
             return
@@ -177,9 +178,8 @@ class CalculatorView(ttk.Frame):
             self._summary_values[name] = dict(allocation=name, share=share, amount=amount)
         self._summary_sorting.apply()
         self.overall_return.set(format_percent(result.expected_return))
-        self._show_funding(result.rows, settings.outgoings, display_rate)
         self.message.set(self._save_error or (f'Unfunded reserves: {format_amount(ceil(result.shortfall / Decimal(str(display_rate))))} {currency}. '
-                         'Cash, then MÁK are funded first; remaining money goes to the stock market.'
+                         'Cash, then MÁK are funded first. Calendar commitments are planned; restoring underfunded reserves may delay them.'
                          if result.shortfall else self._rate_error))
 
     def settings(self):
@@ -190,25 +190,37 @@ class CalculatorView(ttk.Frame):
                                   returns=self.return_assumptions())
 
     def return_assumptions(self):
-        return ReturnAssumptions(**{name: None if name == 'mak' and self._auto_rate.get() else self._number(name)
-                                   for name in ('equities', 'gold', 'bonds', 'mak')})
+        return ReturnAssumptions(**{name: None if name == 'mak_huf' and self._auto_rate.get() else self._number(name)
+                                   for name in ('equities', 'gold', 'bonds', 'mak_huf', 'mak_eur')})
 
     def _build(self):
-        self.columnconfigure((0, 1), weight=1, uniform='calculator')
-        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         ttk.Style(self).configure('Calculator.TEntry', padding=(5, 0))
         ttk.Style(self).configure('Calculator.Treeview', rowheight=24)
         ttk.Style(self).configure('Calculator.Treeview.Heading', padding=(6, 0))
+        self.notebook = ttk.Notebook(self, style='Portfolio.TNotebook')
+        self.notebook.grid(row=0, column=0, sticky='nsew')
+        self.pages = {}
+        for name in ('Inputs', 'Funding', 'Results'):
+            page = ttk.Frame(self.notebook, padding=(8, 4))
+            page.columnconfigure(0, weight=1)
+            self.notebook.add(page, text=name)
+            self.pages[name] = page
+        self.pages['Inputs'].rowconfigure(1, weight=1)
         self._build_settings()
         self._build_cashflows()
+        self.calendar = FundingCalendar(self.pages['Funding'], month=self._month, currency=self._currency,
+                                        on_change=self.refresh, on_select=self._select_funding_month)
+        self.calendar.pack(fill='both', expand=True)
         self._build_overall()
         self._build_portfolio_summary()
         self._message_label = ttk.Label(self, textvariable=self.message, wraplength=950)
-        self._message_label.grid(row=3, column=0, columnspan=2, sticky='w', pady=(3, 0))
+        self._message_label.grid(row=1, column=0, sticky='w', pady=(3, 0))
 
     def _build_settings(self):
-        reserves = self._panel('Settings', 0, 0)
-        reserves.columnconfigure(0, weight=1)
+        reserves = self._panel('Settings', 0, 0, parent=self.pages['Inputs'])
+        reserves.columnconfigure(3, weight=1)
         for row, (name, label, unit) in enumerate((('emergency_months', 'Emergency reserve', 'months'),
                                                    ('cash_months', 'Bank cash buffer', 'months'),
                                                    ('horizon_years', '100% stock market', 'years'))):
@@ -216,57 +228,24 @@ class CalculatorView(ttk.Frame):
             self._entry(reserves, name, 5).grid(row=row, column=1, padx=12, pady=5)
             ttk.Label(reserves, text=unit).grid(row=row, column=2, sticky='w', pady=5)
 
-    def _build_monthly_summary(self, parent):
-        panel = self._panel('Monthly cash flow', 0, 0, parent=parent)
-        panel.configure(padding=(8, 4))
-        panel.columnconfigure(0, weight=1)
-        period = ttk.Frame(panel)
-        info_label(period, 'Monthly cash flow', HELP['monthly_totals']).pack(side='left', padx=(0, 10))
-        self._month_box = MonthEntry(period, textvariable=self._month, width=8)
-        self._month_box.entry.configure(style='Calculator.TEntry')
-        self._month_box.button.configure(padding=(3, 0))
-        self._month_box.pack(side='left')
-        ttk.Label(period, textvariable=self._currency).pack(side='left', padx=(8, 0))
-        panel.configure(labelwidget=period)
-        add_help(self._month_box, HELP['monthly_totals'])
-        self.monthly_summary = ttk.Treeview(panel, columns=('purpose', 'recurring', 'single', 'total'),
-                                           show='headings', height=3, style='Calculator.Treeview')
-        for key, title, width in (('purpose', '', 80), ('recurring', 'Recurring', 85),
-                                  ('single', 'Single', 70), ('total', 'Total', 85)):
-            self.monthly_summary.heading(key, text=title)
-            self.monthly_summary.column(key, width=width, minwidth=width,
-                                        anchor='w' if key == 'purpose' else 'e')
-        self.monthly_summary.grid(row=0, column=0, sticky='ew')
-        self._monthly_sorting = TreeSort(self.monthly_summary, numeric_columns=('recurring', 'single', 'total'),
-                                         value=lambda item, column: self._monthly_values[item][column])
+    def _select_funding_month(self, month, totals):
+        self._saving_ratio.set('—' if totals.saving_percent is None else format_percent(totals.saving_percent))
+        self._saving_label.set(f'Saving ratio · {month:%Y-%m}')
 
-    def _refresh_monthly_summary(self, *_):
-        self.monthly_summary.delete(*self.monthly_summary.get_children())
+    def _refresh_cashflow_views(self):
         self.linked_payments.delete(*self.linked_payments.get_children())
         self._linked_values.clear()
-        self._monthly_values.clear()
         self._saving_ratio.set('—')
         try:
+            settings = self._link_settings(self.settings())
+            month = MonthEntry.validate_month(self._month.get())
             rates = self._get_rates()
             conversion = huf_value(1, self._currency.get(), rates)
-            month = MonthEntry.validate_month(self._month.get())
-            settings = self._link_settings(self.settings())
-            totals = settings.monthly_totals(month.year, month.month, rates)
             self._refresh_linked_payments(settings, month)
+            self._select_funding_month(month, settings.monthly_totals(month.year, month.month, rates))
+            self.calendar.show_cashflows(settings, rates, conversion)
         except ValueError:
-            return
-        if totals.saving_percent is not None:
-            self._saving_ratio.set(format_percent(totals.saving_percent))
-        for name, recurring, single in (('Income', totals.recurring_income, totals.single_income),
-                                         ('Outgoings', totals.recurring_outgoings, totals.single_outgoings),
-                                         ('Net', totals.recurring_income - totals.recurring_outgoings,
-                                          totals.single_income - totals.single_outgoings)):
-            amounts = dict(purpose=name, recurring=recurring, single=single, total=recurring + single)
-            item = self.monthly_summary.insert('', 'end', iid=name,
-                                               values=(name, *(format_amount(amounts[key] / conversion)
-                                                               for key in ('recurring', 'single', 'total'))))
-            self._monthly_values[item] = amounts
-        self._monthly_sorting.apply()
+            self.calendar.clear()
 
     def _build_returns(self, parents):
         """Bind Portfolio's editors directly to the settings saved by this view."""
@@ -288,11 +267,14 @@ class CalculatorView(ttk.Frame):
 
         mak = ttk.Frame(parents[TREASURY], padding=(8, 4))
         mak.grid(row=0, column=0, sticky='ew', pady=(0, 6))
-        info_label(mak, 'Expected annual return', HELP['mak']).grid(row=0, column=0, sticky='w')
-        self._mak_entry = self._entry(mak, 'mak', 7)
-        self._mak_entry.grid(row=0, column=1, padx=(12, 20))
+        info_label(mak, 'HUF annual return', HELP['mak_huf']).grid(row=0, column=0, sticky='w')
+        self._mak_huf_entry = self._entry(mak, 'mak_huf', 7)
+        self._mak_huf_entry.grid(row=0, column=1, padx=(12, 20))
         self._auto_rate_box = ttk.Checkbutton(mak, text='Use MNB base rate', variable=self._auto_rate)
         self._auto_rate_box.grid(row=0, column=2, sticky='w')
+        info_label(mak, 'EUR annual return', HELP['mak_eur']).grid(row=1, column=0, sticky='w', pady=(5, 0))
+        self._mak_eur_entry = self._entry(mak, 'mak_eur', 7)
+        self._mak_eur_entry.grid(row=1, column=1, padx=(12, 20), pady=(5, 0))
         add_help(self._auto_rate_box, HELP['auto_rate'])
         self.return_panels = {STOCK_MARKET: stock, TREASURY: mak}
         self._return_messages = []
@@ -327,8 +309,7 @@ class CalculatorView(ttk.Frame):
                 widget.grid_configure(row=row)
 
     def _build_overall(self):
-        panel = self._panel('Recommended overall allocations', 2, 0, 'overall_allocation')
-        panel.grid_configure(columnspan=2, padx=0)
+        panel = self._panel('Recommended overall allocations', 0, 0, 'overall_allocation', parent=self.pages['Results'])
         panel.configure(padding=(10, 4))
         panel.columnconfigure(0, weight=1)
         self.allocation_summary = ttk.Treeview(panel, columns=('allocation', 'share', 'amount'),
@@ -343,19 +324,23 @@ class CalculatorView(ttk.Frame):
                                          value=lambda item, column: self._summary_values[item][column])
 
     def _build_portfolio_summary(self):
-        panel = self._summary_panel = self._panel('Portfolio summary', 0, 1)
+        panel = self._summary_panel = self._panel('Portfolio summary', 1, 0, parent=self.pages['Results'])
+        self._saving_label = tk.StringVar(self, value='Saving ratio')
         panel.columnconfigure(1, weight=1)
         for row, (label, variable, help_key) in enumerate((
                 ('Portfolio value', self.portfolio_value, 'portfolio_value'),
                 ('Overall annual return', self.overall_return, 'overall_return'),
                 ('Monthly saving ratio', self._saving_ratio, 'saving_ratio'))):
-            info_label(panel, label, HELP[help_key]).grid(row=row, column=0, sticky='w')
+            heading = info_label(panel, label, HELP[help_key])
+            heading.grid(row=row, column=0, sticky='w')
+            if help_key == 'saving_ratio':
+                heading.label.configure(textvariable=self._saving_label)
             ttk.Label(panel, textvariable=variable, anchor='e').grid(
                 row=row, column=1, sticky='e', padx=(12, 4))
         ttk.Label(panel, textvariable=self._currency).grid(row=0, column=2, sticky='w')
 
     def _build_cashflows(self):
-        panel = self._panel('Income and outgoings', 1, 0, 'cashflows')
+        panel = self._panel('Income and outgoings', 1, 0, 'cashflows', parent=self.pages['Inputs'])
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(0, weight=1)
         notebook = ttk.Notebook(panel)
@@ -386,12 +371,6 @@ class CalculatorView(ttk.Frame):
                                         value=lambda item, key: self._linked_values[item][key])
         self.linked_payments.bind('<Double-1>', self._open_linked_payment)
         self.linked_payments.bind('<Return>', self._open_linked_payment)
-        results = ttk.Frame(self)
-        results.grid(row=1, column=1, sticky='nsew', padx=(6, 0))
-        results.columnconfigure(0, weight=1)
-        results.rowconfigure((0, 1), weight=1, uniform='monthly_panels')
-        self._build_monthly_summary(results)
-        self._build_funding(results)
 
     def _refresh_linked_payments(self, settings, month):
         if not hasattr(settings, 'events_for_month'):
@@ -410,37 +389,13 @@ class CalculatorView(ttk.Frame):
         if item in self._linked_values and self._open_source:
             self._open_source(self._linked_values[item]['source_id'])
 
-    def _build_funding(self, parent):
-        panel = self._panel('Single expense funding', 1, 0, 'expense_funding', parent=parent)
-        self._funding_panel = panel
-        panel.rowconfigure(0, weight=1)
-        panel.columnconfigure(0, weight=1)
-        self.breakdown = ttk.Treeview(panel, columns=('income', 'stock', 'mak', 'cash'),
-                                      show='tree headings', height=2, style='Calculator.Treeview')
-        heading_font = font.Font(root=self, font=ttk.Style(self).lookup('Treeview.Heading', 'font'))
-        for name, label, width in (('#0', 'Expense', 135), ('income', 'Future income', 100),
-                                   ('stock', 'Stock market', 100), ('mak', 'MÁK', 75), ('cash', 'Cash', 75)):
-            self.breakdown.heading(name, text=label)
-            width = max(width, heading_font.measure(label + ' ▼') + 16)
-            self.breakdown.column(name, width=width, minwidth=width, anchor='w' if name == '#0' else 'e')
-        self.breakdown.grid(row=0, column=0, sticky='nsew')
-        for orient, command, row, column, sticky in (('vertical', self.breakdown.yview, 0, 1, 'ns'),
-                                                    ('horizontal', self.breakdown.xview, 1, 0, 'ew')):
-            scrollbar = AutoScrollbar(panel, orient=orient, command=command)
-            scrollbar.grid(row=row, column=column, sticky=sticky)
-            self.breakdown.configure(**{f'{"y" if orient == "vertical" else "x"}scrollcommand': scrollbar.set})
-        self.breakdown.tag_configure('alternate', background=ALTERNATE_BACKGROUND)
-        self._sorting = TreeSort(self.breakdown, numeric_columns=('income', 'stock', 'mak', 'cash'),
-                                 value=lambda item, column: self._values[item].get('purpose' if column == '#0' else column, ''),
-                                 on_sort=self._shade_rows)
 
-    def _panel(self, title, row, column, help_key=None, *, parent=None):
-        panel = ttk.LabelFrame(self if parent is None else parent, text=title, padding=(10, 4))
+    def _panel(self, title, row, column, help_key=None, *, parent):
+        panel = ttk.LabelFrame(parent, text=title, padding=(10, 4))
         if help_key:
             panel.help_label = info_label(panel, title, HELP[help_key])
             panel.configure(labelwidget=panel.help_label)
-        padding = 0 if parent is not None else (0, 6) if column == 0 else (6, 0)
-        panel.grid(row=row, column=column, sticky='nsew', padx=padding, pady=(0, 6))
+        panel.grid(row=row, column=column, sticky='nsew', pady=(0, 6))
         return panel
 
     def _entry(self, parent, name, width):
@@ -458,14 +413,14 @@ class CalculatorView(ttk.Frame):
         self._loading = True
         try:
             for name, variable in self._inputs.items():
-                if name in ('equities', 'gold', 'bonds', 'mak'):
+                if name in ('equities', 'gold', 'bonds', 'mak_huf', 'mak_eur'):
                     value = getattr(settings.returns, name)
-                    if name == 'mak' and value is None:
+                    if name == 'mak_huf' and value is None:
                         value = self._base_rate
                 else:
                     value = getattr(settings, name)
                 variable.set('' if value is None else plain_number(value))
-            self._auto_rate.set(settings.returns.mak is None)
+            self._auto_rate.set(settings.returns.mak_huf is None)
             self.cashflows.set_cashflows(settings.incomes, settings.outgoings)
         finally:
             self._loading = False
@@ -480,11 +435,11 @@ class CalculatorView(ttk.Frame):
     def _update_auto_rate(self):
         if self._auto_rate.get():
             self._loading = True
-            self._inputs['mak'].set('' if self._base_rate is None else plain_number(self._base_rate))
+            self._inputs['mak_huf'].set('' if self._base_rate is None else plain_number(self._base_rate))
             self._loading = False
 
     def _update_rate_state(self):
-        self._mak_entry.configure(state='normal' if self._enabled and not self._auto_rate.get() else 'disabled')
+        self._mak_huf_entry.configure(state='normal' if self._enabled and not self._auto_rate.get() else 'disabled')
 
     def _changed(self, *_):
         if not self._loading:
@@ -501,8 +456,8 @@ class CalculatorView(ttk.Frame):
             self._autosave_id = None
 
     def _clear_result(self):
-        self.breakdown.delete(*self.breakdown.get_children())
-        self._values.clear()
+        self._recommendation = None
+        self.calendar.clear()
         self.allocation_summary.delete(*self.allocation_summary.get_children())
         self._summary_values.clear()
         for variable in self.return_weights.values():
@@ -520,19 +475,3 @@ class CalculatorView(ttk.Frame):
         except ValueError as error:
             label = name.replace('_', ' ').capitalize()
             raise ValueError(f'{label}: enter {"a whole number" if parse is int else "a number"}.') from error
-
-    def _show_funding(self, rows, outgoings, display_rate):
-        fields = (('income', 'income_funded'), ('stock', 'stock'), ('mak', 'mak'), ('cash', 'cash'))
-        for row in rows:
-            if row.outgoing_index is None or row.outgoing_index < 0 or outgoings[row.outgoing_index].frequency != 'once':
-                continue
-            amounts = {key: getattr(row, attribute) for key, attribute in fields}
-            item = self.breakdown.insert('', 'end', text=row.name,
-                                         values=[format_amount(amounts[key] / display_rate)
-                                                 for key in self.breakdown['columns']])
-            self._values[item] = dict(purpose=row.name, **amounts)
-        self._sorting.apply()
-
-    def _shade_rows(self):
-        for index, item in enumerate(self.breakdown.get_children()):
-            self.breakdown.item(item, tags=('alternate',) if index % 2 else ())

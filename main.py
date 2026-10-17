@@ -41,8 +41,8 @@ def main(argv=None):
         location = f'\nConfiguration folder: {directory}' if directory is not None else ''
         parser.error(f'{error}{location}\nChoose a valid folder with --config FOLDER or open it in the GUI.')
     try:
-        if settings.returns.mak is None:
-            settings = replace(settings, returns=replace(settings.returns, mak=fetch_base_rate().percent))
+        if settings.returns.mak_huf is None:
+            settings = replace(settings, returns=replace(settings.returns, mak_huf=fetch_base_rate().percent))
         market = fetch_market_data(portfolio, args.base_currency,
                                    extra_currencies=tuple(sorted(settings.currencies | wealth.currencies)))
         rates = {currency: rate / market.value(1, 'HUF') for currency, rate in market.rates.items()}

@@ -160,6 +160,8 @@ class WealthGuiTests(unittest.TestCase):
         self.assertEqual([(entry.flow.amount, entry.direction, entry.occupancy, entry.appreciation_percent) for entry in flat.cashflows],
                          [(900, 'income', 'rented', 3.125), (90, 'outgoing', 'vacant', 2)])
         self.assertEqual(flat.cashflows[1].flow.currency, 'GBP')
+        self.assertTrue(all(entry.flow.appreciation_percent == 0 for entry in flat.cashflows))
+        self.assertEqual(self.view.flows['properties'].tree['columns'].count('appreciation_percent'), 1)
         self.assertFalse(house.cashflows)
         table = self.view.flows['properties']
         rows = table.tree.get_children()
@@ -235,6 +237,7 @@ class WealthGuiTests(unittest.TestCase):
         self.edit('pensions', dict(kind='Payroll contribution', name='Payroll', amount='200', currency='EUR',
                                    frequency='Monthly', start='2027-01', ending='Ongoing'), flow=True)
         self.assertEqual(self.view.settings().pensions[0].contributions[0].source, 'payroll')
+        self.assertNotIn('appreciation_percent', self.view.flows['pensions'].tree['columns'])
         self.assertFalse(self.view.settings().events(date(2026, 12, 1), date(2027, 1, 1)))
 
     def test_pension_withdrawal_before_access_is_rejected_without_saving(self):

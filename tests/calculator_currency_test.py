@@ -22,7 +22,7 @@ class CalculatorCurrencyTests(unittest.TestCase):
     def settings(self, *, extra_outgoings=(), **values):
         defaults = dict(outgoings=(ongoing('Rent', 1_200, 'EUR'), ongoing('Other', 800, 'EUR')),
                         incomes=(ongoing('Salary', 3_000, 'USD'),),
-                        returns=ReturnAssumptions(equities=0, mak=0))
+                        returns=ReturnAssumptions(equities=0, mak_huf=0))
         values = defaults | values
         values['outgoings'] = tuple(values['outgoings']) + tuple(extra_outgoings)
         return CalculatorSettings(**values)

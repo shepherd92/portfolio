@@ -116,16 +116,19 @@ def _living(c):
     costs = []
     for flow in c.settings.outgoings:
         if flow.ongoing and flow.start <= c.as_of:
-            costs.append((flow.name, c.money(flow.amount, flow.currency), flow.frequency,
+            amount = flow.amount_on(c.as_of)
+            costs.append((flow.name, c.money(flow.amount, flow.currency), _percent(flow.appreciation_percent),
+                          c.money(amount, flow.currency), flow.frequency,
                           _fx_text(flow.currency, 'HUF', c.huf_rates[flow.currency]),
-                          c.huf(huf_value(flow.amount, flow.currency, c.huf_rates) / flow.interval_months)))
+                          c.huf(huf_value(amount, flow.currency, c.huf_rates) / flow.interval_months)))
     blocks = [CalculationText('Start with active ongoing Calculator costs. Annual costs are spread over twelve months; '
                               'finite payments are funded individually in section 3.'),
+              _appreciation_formula(),
               CalculationFormula(r'B=\sum_k\frac{a_k x_k}{m_k}',
-                                 'B is the monthly HUF living budget; a is a payment, x its HUF conversion, '
+                                 'B is the monthly HUF living budget; a is the appreciated payment amount this month, x its HUF conversion, '
                                  'and m is one month for monthly costs or twelve for annual costs.'),
-              _table('Monthly living costs', ('Cost', 'Payment', 'Frequency', 'Conversion', 'Monthly equivalent'),
-                     costs or [('No active ongoing costs', '0 HUF', '—', '—', '0 HUF')], (1, 4)),
+              _table('Monthly living costs', ('Cost', 'Begins amount', 'Appreciation', 'Amount now', 'Frequency', 'Conversion', 'Monthly equivalent'),
+                     costs or [('No active ongoing costs', '0 HUF', '0%', '0 HUF', '—', '—', '0 HUF')], (1, 2, 3, 6)),
               CalculationFormula(r'C_{\mathrm{buffer}}=n_C B',
                                  f'{c.settings.cash_months} cash-buffer months × {c.huf(spending)} per month '
                                  f'≈ {c.huf(requested)} requested.'),
@@ -243,7 +246,7 @@ def _expense_overview(c):
         ('D', 'Expense payment in HUF'), ('d; t', 'Nonnegative days to the cash deadline; t = d / 365.2425 years'),
         ('H', 'The configured stock horizon, using its actual calendar-day duration in years'),
         ('w', 'Stock fraction today; zero for linked defensive obligations'),
-        ('rS; rM', 'Annual Stock market and MÁK returns, expressed as decimal fractions in formulas'),
+        ('rS; rM; rE', 'Annual Stock market, HUF MÁK and EUR MÁK returns; decimal fractions in formulas'),
         ('P', 'Full present reserve before future income'), ('S', 'Stock reserve P × w, before shortage funding'),
         ('V0', 'Initial defensive reserve P − S'), ('K', 'Maximum eligible future savings value at the deadline'),
         ('A; F; R', 'Assigned saving principal; its deadline value; present reserve credit'),
@@ -254,14 +257,17 @@ def _expense_overview(c):
                               'No growth is assumed after the cash deadline.'),
               _table('Return assumptions', ('Category', 'Within Stock market', 'Annual return'),
                      [(name, _percent(weights[name] / stock_total * 100 if stock_total else 0), _percent(rate))
-                      for name, rate in returns] + [('MÁK', '—', _percent(c.result.mak_return)), ('Cash', '—', '0%')], (1, 2)),
+                      for name, rate in returns] + [('MÁK HUF', '—', _percent(c.result.mak_huf_return)),
+                                                   ('MÁK EUR', '—', _percent(c.result.mak_eur_return)),
+                                                   ('Cash', '—', '0%')], (1, 2)),
               CalculationFormula(r'r_S=\sum_j \alpha_j r_j',
                                  f'Category weights within Stock market give an annual return of {_percent(c.result.market_return)}. '
-                                 'The Stock market branch can contain equities, bonds and gold. Both MÁK currencies use '
-                                 'the same return assumption and fixed FX.'),
+                                 'The Stock market branch can contain equities, bonds and gold. Emergency and expense '
+                                 'reserves use HUF MÁK return rM. Long-term EUR MÁK uses rE; FX stays fixed.'),
               _table('Symbols used in the expense pages', ('Symbol', 'Meaning'), glossary),
               CalculationFormula(r'w=\min(1,t/H),\qquad g(u)=1+r_M+(r_S-r_M)\min(1,u/H)',
-                                 'As the deadline approaches, the stock fraction declines linearly to zero.'),
+                                 'u is years remaining until the cash deadline. As it approaches, the stock fraction '
+                                 'declines linearly to zero; rM is the HUF MÁK return.'),
               CalculationFormula(r'G=\int_0^t \ln g(u)\,du,\qquad P=D\exp(-G)',
                                  'The model integrates the changing blended annual return. It does not apply today’s '
                                  'stock fraction unchanged for the whole horizon. Defensive obligations use rS = rM.'),
@@ -296,8 +302,31 @@ def _schedule(c, flow):
     return c.money(flow.amount, flow.currency), flow.frequency, f'{flow.start:%Y-%m}', end
 
 
+def _appreciation_formula():
+    return CalculationFormula(r'a(n)=a_0(1+g)^{n/12}',
+                              'a0 is the entered amount in the Begins month; g is annual appreciation as a decimal, '
+                              'and n is elapsed calendar months. Monthly and annual flows use the same formula. '
+                              'A single payment uses its entered amount. Appreciation changes payments, not investment returns.')
+
+
+def _payment_appreciation(c, payment):
+    if not 0 <= payment.outgoing_index < len(c.settings.outgoings):
+        return []
+    flow = c.settings.outgoings[payment.outgoing_index]
+    if not flow.appreciation_percent:
+        return []
+    months = (payment.due.year - flow.start.year) * 12 + payment.due.month - flow.start.month
+    return [_appreciation_formula(),
+            _table('Payment appreciation', ('Input', 'Value'),
+                   [('Begins amount · a0', c.money(flow.amount, flow.currency)),
+                    ('Begins month', f'{flow.start:%Y-%m}'),
+                    ('Annual appreciation · g', _percent(flow.appreciation_percent)),
+                    ('Elapsed months · n', str(months)),
+                    ('Due payment · a(n)', c.money(payment.amount, payment.currency))], (1,))]
+
+
 def _savings(c):
-    schedule = [(kind, flow.name, *_schedule(c, flow)) for kind, flows in
+    schedule = [(kind, flow.name, *_schedule(c, flow), _percent(flow.appreciation_percent)) for kind, flows in
                 (('Income', c.settings.incomes), ('Outgoing', c.settings.outgoings)) for flow in flows]
     budgets, obligations, linked_income = [], [], []
     for budget in c.result.income_budgets:
@@ -314,18 +343,38 @@ def _savings(c):
               CalculationFormula(r'I_j=\max(0,Y_j-B_j)-O_j',
                                  'Y is gross income, B the active monthly living budget and O the linked obligations '
                                  'actually covered from remaining income. Uncovered linked commitments become defensive expenses.'),
-              _table('Captured income and outgoing schedules', ('Kind', 'Name', 'Payment', 'Frequency', 'Begins', 'Ends'),
-                     schedule, (2,)),
+              _appreciation_formula(),
+              _table('Captured income and outgoing schedules', ('Kind', 'Name', 'Begins amount', 'Frequency', 'Begins', 'Ends', 'Appreciation'),
+                     schedule, (2, 6)),
               _table('Dated savings ledger · HUF', ('Receipt date', 'Gross income', 'Living budget', 'Linked payments', 'Savings'),
                      budgets, (1, 2, 3, 4)),
               _table('Linked income included above', ('Date', 'Source', 'Income'), linked_income, (2,)),
               _table('Linked obligations', ('Date', 'Commitment', 'Required', 'Covered', 'Uncovered'), obligations, (2, 3, 4)),
-              _table('New fixed buffers consume savings first', ('Begins', 'Additional buffer'),
-                     [(f'{day:%Y-%m-%d}', c.huf(amount)) for day, amount in c.result.buffer_increases], (1,)),
+              _table('Fixed-buffer changes before expense commitments', ('Month', 'Buffer change'),
+                     [(f'{day:%Y-%m-%d}', c.huf(amount)) for day, amount in c.result.buffer_changes], (1,)),
+              CalculationText('Positive changes reserve savings for additional cash and emergency buffers. Negative '
+                              'changes cancel unpaid buffer needs; they never create extra salary. Projections release '
+                              'excess existing buffer holdings to long-term investments.'),
               CalculationText('Each receipt is assigned once, in expense cash-deadline order; a receipt on the deadline '
-                              'is eligible. New ongoing costs create additional fixed buffers that consume savings '
+                              'is eligible. Expenses with the same deadline share savings in proportion to their '
+                              'remaining defensive capacities. New or growing ongoing costs create additional fixed buffers that consume savings '
                               'first; any unfilled buffer carries forward. Unassigned savings are not current wealth '
                               'and do not reduce today’s reserves.'),
+              CalculationFormula(r'a_{ij}=U_j\frac{k_i}{\sum_{\ell\in G}k_\ell},\qquad '
+                                 r'A_{ij}=\min\left(a_{ij},\frac{k_i}{(1+r_M)^{\delta_j}}\right)',
+                                 'For the earliest eligible deadline group G, ki is each expense’s remaining deadline '
+                                 'capacity and Uj is the receipt principal left after buffers and earlier groups. '
+                                 'All expenses in G have the same growth duration δj. Their assigned principals Aij '
+                                 'reduce their capacities by Aij × (1 + rM)^δj; any unused receipt continues to the next group.'),
+              _table('Monthly savings commitments · principal in HUF',
+                     ('Receipt month', 'Eligible savings', 'Fixed buffers', 'Expenses', 'Unassigned'),
+                     [(f'{entry.day:%Y-%m}', c.huf(entry.available), c.huf(entry.buffer_reserved),
+                       c.huf(fsum(amount for _, amount in entry.expenses)), c.huf(entry.uncommitted))
+                      for entry in c.result.funding_schedule.entries], (1, 2, 3, 4)),
+              _table('Expense assignments · principal in HUF', ('Receipt month', 'Expense', 'Cash deadline', 'Assigned'),
+                     [(f'{entry.day:%Y-%m}', _expense_label(index + 1, c.result.expenses[index]),
+                       f'{c.result.expenses[index].deadline:%Y-%m}', c.huf(principal))
+                      for entry in c.result.funding_schedule.entries for index, principal in entry.expenses], (3,)),
               CalculationText(f'Assigned saving principal across expense receipts: '
                               f'{c.huf(fsum(amount for detail in c.result.expenses for _, amount in detail.contributions))}. '
                               'Each expense separately shows principal, projected deadline value and present reserve credit.')]
@@ -390,7 +439,7 @@ def _expense(c, index, detail, row):
     contributions = []
     with localcontext() as context:
         context.prec = 40
-        gross = 1 + Decimal(str(c.result.mak_return)) / 100
+        gross = 1 + Decimal(str(c.result.mak_huf_return)) / 100
         for day, amount in detail.contributions:
             years = Decimal((detail.deadline - day).days) / Decimal('365.2425')
             terminal = Decimal(str(amount)) * gross ** years
@@ -400,7 +449,8 @@ def _expense(c, index, detail, row):
               ('Cash deadline', f'{detail.deadline:%Y-%m-%d}'), ('Days to cash · d', str(days)),
               ('Years to cash · t', _number(days / 365.2425, 4)), ('Horizon days', str(horizon_days)),
               ('Stock fraction · w', _percent(detail.stock_fraction * 100))]
-    blocks = [CalculationText('This is a linked defensive commitment: zero Stock market and a cash deadline on its payment date.'
+    blocks = [*_payment_appreciation(c, payment),
+              CalculationText('This is a linked defensive commitment: zero Stock market and a cash deadline on its payment date.'
                               if payment.defensive else 'This payment becomes Cash before its due date. Its allocation '
                               'moves from Stock market toward MÁK as that cash deadline approaches.'),
               _table('Payment and timing', ('Input', 'Captured value'), timing, (1,)),
@@ -513,7 +563,7 @@ def _mix(c):
     page = CalculationPage('Long-term remainder and effective class targets',
         'Apply the editable long-term mix to the unreserved remainder, then add the funded reserve allocations.',
         (CalculationFormula(r'T_j=Lq_j+S_R\frac{q_j}{q_S}\quad(j\in\mathrm{Stock})',
-                            'qj is a class’s original fraction of the entire portfolio; qS is the original total '
+                            'qj is a class’s original fraction of the long-term investment mix; qS is its total '
                             'Stock market fraction. Distribute the reserved stock across the same within-Stock mix.'),
          CalculationFormula(r'T_k=Lq_k+R_k\quad(k\in\mathrm{Cash,\ M\acute{A}K}),\qquad p_k=\frac{T_k}{W}',
                             'Cash and MÁK receive their long-term amounts plus protected reserve amounts in the HUF '
@@ -526,9 +576,22 @@ def _mix(c):
                          'displayed, and no division by zero is performed.' if not c.plan.wealth else
                          'Original percentages describe the saved long-term mix; effective percentages describe '
                          'this plan after its funded reserves.'),
-         CalculationFormula(r'r_{\mathrm{mix}}=p_Sr_S+p_Mr_M',
+         _table('Recommended return by component', ('Component', 'Value in HUF', 'Portfolio weight', 'Annual return',
+                                                   'Contribution (pp)'),
+                [(label, c.huf(amount), _percent(amount / c.result.total * 100 if c.result.total else 0), _percent(rate),
+                  _number(amount / c.result.total * rate if c.result.total else 0, 2))
+                 for label, amount, rate in [('Cash', c.result.cash, 0),
+                                            ('MÁK HUF', c.result.mak_huf, c.result.mak_huf_return),
+                                            ('MÁK EUR', c.result.mak_eur, c.result.mak_eur_return),
+                                            ('Stock market', c.result.stock, c.result.market_return)]] +
+                [('Total', c.huf(c.result.total), '100%' if c.result.total else '0%', '—',
+                  _number(c.result.expected_return, 2))], (1, 2, 3, 4), (4,)),
+         CalculationFormula(r'r_{\mathrm{mix}}=p_Sr_S+p_{M,H}r_M+p_{M,E}r_E',
                             f'Illustrative return of the funding-target mix: {_percent(c.result.expected_return)}. '
-                            'Cash contributes zero. This is a planning return before whole-share selection, not the '
+                            'Each contribution is weight × return in percentage points (pp), summed before rounding. '
+                            'Weights use HUF-equivalent values. All funded emergency and expense MÁK is HUF; only the '
+                            'long-term portion follows the saved HUF/EUR target mix. Cash contributes zero. '
+                            'This is a planning return before whole-share selection, not the '
                             'return of actual ending holdings and not an optimized profit forecast.')),
         _outcome(c, 'Combined target amounts · before trade selection', [('Effective targets', _target_parts(c))]))
     return CalculationSection('5. Long-term mix and stock classes', (page,))

@@ -29,7 +29,7 @@ class NetWorthViewTests(unittest.TestCase):
         configure_theme(self.root)
         self.allocation = AllocationTargets({STOCK_MARKET: {}, TREASURY: {}, CASH: {'HUF': 100}})
         self.settings = CalculatorSettings(emergency_months=0, cash_months=0,
-                                           returns=ReturnAssumptions(equities=0, gold=0, bonds=0, mak=0))
+                                           returns=ReturnAssumptions(equities=0, gold=0, bonds=0, mak_huf=0))
         loan = Loan('loan', 'Loan', 200, CashFlow('Repayment', 50, PAYMENT, frequency='monthly', count=2))
         self.data = self.project(WealthSettings(loans=(loan,)), total=100)
         self.get_projection = Mock(return_value=self.data)

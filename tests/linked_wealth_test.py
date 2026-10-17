@@ -26,7 +26,7 @@ def inputs(income=0, spending=0, **values):
     incomes = (flow('Salary', income, frequency='monthly'),) if income else ()
     outgoings = (flow('Living', spending, TODAY, frequency='monthly'),) if spending else ()
     return CalculatorSettings(incomes=incomes, outgoings=outgoings,
-                              returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak=0), **values)
+                              returns=ReturnAssumptions(equities=0, bonds=0, gold=0, mak_huf=0), **values)
 
 
 def loan(amount=100, balance=300, **values):
@@ -50,7 +50,7 @@ class LinkedWealthTests(unittest.TestCase):
                           (date(2026, 4, 1), 50), (date(2026, 5, 1), 150)))
         self.assertEqual(settings.scheduled_payments(TODAY), ())
         self.assertEqual(settings.monthly_spending(as_of=TODAY), 50)
-        self.assertEqual(settings.buffer_increases(TODAY), ())
+        self.assertEqual(settings.buffer_changes(TODAY), ())
 
     def test_loan_deficit_remains_when_living_deficit_is_floored(self):
         settings = linked_settings(inputs(30, 50), WealthSettings(loans=(loan(balance=100),)), TODAY)
@@ -228,9 +228,9 @@ class LinkedWealthTests(unittest.TestCase):
         april, may, june = (date(2026, month, 1) for month in (4, 5, 6))
         payments = (Payment('Loan', 100, may, 'HUF', -1, cash_due=may, defensive=True),
                     Payment('Holiday', 100, june, 'HUF', 0))
-        gaps, assigned = expense_income(payments, (100, 100), ((april, 100), (may, 100)), 0, 2)
-        self.assertEqual(gaps, [0, 0])
-        self.assertEqual(assigned, {april: [(1, 100)], may: [(0, 100)]})
+        schedule = expense_income(payments, (100, 100), ((april, 100), (may, 100)), 0, 2)
+        self.assertEqual(schedule.gaps, (0, 0))
+        self.assertEqual(schedule.payments, {april: ((1, 100),), may: ((0, 100),)})
 
     def test_projection_subtracts_each_loan_payment_only_once(self):
         settings = linked_settings(inputs(200, 50), WealthSettings(loans=(loan(),)), TODAY)
@@ -262,7 +262,7 @@ class LinkedWealthTests(unittest.TestCase):
     def test_defensive_loan_reserve_grows_only_at_mak_rate_until_payment(self):
         due = date(2027, 6, 1)
         debt = Loan('loan', 'Loan', 1100, flow('Final payment', 1100, due))
-        base = replace(inputs(), returns=ReturnAssumptions(equities=50, bonds=0, gold=0, mak=10))
+        base = replace(inputs(), returns=ReturnAssumptions(equities=50, bonds=0, gold=0, mak_huf=10))
         settings = linked_settings(base, WealthSettings(loans=(debt,)), TODAY)
         result = recommend(settings, TODAY, ALLOCATION, total=2000)
         row = result.rows[2]
@@ -371,6 +371,11 @@ class LinkedWealthTests(unittest.TestCase):
             for calculate in (recommend, project):
                 with self.subTest(bound=bound, calculate=calculate.__name__), self.assertRaisesRegex(ValueError, 'Missing exchange rate for EUR/HUF'):
                     calculate(settings, TODAY, ALLOCATION, total=1000, rates=supplied)
+
+    def test_extended_funding_calendar_validates_linked_horizon_before_generating_events(self):
+        settings = linked_settings(inputs(), WealthSettings(loans=(loan(balance=2400),)), TODAY, years=1)
+        with self.assertRaisesRegex(ValueError, 'beyond the linked planning horizon'):
+            recommend(settings, TODAY, ALLOCATION, total=3000, funding_end=date(2028, 1, 1))
 
     def test_projection_cannot_repay_debt_beyond_the_linked_cash_horizon(self):
         settings = linked_settings(inputs(), WealthSettings(loans=(loan(balance=2400),)), TODAY, years=1)

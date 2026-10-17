@@ -289,7 +289,7 @@ class WealthEditor:
         record = self._items[kind][self._selected[kind]]
         if kind == 'properties':
             return replace(record, cashflows=tuple(PropertyCashFlow(
-                CashFlowTable._cashflow(row), row['kind'].lower(), _key(_OCCUPANCY, row['occupancy']),
+                CashFlowTable._cashflow(dict(row, appreciation_percent=0)), row['kind'].lower(), _key(_OCCUPANCY, row['occupancy']),
                 _percentage(row['appreciation_percent'])) for row in rows))
         flows = [(row['kind'], CashFlowTable._cashflow(row)) for row in rows]
         if kind == 'pensions':
@@ -379,7 +379,7 @@ class _LinkedFlowTable(CashFlowTable):
         self.view, self.kind = view, kind
         extra = (('occupancy', 'Occupancy', 95), ('appreciation_percent', 'Appreciation', 110)) if kind == 'properties' else ()
         super().__init__(parent, currency_choices=self._currencies,
-                         extra_columns=extra, percent_columns=('appreciation_percent',) if extra else (),
+                         extra_columns=extra, percent_columns=('appreciation_percent',) if extra else (), appreciation=False,
                          on_change=lambda *args: view._flows_changed(kind, *args))
         if extra:
             self.field_rows += (('occupancy', 'appreciation_percent'),)
@@ -424,7 +424,10 @@ class _LinkedFlowTable(CashFlowTable):
         role = row['kind']
         if role not in _ROLES[self.kind]:
             raise ValueError('Select a valid payment type.')
-        normalized = super()._validate({**row, 'kind': 'Outgoing'}, old)
+        draft = dict(row, kind='Outgoing')
+        if self.kind == 'properties':
+            draft['appreciation_percent'] = 0
+        normalized = super()._validate(draft, old)
         normalized['kind'] = role
         if self.kind == 'properties':
             normalized.update(occupancy=_key(_OCCUPANCY, row['occupancy']),

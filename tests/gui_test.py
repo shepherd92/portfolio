@@ -1025,7 +1025,7 @@ class GuiTests(unittest.TestCase):
         from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions
         self.app.calculator._set_inputs(CalculatorSettings(
             outgoings=(CashFlow('Living costs', 1000, date.today(), frequency='monthly'), CashFlow('Bill', 25000, date.today())),
-            returns=ReturnAssumptions(mak=5)))
+            returns=ReturnAssumptions(mak_huf=5)))
         portfolio, revision = self.app.portfolio(), self.app.revision
         pages = tuple(self.app.allocation_pages.values())
         snapshots = [(dict(page.current_chart._data), dict(page.current_chart._colors), page.current_title.get()) for page in pages]

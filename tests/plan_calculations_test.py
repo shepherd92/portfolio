@@ -31,7 +31,7 @@ class PlanCalculationTests(unittest.TestCase):
 
     def settings(self, **values):
         return CalculatorSettings(**{'emergency_months': 0, 'cash_months': 0,
-                                     'returns': ReturnAssumptions(equities=0, mak=0), **values})
+                                     'returns': ReturnAssumptions(equities=0, mak_huf=0), **values})
 
     def report(self, portfolio, market, settings=None, *, selling=False):
         settings = settings or self.settings()
@@ -150,6 +150,28 @@ class PlanCalculationTests(unittest.TestCase):
         self.assertEqual([self.money(value) for value in rows[(STOCK_MARKET, 'World')][3:6]], [120, 0, 120])
         self.assertEqual(report.sections[4].pages[0].outcome.rows[0][1:], ('200', '680', '120', '1\u202f000'))
 
+    def test_cashflow_appreciation_is_explicit_and_matches_funded_amounts(self):
+        start = date(2024, 1, 1)
+        settings = self.settings(emergency_months=3, cash_months=2,
+            incomes=(CashFlow('Salary', 1000, start, frequency='monthly', appreciation_percent=21),),
+            outgoings=(CashFlow('Living', 100, start, frequency='monthly', appreciation_percent=21),
+                       CashFlow('Fees', 100, start, frequency='annual', count=3, appreciation_percent=21)))
+        portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 100}), {'HUF': 100_000})
+        report, _, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
+        living = self.table(report, 'Monthly living costs').rows[0]
+        self.assertEqual(living[2], '21%')
+        self.assertEqual([self.money(living[column]) for column in (1, 3, 6)], [100, 121, 121])
+        schedule = self.table(report, 'Captured income and outgoing schedules')
+        self.assertEqual([row[-1] for row in schedule.rows], ['21%'] * 3)
+        self.assertAlmostEqual(funding.recommendation.rows[0].amount, 363)
+        evidence = [table for table in self.tables(report) if table.title == 'Payment appreciation']
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual([table.rows[3][1] for table in evidence], ['12', '24'])
+        self.assertEqual([self.money(table.rows[4][1]) for table in evidence], [121, 146])
+        changes = self.table(report, 'Fixed-buffer changes before expense commitments')
+        self.assertTrue(changes.rows)
+        self.assertIn('Appreciation changes payments, not investment returns.', report.text)
+
     def test_expense_preserves_stock_and_separates_present_and_future_values(self):
         self.today = date(2024, 1, 1)
         portfolio = Portfolio((Holding('ETF', 'World', 0),),
@@ -173,7 +195,7 @@ class PlanCalculationTests(unittest.TestCase):
     def test_positive_growth_does_not_conflate_principal_deadline_value_or_credit(self):
         portfolio = Portfolio((Holding('ETF', 'World', 0),),
                               self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 100_000})
-        settings = self.settings(horizon_years=5, returns=ReturnAssumptions(equities=12, mak=6),
+        settings = self.settings(horizon_years=5, returns=ReturnAssumptions(equities=12, mak_huf=6),
             incomes=(CashFlow('Bonus', 1000, date(2025, 7, 1)),),
             outgoings=(CashFlow('Car', 10_000, date(2027, 3, 1)),))
         report, _, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
@@ -286,7 +308,7 @@ class PlanCalculationTests(unittest.TestCase):
             WealthSettings((home,), (pension,), (loan,)), self.today)
         portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 10_000})
         report, plan, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
-        first, second = funding.recommendation.income_budgets
+        first, second = funding.recommendation.income_budgets[:2]
         self.assertEqual(first.gross_income, 134)
         self.assertEqual(first.surplus, 0)
         self.assertEqual(first.obligations, (('Loan · Repayment', 100, 94), ('Pension · Bank saving', 20, 0)))
@@ -298,6 +320,29 @@ class PlanCalculationTests(unittest.TestCase):
         self.assertIn('occupancy weight 75%; vacancy 25%', report.text)
         self.assertIn('Already outside net bank income; not deducted again', report.text)
         self.assertIn('d/365.25', report.text)
+
+    def test_report_reconciles_shared_monthly_assignments_and_currency_returns(self):
+        portfolio = Portfolio((Holding('ETF', 'World', 0),),
+                              self.targets(stock={'World': 40}, mak={'HUF': 20, 'EUR': 40}),
+                              {'HUF': 1_000_000})
+        market = MarketData({'ETF': Quote(10, 'HUF')}, {'EUR': 400}, 'HUF')
+        settings = self.settings(returns=ReturnAssumptions(equities=8, mak_huf=6, mak_eur=2))
+        report, _, funding = self.report(portfolio, market, settings)
+        components = self.table(report, 'Recommended return by component')
+        self.assertEqual(components.rows[1], ('MÁK HUF', '200\u202f000 HUF', '20%', '6%', '1.2'))
+        self.assertEqual(components.rows[2], ('MÁK EUR', '400\u202f000 HUF', '40%', '2%', '0.8'))
+        self.assertAlmostEqual(funding.recommendation.expected_return, 5.2)
+        self.assertIn('5.2%', report.text)
+
+        settings = self.settings(incomes=(CashFlow('Salary', 20, date(2025, 2, 1)),),
+                                 outgoings=(CashFlow('Car', 40, date(2025, 4, 1)),
+                                            CashFlow('Apartment', 60, date(2025, 4, 1))))
+        report, _, _ = self.report(portfolio, market, settings)
+        ledger = self.table(report, 'Monthly savings commitments · principal in HUF')
+        self.assertEqual(ledger.rows[0], ('2025-02', '20 HUF', '0 HUF', '20 HUF', '0 HUF'))
+        assignments = self.table(report, 'Expense assignments · principal in HUF')
+        self.assertEqual([self.money(row[-1]) for row in assignments.rows], [8, 12])
+        self.assertIn('same deadline', report.text)
 
     def test_audits_detect_corrupted_cash_hidden_by_whole_money_rounding(self):
         portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 1000})
@@ -355,7 +400,7 @@ class PlanCalculationTests(unittest.TestCase):
         self.assertIn('<1 EUR', report.text)
 
     def test_extreme_return_tiny_principal_and_zero_wealth_stay_finite(self):
-        settings = self.settings(returns=ReturnAssumptions(equities=6, mak=1e308),
+        settings = self.settings(returns=ReturnAssumptions(equities=6, mak_huf=1e308),
             incomes=(CashFlow('Bonus', 100, date(2025, 2, 1)),),
             outgoings=(CashFlow('Purchase', 1_000_000, date(2026, 1, 1)),))
         portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 10_000})

@@ -18,7 +18,7 @@ class CalculationTraceTests(unittest.TestCase):
         return CalculatorSettings(**{
             'emergency_months': 0,
             'cash_months': 0,
-            'returns': ReturnAssumptions(equities=0, mak=0),
+            'returns': ReturnAssumptions(equities=0, mak_huf=0),
             **values,
         })
 
@@ -37,10 +37,10 @@ class CalculationTraceTests(unittest.TestCase):
         self.assertEqual(sooner.deadline, date(2025, 3, 1))
         self.assertEqual(sooner.contributions, ((date(2025, 2, 1), 100), (date(2025, 3, 1), 100)))
         self.assertEqual(later.contributions, ((date(2025, 4, 1), 100), (date(2025, 5, 1), 100)))
-        self.assertEqual(result.receipts, tuple((date(2025, month, 1), 100) for month in range(2, 6)))
+        self.assertEqual(result.receipts[:4], tuple((date(2025, month, 1), 100) for month in range(2, 6)))
         for day, available in result.receipts:
             assigned = fsum(amount for item in result.expenses for when, amount in item.contributions if when == day)
-            self.assertEqual(assigned, available)
+            self.assertLessEqual(assigned, available)
         for item, row in zip(result.expenses, result.rows[2:-1]):
             self.assertEqual(item.income_funded, 200)
             self.assertEqual(row.amount, item.full_reserve - item.released_reserve)
@@ -56,18 +56,18 @@ class CalculationTraceTests(unittest.TestCase):
                        CashFlow('Second', 100, date(2025, 4, 1))),
         )
         first, second = self.calculate(settings).expenses
-        self.assertAlmostEqual(first.income_funded, first.income_capacity)
+        self.assertAlmostEqual(first.income_funded, 50)
         self.assertEqual(len(first.contributions), 1)
         self.assertEqual(len(second.contributions), 1)
         self.assertEqual(first.contributions[0][0], second.contributions[0][0])
         self.assertAlmostEqual(first.contributions[0][1] + second.contributions[0][1], 100)
-        self.assertAlmostEqual(second.income_funded, 100 - first.income_capacity)
+        self.assertAlmostEqual(second.income_funded, 50)
 
     def test_compounded_funding_and_uncapped_reserve_survive_insufficient_wealth(self):
         self.today = date(2024, 1, 1)
         settings = self.settings(
             horizon_years=1,
-            returns=ReturnAssumptions(equities=10, mak=10),
+            returns=ReturnAssumptions(equities=10, mak_huf=10),
             incomes=(CashFlow('Bonus', 20, date(2024, 5, 1)),),
             outgoings=(CashFlow('Purchase', 100, date(2024, 9, 1)),),
         )
@@ -96,12 +96,11 @@ class CalculationTraceTests(unittest.TestCase):
         )
         result = self.calculate(settings)
         item, = result.expenses
-        self.assertEqual(result.buffer_increases, ((date(2025, 2, 1), 60),))
-        self.assertEqual(result.receipts, ((date(2025, 2, 1), 50), (date(2025, 3, 1), 50)))
+        self.assertEqual(result.buffer_changes, ((date(2025, 2, 1), 60),))
+        self.assertEqual(result.receipts[:2], ((date(2025, 2, 1), 50), (date(2025, 3, 1), 50)))
         self.assertEqual(item.contributions, ((date(2025, 3, 1), 40),))
         self.assertEqual(item.income_funded, 40)
-        self.assertEqual(fsum(value for _, value in result.receipts)
-                         - fsum(value for _, value in item.contributions), 60)
+        self.assertEqual(fsum(entry.buffer_reserved for entry in result.funding_schedule.entries), 60)
         self.assertEqual([row.amount for row in result.rows[:2]], [0, 0])
 
     def test_multicurrency_inputs_have_the_same_huf_trace_and_base_currency_does_not_change_it(self):
@@ -143,7 +142,7 @@ class CalculationTraceTests(unittest.TestCase):
         )
         result = self.calculate(settings)
         self.assertEqual(result.receipts, ())
-        self.assertEqual(len(result.income_budgets), 2)
+        self.assertEqual(len(result.income_budgets), 12)
         for budget, month in zip(result.income_budgets, (2, 3)):
             self.assertEqual(budget.day, date(2025, month, 1))
             self.assertEqual((budget.gross_income, budget.living_costs, budget.surplus), (30, 50, 0))

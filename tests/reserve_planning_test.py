@@ -27,7 +27,7 @@ class ReservePlanningTests(unittest.TestCase):
         market = MarketData({'ETF': Quote(10, 'EUR')}, {'HUF': .0025})
         settings = CalculatorSettings(
             incomes=(CashFlow('Salary', 1_000_000, date(2026, 1, 1), frequency='monthly'),),
-            returns=ReturnAssumptions(mak=5),
+            returns=ReturnAssumptions(mak_huf=5),
             outgoings=(
                 CashFlow('Living costs', 1000, date.min, frequency='monthly'),
                 CashFlow('Ready today', 2000, date(2026, 3, 1)),
