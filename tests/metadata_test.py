@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 from portfolio.metadata import fetch_asset_details
+from portfolio.market import MarketCache
 from portfolio.models import AssetDetails
 
 
@@ -76,3 +77,27 @@ class MetadataTests(unittest.TestCase):
         with patch('yfinance.Ticker', side_effect=TimeoutError('offline')):
             with self.assertRaisesRegex(ValueError, 'Could not look up VWCE.DE: offline'):
                 fetch_asset_details('VWCE.DE')
+
+    def test_session_cache_reuses_successful_partial_details_for_same_listing(self):
+        cache = MarketCache()
+        asset = Mock()
+        asset.get_info.return_value = {'symbol': 'VWCE.DE', 'longName': 'Fund'}
+        with patch('yfinance.Ticker', return_value=asset) as constructor:
+            first = fetch_asset_details('vwce.de', cache=cache)
+            second = fetch_asset_details('VWCE.DE', cache=cache)
+        self.assertIs(first, second)
+        self.assertEqual(second, AssetDetails(name='Fund'))
+        constructor.assert_called_once_with('VWCE.DE')
+        asset.get_info.assert_called_once_with()
+
+    def test_failed_metadata_lookup_can_retry_with_same_cache(self):
+        cache = MarketCache()
+        asset = Mock()
+        asset.get_info.side_effect = [{}, {'longName': 'Fund'}]
+        with patch('yfinance.Ticker', return_value=asset) as constructor:
+            with self.assertRaisesRegex(ValueError, 'No usable details'):
+                fetch_asset_details('VWCE.DE', cache=cache)
+            self.assertEqual(fetch_asset_details('VWCE.DE', cache=cache), AssetDetails(name='Fund'))
+            fetch_asset_details('VWCE.DE', cache=cache)
+        self.assertEqual(constructor.call_count, 2)
+        self.assertEqual(asset.get_info.call_count, 2)

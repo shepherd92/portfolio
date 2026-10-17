@@ -99,14 +99,14 @@ class TreasuryStorageTests(unittest.TestCase):
         save_portfolio(self.portfolio, self.directory)
         original = self.contents()
         external = b"currency,amount\nEUR,99\n"
-        real_stage = portfolio_io._stage
+        real_stage = portfolio_io.stage_bytes
 
-        def stage_and_change(path, contents):
-            result = real_stage(path, contents)
+        def stage_and_change(path, contents, *, preserve_mode):
+            result = real_stage(path, contents, preserve_mode=preserve_mode)
             (self.directory / "manual_asset.csv").write_bytes(external)
             return result
 
-        with patch.object(portfolio_io, "_stage", stage_and_change):
+        with patch.object(portfolio_io, "stage_bytes", stage_and_change):
             with self.assertRaisesRegex(ValueError, "changed while saving"):
                 save_portfolio(self.portfolio, self.directory)
         self.assertEqual(self.contents(), {**original, "manual_asset.csv": external})

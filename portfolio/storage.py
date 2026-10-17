@@ -9,9 +9,9 @@ import io
 import json
 import os
 from pathlib import Path
-import tempfile
 
-from portfolio.calculator import CalculatorSettings, Expense, MonthlyCost, ReturnAssumptions
+from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions
+from portfolio.files import json_bytes, read_optional_bytes, stage_bytes, unique_object
 from portfolio.models import (AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, ManualHolding,
                     Portfolio, currency_code, parse_currency_amount, parse_manual_amount)
 
@@ -43,6 +43,10 @@ def save_portfolio(portfolio, directory, expected_signature=None, *, group_origi
     """
     if not isinstance(portfolio, Portfolio):
         raise ValueError("Expected a Portfolio")
+    for currency, amount in portfolio.cash.items():
+        parse_currency_amount(str(amount), currency)
+    for holding in portfolio.manual_holdings:
+        parse_manual_amount(str(holding.amount), holding.currency)
     directory = Path(directory)
     original = _config_bytes(directory)
     signature = _signature(original)
@@ -101,52 +105,53 @@ def load_portfolio_with_signature(directory):
 
 def load_settings(directory):
     """Load calculator inputs and their exact save token; a missing file uses defaults."""
-    original = _read(Path(directory) / 'calculator.json')
+    original = read_optional_bytes(Path(directory) / 'calculator.json')
     if original is None:
         return CalculatorSettings(), None
     try:
-        values = json.loads(original, parse_float=Decimal, object_pairs_hook=_unique_object)
+        values = json.loads(original, parse_float=Decimal, object_pairs_hook=unique_object)
         _keys(values, CalculatorSettings)
         _keys(values['returns'], ReturnAssumptions)
         values['returns'] = ReturnAssumptions(**values['returns'])
-        if not isinstance(values['monthly_costs'], list):
-            raise ValueError('Monthly costs must be a JSON list.')
-        costs = []
-        for row in values['monthly_costs']:
-            _keys(row, MonthlyCost)
-            costs.append(MonthlyCost(**row))
-        values['monthly_costs'] = tuple(costs)
-        if not isinstance(values['expenses'], list):
-            raise ValueError('Expenses must be a JSON list.')
-        expenses = []
-        for row in values['expenses']:
-            _keys(row, Expense)
-            due = date.fromisoformat(row['due']) if isinstance(row['due'], str) else None
-            if due is None or due.isoformat() != row['due']:
-                raise ValueError('Expense dates must use YYYY-MM-DD.')
-            expenses.append(Expense(row['name'], row['amount'], due, row['currency']))
-        return CalculatorSettings(**{**values, 'expenses': tuple(expenses)}), original
+        for name in ('incomes', 'outgoings'):
+            if not isinstance(values[name], list):
+                raise ValueError(f'{name.capitalize()} must be a JSON list.')
+            flows = []
+            for row in values[name]:
+                _keys(row, CashFlow)
+                start = _setting_month(row['start'])
+                end = _setting_month(row['end']) if row['end'] is not None else None
+                flows.append(CashFlow(**{**row, 'start': start, 'end': end}))
+            values[name] = tuple(flows)
+        return CalculatorSettings(**values), original
     except (ValueError, TypeError, UnicodeError) as error:
         raise ValueError(f'Invalid calculator.json: {error}') from error
 
 
 def save_settings(settings, directory, original):
     """Atomically save calculator inputs without modifying any portfolio files."""
-    if not isinstance(settings, CalculatorSettings):
+    if type(settings) is not CalculatorSettings:
         raise ValueError('Expected validated calculator settings.')
     path = Path(directory) / 'calculator.json'
-    values = asdict(settings)
-    values['expenses'] = [{**asdict(expense), 'due': expense.due.isoformat()} for expense in settings.expenses]
-    contents = (json.dumps(values, ensure_ascii=False, allow_nan=False, indent=2) + '\n').encode('utf-8')
+    contents = json_bytes(asdict(settings))
     _check_original(path, original)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _stage(path, contents)
+    temporary = stage_bytes(path, contents, preserve_mode=True)
     try:
         _check_original(path, original)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return contents
+
+
+def _setting_month(value):
+    if not isinstance(value, str) or len(value) != 7:
+        raise ValueError('Payment months use YYYY-MM.')
+    parsed = date.fromisoformat(f'{value}-01')
+    if parsed.isoformat()[:7] != value:
+        raise ValueError('Payment months use YYYY-MM.')
+    return parsed
 
 
 def _read_csv(name, contents):
@@ -171,7 +176,7 @@ def _read_csv(name, contents):
 
 def _config_bytes(directory):
     """Read only managed CSVs; a missing file has a distinct signature."""
-    return {name: _read(directory / name) for name in _CSV_COLUMNS}
+    return {name: read_optional_bytes(directory / name) for name in _CSV_COLUMNS}
 
 
 def _signature(contents):
@@ -215,8 +220,9 @@ def _csv_bytes(name, contents, key, rows, original_keys=None):
 
 def _asset_details(row):
     values = {name: row.get(name, "") for name in _ASSET_DETAIL_COLUMNS}
-    ter = values["ter"].strip()
-    values["ter"] = float(ter) if ter else None
+    for name in ("ter", "color_hue"):
+        value = values[name].strip()
+        values[name] = float(value) if value else None
     return AssetDetails(**values)
 
 
@@ -247,34 +253,15 @@ def _read_allocation(rows):
     return AllocationTargets(weights, categories)
 
 
-def _stage(path, contents):
-    """Flush a sibling temporary file before its atomic replacement."""
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp",
-                                         dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if path.exists():
-            temporary.chmod(path.stat().st_mode & 0o777)
-        return temporary
-    except BaseException:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise
-
-
 def _replace_portfolio_files(directory, original, serialized):
     """Stage all replacements and keep originals recoverable until every write succeeds."""
     directory.mkdir(parents=True, exist_ok=True)
     staged, backups, replaced = {}, {}, []
     try:
         for name, contents in serialized.items():
-            staged[name] = _stage(directory / name, contents)
+            staged[name] = stage_bytes(directory / name, contents, preserve_mode=True)
             if original[name] is not None:
-                backups[name] = _stage(directory / name, original[name])
+                backups[name] = stage_bytes(directory / name, original[name], preserve_mode=True)
         if config_signature(directory) != _signature(original):
             raise ValueError("Portfolio files changed while saving. Reload before saving.")
         try:
@@ -313,27 +300,11 @@ def _unique(pairs, name):
     return result
 
 
-def _read(path):
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        return None
-
-
 def _check_original(path, original):
-    if _read(path) != original:
+    if read_optional_bytes(path) != original:
         raise ValueError('Calculator inputs changed outside this application. Reload before saving.')
 
 
 def _keys(value, model):
     if not isinstance(value, dict) or set(value) != {field.name for field in fields(model)}:
         raise ValueError(f'{model.__name__} has missing or unsupported fields.')
-
-
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f'Duplicate field: {key}.')
-        result[key] = value
-    return result

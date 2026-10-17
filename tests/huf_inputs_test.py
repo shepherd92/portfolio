@@ -1,5 +1,6 @@
 """Whole-HUF rules apply to entered balances, not internal trade calculations."""
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -81,6 +82,30 @@ class HufStorageInputTests(unittest.TestCase):
         portfolio = load_portfolio(self.directory)
         self.assertEqual(portfolio.cash, {'EUR': -10.25, 'HUF': 20})
         self.assertEqual(portfolio.manual_holdings, (ManualHolding(100.25, 'EUR'), ManualHolding(300, 'HUF')))
+
+    def test_saving_rejects_fractional_huf_without_replacing_or_creating_inputs(self):
+        portfolio = load_portfolio(self.directory)
+        before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
+        invalid = (
+            replace(portfolio, cash={**portfolio.cash, 'HUF': 0.25}),
+            replace(portfolio, cash={**portfolio.cash, 'HUF': -1.5}),
+            replace(portfolio, manual_holdings=(ManualHolding(100.25, 'EUR'), ManualHolding(300.25, 'HUF'))),
+        )
+        absent = self.directory / 'new-portfolio'
+        for candidate in invalid:
+            for directory in (self.directory, absent):
+                with self.subTest(portfolio=candidate, directory=directory), self.assertRaisesRegex(
+                        ValueError, 'HUF amounts must be whole'):
+                    save_portfolio(candidate, directory)
+                self.assertFalse(absent.exists())
+                self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
+
+    def test_saving_preserves_eur_fractions_and_whole_huf(self):
+        portfolio = load_portfolio(self.directory)
+        changed = replace(portfolio, cash={'EUR': -10.125, 'HUF': 200},
+                          manual_holdings=(ManualHolding(123.45, 'EUR'), ManualHolding(400, 'HUF')))
+        save_portfolio(changed, self.directory)
+        self.assertEqual(load_portfolio(self.directory), changed)
 
 
 if __name__ == '__main__':

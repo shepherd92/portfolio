@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from portfolio.models import AllocationTargets, AssetDetails, CASH, STOCK_MARKET, TREASURY, Holding, Portfolio
 from portfolio.storage import config_signature, load_portfolio, save_portfolio
 from portfolio.market import fetch_market_data
+from ui.assets import LOOKUP_FIELDS, details_from_row, details_row
 
 
 class AssetDetailsTests(unittest.TestCase):
@@ -52,6 +53,22 @@ class AssetDetailsTests(unittest.TestCase):
         for value in (None, 0, .19, 100):
             self.assertEqual(AssetDetails(ter=value).ter, value)
 
+    def test_color_hue_is_optional_and_restricts_only_hue(self):
+        for value in (None, 0, 360, 123.456789):
+            self.assertEqual(AssetDetails(color_hue=value).color_hue, value)
+        for value in (-1, 361, float('nan'), float('inf'), True, 'blue'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'hue'):
+                AssetDetails(color_hue=value)
+
+    def test_manual_hue_is_not_a_metadata_lookup_requirement(self):
+        self.assertNotIn('color_hue', LOOKUP_FIELDS)
+        for hue in ('0', '123.456789', '360°', ''):
+            result = details_from_row({'color_hue': hue})
+            self.assertEqual(details_from_row(details_row(result)), result)
+        for hue in ('blue', '-1', '361', 'nan'):
+            with self.subTest(hue=hue), self.assertRaisesRegex(ValueError, 'hue'):
+                details_from_row({'color_hue': hue})
+
 
 class AssetDetailsStorageTests(unittest.TestCase):
     def setUp(self):
@@ -73,7 +90,7 @@ class AssetDetailsStorageTests(unittest.TestCase):
         with self.asset_path.open() as stream:
             row = next(csv.DictReader(stream))
         self.assertEqual(row['note'], 'Keep')
-        self.assertTrue(all(row[name] == '' for name in ('isin', 'exchange', 'currency', 'ter', 'name', 'ibkr_name')))
+        self.assertTrue(all(row[name] == '' for name in ('isin', 'exchange', 'currency', 'ter', 'name', 'ibkr_name', 'color_hue')))
         self.assertEqual(load_portfolio(self.directory), loaded)
 
     def test_existing_metadata_round_trips_with_arbitrary_extra_columns(self):
@@ -90,7 +107,7 @@ class AssetDetailsStorageTests(unittest.TestCase):
         with self.asset_path.open() as stream:
             row = next(csv.DictReader(stream))
         self.assertEqual(list(row), ['ticker', 'name', 'asset_group', 'isin', 'is_main', 'shares',
-                                     'ter', 'ibkr_id', 'exchange', 'currency', 'ibkr_name', 'note'])
+                                     'ter', 'ibkr_id', 'exchange', 'currency', 'ibkr_name', 'note', 'color_hue'])
         self.assertEqual(row['ibkr_id'], '123')
         self.assertEqual(row['note'], 'Keep')
         self.assertEqual(row['ter'], '0.0')
@@ -105,9 +122,17 @@ class AssetDetailsStorageTests(unittest.TestCase):
         save_portfolio(loaded, self.directory)
         self.assertEqual(load_portfolio(self.directory), loaded)
 
+    def test_manual_hue_round_trips_with_full_precision_and_can_be_cleared(self):
+        for hue in (123.456789, 0, 360, None):
+            updated = replace(self.portfolio, holdings=(replace(self.portfolio.holdings[0],
+                              details=AssetDetails(color_hue=hue)),))
+            save_portfolio(updated, self.directory)
+            self.assertEqual(load_portfolio(self.directory), updated)
+
     def test_invalid_saved_metadata_does_not_write_any_files(self):
         for column, value in (('isin', 'US0378331004'), ('ter', 'nan'), ('ter', '101'),
-                              ('ter', 'not a number'), ('currency', 'EURO')):
+                              ('ter', 'not a number'), ('currency', 'EURO'),
+                              ('color_hue', '-1'), ('color_hue', '361'), ('color_hue', 'nan')):
             self.asset_path.write_text(f'asset_group,ticker,is_main,shares,{column}\nStocks,A.L,True,2,{value}\n')
             original = {path: path.read_bytes() for path in self.directory.iterdir()}
             with self.subTest(column=column, value=value), self.assertRaises(ValueError):

@@ -9,14 +9,11 @@ import tkinter as tk
 from tkinter import font, ttk
 
 from ui.reporting import format_amount
+from ui.palette import PROJECTION_COLORS
+from ui.help import HELP, add_help, info_label
 from ui.theme import BACKGROUND, MUTED_TEXT, TEXT
 
 
-_COLORS = {
-    'Stock market': '#648ed0', 'MÁK': '#47a994', 'Cash': '#d9b458',
-    'Long-term investment': '#648ed0', 'Emergency fund': '#47a994',
-    'Planned expenses': '#b38acb', 'Monthly living costs': '#d9b458',
-}
 _STACK_ORDER = {
     'Portfolio': ('Cash', 'MÁK', 'Stock market'),
     'Purpose': ('Monthly living costs', 'Emergency fund', 'Planned expenses', 'Long-term investment'),
@@ -78,15 +75,17 @@ class ProjectionWindow(tk.Toplevel):
         self.rowconfigure(2, weight=1)
         controls = ttk.Frame(self, padding=(16, 12))
         controls.grid(row=0, column=0, sticky='ew')
-        ttk.Label(controls, text='Show').pack(side='left', padx=(0, 6))
+        info_label(controls, 'Show', HELP['projection_view']).pack(side='left', padx=(0, 6))
         selector = ttk.Combobox(controls, textvariable=self.view,
-                                values=('Portfolio', 'Purpose'), state='readonly', width=14)
+                                values=('Portfolio', 'Purpose', 'Net worth'), state='readonly', width=14)
         selector.pack(side='left')
         selector.bind('<<ComboboxSelected>>', self._change_view)
-        ttk.Label(controls, text='Horizon').pack(side='left', padx=(24, 6))
+        add_help(selector, HELP['projection_view'])
+        info_label(controls, 'Horizon', HELP['projection_horizon']).pack(side='left', padx=(24, 6))
         horizon = ttk.Spinbox(controls, textvariable=self.years, from_=1, to=100, width=5,
                               command=self.refresh, justify='right')
         horizon.pack(side='left')
+        add_help(horizon, HELP['projection_horizon'])
         horizon.bind('<Return>', lambda _event: self.refresh())
         horizon.bind('<FocusOut>', lambda _event: self.refresh())
         ttk.Label(controls, text='years').pack(side='left', padx=6)
@@ -123,6 +122,8 @@ class ProjectionWindow(tk.Toplevel):
     def _series(self):
         if self._projection is None:
             return {}
+        if self.view.get() == 'Net worth':
+            return self._projection.net_worth
         values = self._projection.portfolio if self.view.get() == 'Portfolio' else self._projection.purpose
         return {name: values[name] for name in _STACK_ORDER[self.view.get()]}
 
@@ -133,7 +134,7 @@ class ProjectionWindow(tk.Toplevel):
             item = ttk.Frame(self.legend)
             item.grid(row=0, column=index, padx=(0, 20), sticky='w')
             swatch = tk.Canvas(item, width=12, height=12, background=BACKGROUND, highlightthickness=0)
-            swatch.create_rectangle(0, 0, 12, 12, fill=_COLORS[name], outline='')
+            swatch.create_rectangle(0, 0, 12, 12, fill=PROJECTION_COLORS[name], outline='')
             swatch.pack(side='left', padx=(0, 7))
             ttk.Label(item, text=name).pack(side='left')
 
@@ -148,9 +149,17 @@ class ProjectionWindow(tk.Toplevel):
         if width < 150 or height < 100:
             return
         series = self._series()
-        totals = [fsum(parts) for parts in zip(*series.values())]
-        maximum = self._scale(max(totals, default=0))
-        label_width = font.nametofont('TkDefaultFont').measure(format_amount(maximum))
+        if not series:
+            self.canvas.create_text(width / 2, height / 2,
+                                    text='Add a property, pension or loan to see the net-worth projection.', fill=TEXT)
+            self.readout.set('')
+            self.details.set('')
+            return
+        lines = self.view.get() == 'Net worth'
+        values = [value for parts in series.values() for value in parts] if lines else [fsum(parts) for parts in zip(*series.values())]
+        maximum = self._scale(max(values, default=0))
+        minimum = -self._scale(-min(values)) if lines and min(values) < 0 else 0
+        label_width = max(font.nametofont('TkDefaultFont').measure(format_amount(value)) for value in (minimum, maximum))
         if label_width + 144 >= width:
             self.canvas.create_text(width / 2, height / 2, text='Projected values are too large to display. '
                                     'Reduce the horizon or expected returns.', width=max(100, width - 100),
@@ -163,22 +172,30 @@ class ProjectionWindow(tk.Toplevel):
         days = [day.toordinal() for day in self._projection.dates]
         span = max(1, days[-1] - days[0])
         self._xs = [left + (day - days[0]) / span * (right - left) for day in days]
-        y = lambda value: bottom - value / maximum * (bottom - top)
-        self._axes(maximum, days, y)
+        y = lambda value: bottom - (value - minimum) / (maximum - minimum) * (bottom - top)
+        self._axes(maximum, days, y, minimum=minimum)
+        if lines:
+            for name, values in series.items():
+                points = [coordinate for x, value in zip(self._xs, values) for coordinate in (x, y(value))]
+                if len(points) >= 4:
+                    self.canvas.create_line(points, fill=PROJECTION_COLORS[name], width=3 if name == 'Net worth' else 2,
+                                            tags=('series', name))
+            self._read_point(-1)
+            return
         lower = [0.] * len(days)
         for name, values in series.items():
             upper = [a + b for a, b in zip(lower, values)]
             points = [(x, y(value)) for x, value in zip(self._xs, upper)]
             points.extend((x, y(value)) for x, value in reversed(list(zip(self._xs, lower))))
-            self.canvas.create_polygon(points, fill=_COLORS[name], outline='', tags=('area', name))
+            self.canvas.create_polygon(points, fill=PROJECTION_COLORS[name], outline='', tags=('area', name))
             lower = upper
         self._read_point(-1)
 
-    def _axes(self, maximum, days, y):
+    def _axes(self, maximum, days, y, *, minimum=0):
         left, top, right, bottom = self._bounds
         self.canvas.create_text(left, 10, text=self._projection.currency, anchor='w', fill=MUTED_TEXT, tags='axis')
         for index in range(5):
-            value = maximum * (index / 4)
+            value = minimum + (maximum - minimum) * (index / 4)
             self.canvas.create_line(left, y(value), right, y(value), fill='#454b55', tags='grid')
             self.canvas.create_text(left - 10, y(value), text=format_amount(value),
                                     anchor='e', fill=MUTED_TEXT, tags='axis')
@@ -219,8 +236,8 @@ class ProjectionWindow(tk.Toplevel):
         self._point = index % len(self._xs)
         values = {name: amounts[index] for name, amounts in self._series().items()}
         currency = self._projection.currency
-        self.readout.set(f'{self._projection.dates[index]:%Y-%m-%d} · '
-                         f'{format_amount(fsum(values.values()))} {currency}')
+        total = values['Net worth'] if self.view.get() == 'Net worth' else fsum(values.values())
+        self.readout.set(f'{self._projection.dates[index]:%Y-%m-%d} · {format_amount(total)} {currency}')
         self.details.set('  ·  '.join(f'{name}: {format_amount(value)} {currency}' for name, value in values.items()))
 
     def _wrap_footer(self, event):

@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from ui.theme import BACKGROUND, MUTED_TEXT
+from ui.palette import hue_color
 from ui.widgets import AutoScrollbar
 
 
@@ -35,12 +36,14 @@ class PieChart(ttk.Frame):
         self._empty_message = "No holdings"
 
     def set_data(self, values, colors, empty_message="No holdings", *, percent_values=False):
-        """Normalize slice geometry; optionally label values already expressed in percent."""
+        """Use palette order for slices; values only determine their geometry."""
         data = {str(key): float(value) for key, value in values.items()}
         if any(not math.isfinite(value) or value < 0 for value in data.values()):
             raise ValueError("Chart values must be finite and nonnegative.")
-        self._data = data
         self._colors = {str(key): color for key, color in colors.items()}
+        order = [key for key in self._colors if key in data]
+        order.extend(sorted(data.keys() - self._colors.keys(), key=lambda key: (key.casefold(), key)))
+        self._data = data = {key: data[key] for key in order}
         self._empty_message = empty_message
         scale = max(data.values(), default=0)
         total = math.fsum(value / scale for value in data.values()) if scale else 0
@@ -66,7 +69,7 @@ class PieChart(ttk.Frame):
         self._draw()
 
     def _color(self, key):
-        return self._colors.get(key, "#64748b")
+        return self._colors.get(key, hue_color(230))
 
     def _bind_scroll(self, widget):
         widget.bind("<MouseWheel>", lambda event: self._scroll_legend(-1 if event.delta > 0 else 1))

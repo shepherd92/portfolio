@@ -1,7 +1,8 @@
 """Human-readable recommendations shared by the GUI and command line."""
 
 from decimal import Decimal, InvalidOperation
-from math import fsum
+from dataclasses import dataclass
+from math import fsum, ulp
 
 from portfolio.models import CASH, TREASURY
 
@@ -30,6 +31,57 @@ def format_amount(value, places=0):
 
 def format_percent(value):
     return f"{format_amount(value, 2).rstrip('0').rstrip('.')}%"
+
+
+@dataclass(frozen=True)
+class TransactionLedger:
+    purchases: float
+    proceeds: float
+    cash_change: float
+    paid: float
+    received: float
+    balanced: bool
+
+    @property
+    def display_paid(self):
+        return max(self.purchases, self.proceeds) if self.balanced else self.paid
+
+    @property
+    def display_received(self):
+        return self.display_paid if self.balanced else self.received
+
+    @property
+    def display_cash_change(self):
+        return self.purchases - self.proceeds if self.balanced else self.cash_change
+
+
+def accounting_tolerance(values):
+    """Allow arithmetic roundoff, never more than 0.00001 currency units."""
+    return min(1e-5, max(1e-12, 4 * fsum(ulp(value) for value in values)))
+
+
+def transaction_ledger(plan, portfolio, market):
+    """Reconcile actual cash and trade legs in the plan's base currency.
+
+    Preserve raw totals; normalize display-only roundoff around half-unit ties.
+    Both FX legs count. The cash adjustment is bookkeeping, not another trade.
+    """
+    base_rate = market.value(1, plan.base_currency)
+    value = lambda amount, currency: market.value(amount, currency) / base_rate
+    costs = [*(value(t.shares * t.price, t.currency) for t in plan.trades),
+             *(value(t.amount, t.currency) for t in plan.manual_trades)]
+    purchases = [*(cost for cost in costs if cost > 0),
+                 *(value(fx.from_amount, fx.from_currency) for fx in plan.conversions)]
+    proceeds = [*(-cost for cost in costs if cost < 0),
+                *(value(fx.to_amount, fx.to_currency) for fx in plan.conversions)]
+    opening = [value(amount, currency) for currency, amount in portfolio.cash.items()]
+    ending = [value(amount, currency) for currency, amount in plan.cash.items()]
+    cash_change = fsum(opening) - fsum(ending)
+    paid = fsum([*purchases, max(0., -cash_change)])
+    received = fsum([*proceeds, max(0., cash_change)])
+    roundoff = accounting_tolerance((*purchases, *proceeds, *opening, *ending, paid, received))
+    return TransactionLedger(fsum(purchases), fsum(proceeds), cash_change, paid, received,
+                             abs(paid - received) <= roundoff)
 
 
 def format_plan(plan, targets):

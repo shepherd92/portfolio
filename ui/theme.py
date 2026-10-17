@@ -35,8 +35,6 @@ def configure_theme(root):
     style.map('.', foreground=[('disabled', MUTED_TEXT)])
     for name in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label', 'TNotebook'):
         style.configure(name, background=BACKGROUND, foreground=TEXT)
-    for name in ('Trading.TFrame', 'Trading.TLabel'):
-        style.configure(name, background=_SURFACE)
     style.configure('Heading.TLabel', font=('DejaVu Sans', 12, 'bold'))
     style.configure('TSeparator', background=_BORDER)
 
@@ -75,6 +73,8 @@ def configure_theme(root):
               foreground=[('disabled', MUTED_TEXT), ('selected', TEXT), ('active', TEXT)],
               padding=[('selected', (14, 8))],
               lightcolor=[('selected', _BORDER), ('!selected', _BORDER)])
+    style.configure('Portfolio.TNotebook', tabposition='wn')
+    style.configure('Portfolio.TNotebook.Tab', padding=(12, 10), width=13, anchor='w')
     for direction in ('Horizontal', 'Vertical'):
         style.configure(f'{direction}.TScrollbar', background=_BORDER, troughcolor=BACKGROUND,
                         arrowcolor=TEXT, gripcount=0)

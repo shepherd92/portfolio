@@ -98,7 +98,9 @@ class AssetLinksPricesTests(unittest.TestCase):
         return SimpleNamespace(x=x + width // 2, y=y + height // 2, widget=tree)
 
     def show_assets(self):
-        self.app.notebook.select(self.app.assets_page)
+        self.app.notebook.select(self.app.portfolio_page)
+        self.app.portfolio_notebook.select(self.app.stock_page)
+        self.app.stock_notebook.select(self.app.assets_page)
         self.root.update()
         return self.app.assets_table
 
@@ -125,6 +127,7 @@ class AssetLinksPricesTests(unittest.TestCase):
             self.assertFalse(open_cell_link(SimpleNamespace(x=event.x, y=2), tree, links))
             self.assertFalse(open_cell_link(SimpleNamespace(x=event.x, y=tree.winfo_height() - 5), tree, links))
             self.app.notebook.select(self.app.portfolio_page)
+            self.app.portfolio_notebook.select(self.app.summary_page)
             self.root.update()
             view = self.app.real_allocations
             tree = view.tree
@@ -140,7 +143,9 @@ class AssetLinksPricesTests(unittest.TestCase):
             browser.assert_not_called()
 
     def test_representative_and_home_security_cells_open_yahoo(self):
-        self.app.notebook.select(self.app.classes_page)
+        self.app.notebook.select(self.app.portfolio_page)
+        self.app.portfolio_notebook.select(self.app.stock_page)
+        self.app.stock_notebook.select(self.app.classes_page)
         table = self.app.class_table
         item = table.tree.get_children()[0]
         with patch('webbrowser.open_new_tab') as browser, patch.object(table, '_edit') as edit:
@@ -148,6 +153,7 @@ class AssetLinksPricesTests(unittest.TestCase):
             browser.assert_called_once_with(quote_url('MAIN'))
             edit.assert_not_called()
         self.app.notebook.select(self.app.portfolio_page)
+        self.app.portfolio_notebook.select(self.app.summary_page)
         view = self.app.real_allocations
         item = next(item for item, (table, source) in view._sources.items()
                     if table is self.app.holdings_table and table.row(source)['ticker'] == 'OLD')

@@ -1,280 +1,139 @@
-"""Editable portfolio percentages with read-only category totals."""
+"""Three category totals backed by the canonical absolute allocation targets."""
 
-import tkinter as tk
-from math import fsum, isclose
-from tkinter import messagebox, ttk
+from math import fsum
+from tkinter import ttk
 
-from ui.reporting import plain_number, format_percent
+from portfolio.models import ALLOCATION_BRANCHES, AllocationTargets, allocation_name, percentage
+from ui.help import add_help
+from ui.reporting import format_percent
 from ui.sorting import TreeSort
-from ui.widgets import AutoScrollbar, PercentEntry, bind_shortcuts, retain_visible_selection, shade_allocation_groups, show_modal
-from portfolio.models import (ALLOCATION_BRANCHES, MARKET_CATEGORIES, AllocationTargets, CASH, STOCK_MARKET, TREASURY,
-                              allocation_name, currency_code, percentage)
+from ui.theme import ALTERNATE_BACKGROUND
+from ui.widgets import AutoScrollbar, bind_shortcuts, retain_visible_selection
 
 
 class AllocationEditor(ttk.Frame):
-    """Keep all configured leaves while displaying only positive targets."""
+    """Edit category totals without exposing or duplicating their underlying mixes."""
 
-    def __init__(self, parent, *, on_change=None, currency_choices=None, height=9):
+    def __init__(self, parent, *, on_change=None, height=9, controls=None):
         super().__init__(parent)
         self.on_change = on_change
-        self.currency_choices = currency_choices or (lambda: ('EUR', 'GBP', 'HUF', 'USD'))
-        self._enabled, self._scope = True, 'All'
-        self._rows, self._roots = {}, {}
-        self._categories, self._category_items, self._totals = {}, {}, {}
+        self._enabled = True
+        self._rows, self._categories, self._values = [], {}, {}
+        self._overview = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(self, columns=('total',), selectmode='browse', height=height)
+        self.tree = ttk.Treeview(self, columns=('total', 'overall'), selectmode='browse', height=height)
         self.tree.heading('#0', text='Asset class')
-        self.tree.heading('total', text='Portfolio')
+        self.tree.heading('total', text='Investments')
+        self.tree.heading('overall', text='All assets')
         self.tree.column('#0', width=200, minwidth=110)
-        self.tree.column('total', width=100, minwidth=90, anchor='e')
-        self.sorting = TreeSort(self.tree, numeric_columns=('total',), value=self._sort_value,
-                                on_sort=lambda: shade_allocation_groups(self.tree))
+        for column in ('total', 'overall'):
+            self.tree.column(column, width=110, minwidth=110 if column == 'total' else 90, anchor='e')
+        self.tree.tag_configure('alternate', background=ALTERNATE_BACKGROUND)
         self.tree.grid(row=0, column=0, sticky='nsew')
         scrollbar = AutoScrollbar(self, orient='vertical', command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky='ns')
         self.tree.configure(yscrollcommand=scrollbar.set)
-        controls = ttk.Frame(self)
-        controls.grid(row=1, column=0, sticky='w', pady=(7, 0))
-        self.add_button = ttk.Button(controls, text='Add', command=self._add)
-        self.edit_button = ttk.Button(controls, text='Edit', command=self._edit)
-        self.remove_button = ttk.Button(controls, text='Remove', command=self._remove)
-        for button in (self.add_button, self.edit_button, self.remove_button):
-            button.pack(side='left', padx=(0, 5))
+        self._roots = {name: self.tree.insert('', 'end', text=name) for name in ALLOCATION_BRANCHES}
+        self._fixed = {name: self.tree.insert('', 'end', text=name) for name in ('Properties', 'Pension funds')}
+        self.sorting = TreeSort(self.tree, numeric_columns=('total', 'overall'), value=self._sort_value,
+                                on_sort=self._shade)
+        self.edit_button = ttk.Button(controls if controls is not None else self,
+                                      text='Edit targets' if controls is not None else 'Edit', command=self._edit)
+        if controls is not None:
+            self.edit_button.pack(side='left', padx=(0, 8))
+        else:
+            self.edit_button.grid(row=1, column=0, sticky='w', pady=(7, 0))
+        add_help(self.edit_button, 'Set Stock market, MÁK and Cash targets together. '
+                 'Edit the mix within each category on its own page.')
         self.tree.bind('<Double-1>', self._double_click)
-        self.tree.bind('<<TreeviewSelect>>', self._update_buttons)
-        bind_shortcuts(self.tree, {'<Return>': self._edit, '<F2>': self._edit,
-                                  '<Insert>': self._add, '<Delete>': self._remove})
-        self._update_buttons()
+        self.tree.bind('<<TreeviewSelect>>', self._update_button)
+        bind_shortcuts(self.tree, {'<Return>': self._edit, '<F2>': self._edit})
+        self.set_rows([])
 
     def get_rows(self):
-        """Return configured leaves, including zero targets hidden from the tree."""
-        return [dict(row) for row in self._rows.values()]
+        """Return every canonical leaf, including zero targets, at full precision."""
+        return [dict(row) for row in self._rows]
 
     def set_rows(self, rows):
         normalized, identities = [], set()
         for row in rows:
-            parent = row['parent']
-            group = allocation_name(parent, row['group'])
+            parent, group = row['parent'], allocation_name(row['parent'], row['group'])
             _percentage(row['target'])
-            identity = parent, group
-            if identity in identities:
+            if (parent, group) in identities:
                 raise ValueError(f'Duplicate allocation: {group!r} in {parent}.')
-            identities.add(identity)
+            identities.add((parent, group))
             normalized.append({'parent': parent, 'group': group, 'target': str(row['target'])})
-        self._render(normalized)
+        self._rows = normalized
+        self._refresh()
 
     def allocation(self):
-        return AllocationTargets({parent: {row['group']: _percentage(row['target']) for row in self._rows.values()
+        return AllocationTargets({parent: {row['group']: _percentage(row['target']) for row in self._rows
                                             if row['parent'] == parent} for parent in ALLOCATION_BRANCHES},
                                  self._categories)
 
     def set_categories(self, categories):
-        if self._categories != categories:
-            self._categories = dict(categories)
-            selected = self._rows.get(next(iter(self.tree.selection()), None))
-            self._render(self.get_rows(), (selected['parent'], selected['group']) if selected else None)
+        self._categories = dict(categories)
+        self._refresh()
+
+    def set_overview(self, overview):
+        self._overview = overview
+        self._refresh()
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
-        self._update_buttons()
-
-    def set_scope(self, scope):
-        if scope not in ('All', *ALLOCATION_BRANCHES):
-            raise ValueError(f'Unknown allocation scope: {scope!r}.')
-        self._scope = scope
-        self._filter_rows()
-
-    def _update_buttons(self, _event=None):
-        selected = next(iter(self.tree.selection()), None)
-        editable = self._enabled and self._editable(self._rows.get(selected))
-        self.add_button.configure(state='normal' if self._enabled else 'disabled')
-        for button in (self.edit_button, self.remove_button):
-            button.configure(state='normal' if editable else 'disabled')
-
-    def _in_scope(self, parent):
-        return self._scope == 'All' or parent == self._scope
-
-    def _editable(self, row):
-        return row is not None and self._in_scope(row['parent']) and float(row['target']) > 0
+        self._update_button()
 
     def _sort_value(self, item, column):
-        if column == '#0':
-            return self.tree.item(item, 'text')
-        if item in self._rows:
-            return self._rows[item]['target']
-        return self._totals[item]
+        return self.tree.item(item, 'text') if column == '#0' else self._values[item][column]
 
-    def _filter_rows(self):
-        for parent, item in self._roots.items():
-            if self._in_scope(parent):
+    def _refresh(self):
+        overview = self._overview
+        overall = {}
+        if overview is not None and overview.assets_total:
+            overall = {name: value / overview.assets_total * 100 for name, value in overview.allocations.items()
+                       if name in self._fixed}
+            try:
+                overall.update({name: value / overview.assets_total * 100
+                                for name, value in overview.target_values(self.allocation()).items()})
+            except ValueError:
+                pass
+        for name, item in {**self._roots, **self._fixed}.items():
+            total = (fsum(float(row['target']) for row in self._rows if row['parent'] == name)
+                     if name in self._roots else None)
+            self._values[item] = {'total': total, 'overall': overall.get(name)}
+            self.tree.item(item, values=tuple('—' if value is None else format_percent(value)
+                                            for value in self._values[item].values()))
+        for _, item in sorted(self._roots.items(), key=lambda pair: (-self._values[pair[1]]['total'], pair[0])):
+            self.tree.move(item, '', 'end')
+        for name, item in self._fixed.items():
+            if overview is not None and overview.allocations.get(name, 0) > 0:
                 self.tree.move(item, '', 'end')
-            else:
-                self.tree.detach(item)
-        for item, row in self._rows.items():
-            if self._editable(row):
-                parent = (self._category_items[self._categories.get(row['group']) or 'Unclassified']
-                          if row['parent'] == STOCK_MARKET else self._roots[row['parent']])
-                self.tree.move(item, parent, 'end')
             else:
                 self.tree.detach(item)
         self.sorting.apply()
         retain_visible_selection(self.tree)
-        self._update_buttons()
+        self._update_button()
 
-    def _render(self, rows, selected=None):
-        expanded = {parent: self.tree.item(item, 'open') for parent, item in self._roots.items()}
-        category_expanded = {name: self.tree.item(item, 'open') for name, item in self._category_items.items()}
-        for item in (*self._rows, *self._roots.values()):
-            if self.tree.exists(item):
-                self.tree.delete(item)
-        self._rows.clear()
-        self._roots.clear()
-        self._category_items.clear()
-        self._totals.clear()
-        totals = {parent: fsum(float(row['target']) for row in rows if row['parent'] == parent)
-                  for parent in ALLOCATION_BRANCHES}
-        for parent in sorted(totals, key=lambda name: (-totals[name], name)):
-            root = self.tree.insert('', 'end', text=parent, values=(format_percent(totals[parent]),),
-                                    open=expanded.get(parent, True), tags=('category',))
-            self._roots[parent] = root
-            self._totals[root] = totals[parent]
-            children = sorted((row for row in rows if row['parent'] == parent),
-                              key=lambda row: (-float(row['target']), row['group']))
-            if parent == STOCK_MARKET:
-                category_totals = {name: 0. for name in MARKET_CATEGORIES}
-                for row in children:
-                    if float(row['target']):
-                        name = self._categories.get(row['group']) or 'Unclassified'
-                        category_totals[name] = category_totals.get(name, 0.) + float(row['target'])
-                for name in sorted(category_totals, key=lambda name: (-category_totals[name], name)):
-                    item = self.tree.insert(root, 'end', text=name,
-                                            values=(format_percent(category_totals[name]),),
-                                            open=category_expanded.get(name, True), tags=('category',))
-                    self._category_items[name] = item
-                    self._totals[item] = category_totals[name]
-            for row in children:
-                item = self.tree.insert(root, 'end', text=row['group'], values=(format_percent(row["target"]),))
-                self._rows[item] = dict(row)
-                if (row['parent'], row['group']) == selected:
-                    self.tree.selection_set(item)
-                    self.tree.focus(item)
-        self._filter_rows()
+    def _shade(self):
+        for index, item in enumerate(self.tree.get_children()):
+            self.tree.item(item, tags=('alternate',) if index % 2 else ())
 
-    def _set_target(self, item, value):
-        row = self._rows.get(item)
-        if self._enabled and row is not None:
-            self._save_target(row, value)
-
-    def _save_target(self, row, value):
-        target = _percentage(value)
-        if float(row['target']) == target:
-            return
-        identity = row['parent'], row['group']
-        rows = [item for item in self.get_rows() if (item['parent'], item['group']) != identity]
-        rows.append(dict(row, target=str(target)))
-        self._render(rows, identity)
-        if self.on_change:
-            self.on_change()
-
-    def _remove(self):
-        selected = next(iter(self.tree.selection()), None)
-        if self._editable(self._rows.get(selected)):
-            self._set_target(selected, 0)
-
-    def _add(self):
-        if not self._enabled:
-            return
-        rows = self.get_rows()
-        known = {(row['parent'], row['group']) for row in rows}
-        for parent, currencies in ((TREASURY, ('EUR', 'HUF')), (CASH, self.currency_choices())):
-            rows.extend({'parent': parent, 'group': currency_code(currency), 'target': '0'}
-                        for currency in currencies if (parent, currency_code(currency)) not in known)
-        candidates = [row for row in rows if self._in_scope(row['parent']) and not float(row['target'])]
-        if candidates:
-            self._target_dialog(candidates, adding=True)
-        else:
-            messagebox.showinfo('Add allocation', 'All configured allocations are active.\n'
-                                'Configure stock classes on the Asset classes page.', parent=self)
+    def _update_button(self, _event=None):
+        fixed_selected = any(item in self._fixed.values() for item in self.tree.selection())
+        self.edit_button.configure(state='normal' if self._enabled and not fixed_selected else 'disabled')
 
     def _double_click(self, event):
-        if self.tree.identify_element(event.x, event.y).endswith('indicator'):
-            return
         item = self.tree.identify_row(event.y)
-        if item in self._rows:
+        if item in self._roots.values():
             self.tree.selection_set(item)
-            self._edit(item)
+            self._edit()
             return 'break'
 
-    def _edit(self, item=None):
-        item = item or next(iter(self.tree.selection()), None)
-        row = self._rows.get(item)
-        if self._enabled and self._editable(row):
-            self._target_dialog([row])
-
-    def _target_dialog(self, candidates, *, adding=False):
-        if any(isinstance(child, tk.Toplevel) for child in self.winfo_children()):
-            return
-        dialog = tk.Toplevel(self)
-        dialog.title('Add allocation' if adding else f'Target: {candidates[0]["group"]}')
-        dialog.resizable(False, False)
-        form = ttk.Frame(dialog, padding=16)
-        form.pack(fill='both', expand=True)
-        if adding:
-            choice = ttk.Combobox(form, values=[f'{row["parent"]} / {row["group"]}' for row in candidates],
-                                  state='readonly', width=32)
-            choice.current(0)
-            choice.pack(fill='x', pady=(0, 8))
-        ttk.Label(form, text='Percentage of the long-term allocation').pack(anchor='w')
-        value = tk.StringVar(value='' if adding else plain_number(candidates[0]['target']))
-        editor = PercentEntry(form, textvariable=value, width=24)
-        editor.pack(fill='x', pady=8)
-        helper = ttk.Label(form, justify='left', wraplength=360)
-        helper.pack(anchor='w', pady=(0, 12))
-        total = fsum(float(row['target']) for row in self._rows.values())
-
-        def describe(*_):
-            selected = candidates[choice.current() if adding else 0]
-            try:
-                remaining = 100 - total + float(selected['target']) - _percentage(value.get())
-            except ValueError:
-                helper.configure(text='Enter 0–100%. All allocations together must total 100%.')
-                return
-            adjustment = ('complete' if isclose(remaining, 0, abs_tol=1e-8, rel_tol=0)
-                          else f'{"add" if remaining > 0 else "reduce by"} {format_percent(abs(remaining))}')
-            helper.configure(text=f'Long-term total after edit: {format_percent(100 - remaining)} — {adjustment}')
-
-        describe()
-        value.trace_add('write', describe)
-        if adding:
-            choice.bind('<<ComboboxSelected>>', describe)
-
-        def accept(_event=None):
-            if not self._enabled:
-                dialog.destroy()
-                return 'break'
-            try:
-                target = _percentage(value.get())
-                if adding and target == 0:
-                    raise ValueError('An added allocation needs a target greater than zero.')
-                self._save_target(candidates[choice.current() if adding else 0], target)
-            except ValueError as error:
-                messagebox.showerror('Invalid target', str(error), parent=dialog)
-                editor.focus_set()
-                return 'break'
-            dialog.destroy()
-            return 'break'
-
-        buttons = ttk.Frame(form)
-        buttons.pack(anchor='e')
-        ttk.Button(buttons, text='Cancel', command=dialog.destroy).pack(side='left', padx=6)
-        ttk.Button(buttons, text='Save', command=accept).pack(side='left')
-        dialog.bind('<Return>', accept)
-        dialog.bind('<Escape>', lambda _event: dialog.destroy())
-        editor.selection_range(0, 'end')
-        show_modal(dialog, editor)
-        if self.tree.winfo_exists():
-            self.tree.focus_set()
+    def _edit(self):
+        if self._enabled and not any(item in self._fixed.values() for item in self.tree.selection()):
+            from ui.target_mix import edit_mix
+            edit_mix(self, self)
 
 
 def _percentage(value):
@@ -285,4 +144,3 @@ def _percentage(value):
     except (ValueError, TypeError, OverflowError) as error:
         raise ValueError('Target percentage must be a finite number.') from error
     return percentage(value)
-

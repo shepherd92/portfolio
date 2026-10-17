@@ -1,6 +1,7 @@
 """Automatic market-data refresh and planning use no external network in tests."""
 
 from dataclasses import replace
+from portfolio.calculator import CashFlow
 from datetime import date, datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -89,7 +90,7 @@ class AutomaticPricesTests(unittest.TestCase):
                 self.fetch.reset_mock()
                 self.app.generate_plan()
                 self.finish_worker()
-                self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',))
+                self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',), cache=self.app.market_cache)
                 self.assertIs(self.app.market, self.market)
                 self.assertIsNotNone(self.app.plan)
                 self.assertIn('Plan ready', self.app.status.get())
@@ -112,14 +113,14 @@ class AutomaticPricesTests(unittest.TestCase):
         self.fetch.return_value = MarketData(self.market.quotes, {'HUF': .0025})
         self.app.generate_plan()
         self.finish_worker()
-        self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',))
+        self.fetch.assert_called_once_with(portfolio, 'EUR', extra_currencies=('HUF',), cache=self.app.market_cache)
         self.assertIsNotNone(self.app.plan)
         self.assertEqual(self.app.portfolio().cash, {'EUR': 10, 'HUF': 4000})
         self.errors.assert_not_called()
 
     def test_native_income_quotes_refresh_display_without_rewriting_saved_income(self):
         calculator = self.app.calculator
-        native = replace(calculator.settings(), monthly_income=100.25, income_currency='USD')
+        native = replace(calculator.settings(), incomes=(CashFlow('Salary', 100.25, datetime.now().date(), 'USD', 'monthly'),))
         calculator._set_inputs(native)
         calculator._changed()
         self.assertTrue(calculator.save())
@@ -130,10 +131,10 @@ class AutomaticPricesTests(unittest.TestCase):
             self.app.next_price_refresh = 100
             self.app._refresh_due_prices()
             self.finish_worker()
-        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF', 'USD'))
-        self.assertAlmostEqual(float(calculator._inputs['monthly_income'].get()), 90.225)
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF', 'USD'), cache=self.app.market_cache)
+        self.assertEqual(calculator.monthly_summary.set('Income', 'recurring'), '90')
         self.app._accept_market(replace(self.market, rates={'EUR': 1, 'HUF': .0025, 'USD': .95}))
-        self.assertAlmostEqual(float(calculator._inputs['monthly_income'].get()), 95.2375)
+        self.assertEqual(calculator.monthly_summary.set('Income', 'recurring'), '95')
         self.assertEqual(calculator.settings(), native)
         self.assertEqual((self.app.directory / 'calculator.json').read_bytes(), original)
         self.assertFalse(calculator.dirty)
@@ -237,10 +238,10 @@ class AutomaticPricesTests(unittest.TestCase):
             self.app.next_price_refresh = 100
             self.app._refresh_due_prices()
             self.finish_worker()
-        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',))
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',), cache=self.app.market_cache)
         self.assertIs(self.app.market, updated)
         self.assertNotEqual(self.app.source.get(), source)
-        self.assertIn('50 EUR', self.app.current_title.get())
+        self.assertEqual(sum(self.app.current_chart._data.values()), 50)
         self.assertEqual(self.app.calculator.portfolio_value.get(), '50')
         self.assertEqual(self.app._calculator_total(), 20_000)
         self.assertFalse(self.app.calculator.dirty)
@@ -275,7 +276,7 @@ class AutomaticPricesTests(unittest.TestCase):
         with patch('ui.app.monotonic', return_value=100.5):
             self.app._refresh_due_prices()
             self.finish_worker()
-        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',))
+        self.fetch.assert_called_once_with(self.app.portfolio(), 'EUR', extra_currencies=('HUF',), cache=self.app.market_cache)
         self.assertEqual(self.app.market.price('NEW'), 5)
         self.errors.assert_not_called()
 
@@ -299,10 +300,11 @@ class AutomaticPricesTests(unittest.TestCase):
                 with patch('ui.app.monotonic', return_value=1000 + index * 900):
                     self.app._update_calculator()
                     self.finish_worker()
-                    self.rate.assert_called_once_with()
-                    self.assertEqual(self.app.next_base_rate_refresh, 1900 + index * 900)
+                    self.rate.assert_called_once_with(cache=self.app.market_cache)
+                    self.assertGreater(self.app.next_base_rate_refresh, 1890 + index * 900)
+                    self.assertLessEqual(self.app.next_base_rate_refresh, 1900 + index * 900)
                     self.app._update_calculator()
-                    self.rate.assert_called_once_with()
+                    self.rate.assert_called_once_with(cache=self.app.market_cache)
                 self.rate.reset_mock()
         self.errors.assert_not_called()
 
@@ -322,8 +324,9 @@ class AutomaticPricesTests(unittest.TestCase):
                 dialog.destroy()
                 self.app._update_calculator()
                 self.finish_worker()
-                self.rate.assert_called_once_with()
-                self.assertEqual(self.app.next_base_rate_refresh, 1000)
+                self.rate.assert_called_once_with(cache=self.app.market_cache)
+                self.assertGreater(self.app.next_base_rate_refresh, 990)
+                self.assertLessEqual(self.app.next_base_rate_refresh, 1000)
         finally:
             self.app.busy = False
             if dialog.winfo_exists():
@@ -340,7 +343,7 @@ class AutomaticPricesTests(unittest.TestCase):
             self.finish_worker()
             self.app._update_calculator()
             self.assertEqual(self.app.next_base_rate_refresh, 1000)
-        self.rate.assert_called_once_with()
+        self.rate.assert_called_once_with(cache=self.app.market_cache)
         self.errors.assert_not_called()
         self.assertEqual(self.app.calculator.planning_settings().returns.mak, 5)
         self.assertIn('cached', self.app.calculator.rate_description)
@@ -359,7 +362,7 @@ class AutomaticPricesTests(unittest.TestCase):
             self.app.next_base_rate_refresh = 100
             self.app._update_calculator()
             self.finish_worker()
-        self.rate.assert_called_once_with()
+        self.rate.assert_called_once_with(cache=self.app.market_cache)
         self.assertEqual(self.app.calculator.planning_settings().returns.mak, 6.25)
         self.assertIn('6.25%', self.app.calculator.rate_description)
         self.assertIs(self.app.plan, plan)

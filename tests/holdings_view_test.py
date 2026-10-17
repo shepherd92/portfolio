@@ -36,6 +36,12 @@ class HoldingsViewTests(unittest.TestCase):
     def source_rows(self):
         return {category: table.get_rows() for category, table in self.tables.items()}
 
+    def category_view(self, category):
+        self.view = HoldingsView(self.root, category=category)
+        self.view.set_tables({category: self.tables[category]})
+        self.view.set_categories({'US': 'Equities', 'EU': 'Equities'})
+        return self.view
+
     def select(self, category, index=0):
         table = self.tables[category]
         source = table, table.tree.get_children()[index]
@@ -43,21 +49,101 @@ class HoldingsViewTests(unittest.TestCase):
         self.view.tree.selection_set(item)
         return source
 
-    def test_scope_change_moves_keyboard_focus_out_of_hidden_stock_rows(self):
-        tree = self.view.tree
-        self.select(STOCK_MARKET)
+    def test_refresh_clears_selection_and_focus_for_replaced_source(self):
+        tree = self.category_view(CASH).tree
+        self.select(CASH)
         tree.focus(tree.selection()[0])
-        self.view.set_scope(CASH)
+        self.tables[CASH].set_rows([{'currency': 'USD', 'amount': '5'}])
+        self.view.refresh()
         self.assertFalse(tree.selection())
-        self.assertEqual(tree.focus(), self.view._branches[CASH,])
+        self.assertFalse(tree.focus())
+
+    def test_category_page_omits_stock_root_without_changing_sources_or_editing(self):
+        self.category_view(STOCK_MARKET)
+        self.view.set_categories({'US': 'Equities', 'EU': 'Bonds'})
+        tree = self.view.tree
+        before = self.source_rows()
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children()], ['Equities', 'Bonds'])
+        table, source = self.select(STOCK_MARKET, 2)
+        self.view.sorting.sort('#0')
+        self.view.refresh()
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children()], ['Bonds', 'Equities'])
+        self.assertEqual(self.view._sources[tree.selection()[0]], (table, source))
+        with patch.object(table, 'edit_selected') as edit:
+            self.view._edit_selected()
+        edit.assert_called_once_with()
+        self.assertEqual(table.tree.selection(), (source,))
+        self.assertEqual(self.source_rows(), before)
+        self.assertNotIn((STOCK_MARKET,), self.view._branches)
+        self.assertEqual(len(self.view._sources), 3)
+
+    def test_currency_pages_omit_outer_root_and_restore_selection_after_refresh(self):
+        before = self.source_rows()
+        for category, labels in ((TREASURY, ['HUF']), (CASH, ['EUR', 'USD'])):
+            with self.subTest(category=category):
+                tree = self.category_view(category).tree
+                self.assertEqual([tree.item(item, 'text') for item in tree.get_children()], labels)
+                table, source = self.select(category)
+                self.view.refresh()
+                self.assertEqual([tree.item(item, 'text') for item in tree.get_children()], labels)
+                self.assertEqual(self.view._sources[tree.selection()[0]], (table, source))
+                with patch.object(table, 'edit_selected') as edit:
+                    self.view._edit_selected()
+                edit.assert_called_once_with()
+                self.assertNotIn((category,), self.view._branches)
+                self.assertEqual(len(self.view._sources), len(labels))
+                table.set_rows([])
+                self.view.refresh()
+                self.assertFalse(tree.get_children())
+                table.set_rows(before[category])
+        self.assertEqual(self.source_rows(), before)
+
+    def test_read_only_summary_has_no_edit_controls_and_does_not_disable_shared_editors(self):
+        view = self.view
+        view.set_tables(self.tables)
+        before = self.source_rows()
+        self.assertTrue(all(table._enabled for table in self.tables.values()))
+        for name in ('add_button', 'edit_button', 'remove_button', '_menu'):
+            self.assertFalse(hasattr(view, name))
+        for shortcut in ('<Return>', '<F2>', '<Delete>', '<Insert>'):
+            self.assertFalse(view.tree.bind(shortcut))
+        view.set_enabled(False)
+        self.assertTrue(all(table._enabled for table in self.tables.values()))
+        view.set_enabled(True)
+        for category, table in self.tables.items():
+            self.select(category)
+            item = view.tree.selection()[0]
+            with patch.object(table, 'edit_selected') as edit, patch.object(table, 'remove_selected') as remove, \
+                    patch.object(table, 'add') as add, patch.object(view.tree, 'identify_row', return_value=item), \
+                    patch.object(view.tree, 'identify_element', return_value='text'), \
+                    patch('ui.holdings.open_cell_link', return_value=False):
+                view._edit_selected()
+                view._remove()
+                view._add()
+                view._double_click(SimpleNamespace(x=0, y=0))
+            edit.assert_not_called()
+            remove.assert_not_called()
+            add.assert_not_called()
+        view.set_other_assets([SimpleNamespace(category='Properties', name='Apartment', amount=1000,
+                                               currency='EUR', source_id='property')])
+        item = next(iter(view._other_items))
+        view.tree.selection_set(item)
+        with patch.object(view.tree, 'identify_row', return_value=item), \
+                patch('ui.holdings.open_cell_link', return_value=False), \
+                patch.object(view, '_edit_selected') as edit:
+            self.assertIsNone(view._double_click(SimpleNamespace(x=0, y=0)))
+        edit.assert_not_called()
+        self.assertIsNone(view._selection())
+        self.assertEqual(self.source_rows(), before)
 
     def test_cancel_add_preserves_visible_selection(self):
+        self.category_view(STOCK_MARKET)
         table, first = self.select(STOCK_MARKET, 0)
         table.tree.selection_set(first)
         self.select(STOCK_MARKET, 1)
         before = self.view.tree.selection()
         with patch.object(table, 'add', return_value=None):
-            self.view._add_to(STOCK_MARKET)
+            self.view._add()
         self.assertEqual(self.view.tree.selection(), before)
 
     def test_tree_groups_stocks_and_currencies_without_changing_native_values(self):
@@ -86,9 +172,9 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertEqual(len(self.view._sources), 6)
 
     def test_single_class_row_expands_and_compacts_after_add_and_remove(self):
+        self.category_view(STOCK_MARKET)
         tree = self.view.tree
         table, source_item = self.select(STOCK_MARKET, 2)
-        self.view.set_scope(STOCK_MARKET)
         root = self.view._branches[STOCK_MARKET, None, 'Equities']
         compact = self.view._branches[STOCK_MARKET, 'EU']
         self.assertEqual(tree.selection(), (compact,))
@@ -121,7 +207,7 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertEqual(tree.item(compact, 'values'), ('SOLO', '1', 'shares'))
         self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.view._branches[STOCK_MARKET, None, 'Equities'])],
                          ['US', 'EU'])
-        self.assertEqual(self.view.scope, STOCK_MARKET)
+        self.assertEqual(self.view.category, STOCK_MARKET)
         with patch('ui.table.messagebox.askyesno', return_value=True):
             self.view._remove()
         table.on_change.assert_called_with('remove', {'ticker': 'SOLO', 'group': 'EU', 'shares': '1'}, None)
@@ -150,16 +236,17 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertEqual(table.get_rows(), rows)
         self.assertEqual(len(self.view.tree.get_children()), 3)
 
-    def test_scope_filters_one_tree_without_mutating_or_showing_source_tables(self):
+    def test_category_views_keep_only_their_canonical_source_table(self):
         original = self.source_rows()
-        for scope in (*self.tables, 'All'):
-            self.view.set_scope(scope)
-            self.assertEqual(self.view.scope, scope)
-            roots = [self.view.tree.item(item, 'text') for item in self.view.tree.get_children()]
-            self.assertEqual(roots, list(self.tables) if scope == 'All' else [scope])
-            self.assertTrue(self.view.tree.grid_info())
-            self.assertTrue(all(not table.grid_info() for table in self.tables.values()))
-            self.assertEqual(self.source_rows(), original)
+        for category, table in self.tables.items():
+            with self.subTest(category=category):
+                view = self.category_view(category)
+                view.set_tables(self.tables)
+                self.assertEqual(view._tables, {category: table})
+                self.assertEqual({source for source, _ in view._sources.values()}, {table})
+                self.assertTrue(view.tree.grid_info())
+                self.assertTrue(all(not source.grid_info() for source in self.tables.values()))
+                self.assertEqual(self.source_rows(), original)
 
     def test_categories_show_only_held_classes_without_changing_sources(self):
         before = self.source_rows()
@@ -176,18 +263,17 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertNotIn((STOCK_MARKET, None, 'Bonds'), self.view._branches)
 
     def test_reclassification_preserves_source_selection_sort_and_expansion(self):
+        self.category_view(STOCK_MARKET)
         tree = self.view.tree
         source = self.select(STOCK_MARKET, 2)
-        self.view.set_scope(STOCK_MARKET)
         self.view.sorting.sort('#0')
         tree.item(self.view._branches[STOCK_MARKET, None, 'Equities'], open=False)
         self.view.set_categories({'US': 'Equities', 'EU': 'Gold'})
         self.assertEqual(self.view._sources[tree.selection()[0]], source)
         self.assertFalse(tree.item(self.view._branches[STOCK_MARKET, None, 'Equities'], 'open'))
-        self.assertEqual(self.view.scope, STOCK_MARKET)
+        self.assertEqual(self.view.category, STOCK_MARKET)
         self.assertEqual(self.view.sorting.column, '#0')
-        self.assertEqual([tree.item(item, 'text') for item in tree.get_children(self.view._branches[STOCK_MARKET,])],
-                         ['Equities', 'Gold'])
+        self.assertEqual([tree.item(item, 'text') for item in tree.get_children()], ['Equities', 'Gold'])
         with patch.object(self.view, 'refresh') as refresh:
             self.view.set_categories(dict(self.view._categories))
         refresh.assert_not_called()
@@ -202,38 +288,48 @@ class HoldingsViewTests(unittest.TestCase):
         selected = self.view.tree.selection()[0]
         self.assertEqual(self.view._sources[selected], source)
 
-    def test_add_menu_uses_each_category_editor(self):
-        for index, (category, table) in enumerate(self.tables.items()):
-            with self.subTest(category=category), patch.object(table, 'add') as edit:
-                self.assertEqual(self.view._menu.entrycget(index, 'label'), category)
-                self.view._menu.invoke(index)
-                edit.assert_called_once_with()
-
-    def test_filtered_add_uses_its_editor_without_opening_category_menu(self):
+    def test_add_uses_its_category_editor_and_selects_the_added_source(self):
         for category, table in self.tables.items():
-            self.view.set_scope(category)
-            with self.subTest(category=category), patch.object(table, 'add') as add, \
-                    patch.object(self.view._menu, 'tk_popup') as popup:
-                self.view._add()
-                add.assert_called_once_with()
-                popup.assert_not_called()
+            with self.subTest(category=category):
+                view = self.category_view(category)
+                row = ({'ticker': 'NEW', 'group': 'EU', 'shares': '2'} if category == STOCK_MARKET
+                       else {'currency': 'GBP', 'amount': '5'})
+                def add():
+                    item = table.tree.insert('', 'end')
+                    table._rows[item] = row
+                    return item
+                with patch.object(table, 'add', side_effect=add) as editor:
+                    view._add()
+                editor.assert_called_once_with()
+                source = view._sources[view.tree.selection()[0]]
+                self.assertIs(source[0], table)
+                self.assertEqual(table.row(source[1]), row)
+                self.assertEqual(view.tree.focus(), view.tree.selection()[0])
+                self.assertNotIn((category,), view._branches)
+                self.assertFalse(hasattr(view, '_menu'))
 
-    def test_refresh_and_filter_preserve_expansion_and_group_selection(self):
+    def test_refresh_accepts_categories_before_restoring_source_selection(self):
+        self.category_view(STOCK_MARKET)
+        source = self.select(STOCK_MARKET, 2)
+        self.view.refresh(categories={'US': 'Equities', 'EU': 'Bonds'})
+        tree = self.view.tree
+        item = tree.selection()[0]
+        self.assertEqual(self.view._sources[item], source)
+        self.assertEqual(tree.parent(item), self.view._branches[STOCK_MARKET, None, 'Bonds'])
+
+    def test_summary_refresh_preserves_expansion_and_group_selection(self):
         tree = self.view.tree
         for key in ((STOCK_MARKET,), (STOCK_MARKET, 'US'), (CASH,)):
             tree.item(self.view._branches[key], open=False)
         tree.selection_set(self.view._branches[STOCK_MARKET, 'US'])
         self.view.refresh()
         self.assertEqual(tree.selection(), (self.view._branches[STOCK_MARKET, 'US'],))
-        self.view.set_scope(CASH)
-        self.assertFalse(tree.selection())
-        self.view.refresh()
-        self.view.set_scope('All')
         for key in ((STOCK_MARKET,), (STOCK_MARKET, 'US'), (CASH,)):
             self.assertFalse(tree.item(self.view._branches[key], 'open'))
 
-    def test_groups_cannot_be_edited_or_removed_and_hidden_sources_are_inactive(self):
-        tree = self.view.tree
+    def test_groups_cannot_be_edited_or_removed(self):
+        tree = self.category_view(STOCK_MARKET).tree
+        table = self.tables[STOCK_MARKET]
         for item in self.view._branches.values():
             if item in self.view._sources:
                 continue
@@ -242,17 +338,14 @@ class HoldingsViewTests(unittest.TestCase):
             self.assertTrue(self.view.edit_button.instate(['disabled']))
             self.assertTrue(self.view.remove_button.instate(['disabled']))
             self.assertIsNone(self.view._selection())
-        table, _ = self.select(CASH)
-        self.view.set_scope(STOCK_MARKET)
-        self.assertFalse(tree.selection())
-        self.select(CASH)
-        with patch.object(table, 'edit_selected') as edit, patch.object(table, 'remove_selected') as remove:
-            self.view._edit_selected()
-            self.view._remove()
-        edit.assert_not_called()
-        remove.assert_not_called()
+            with patch.object(table, 'edit_selected') as edit, patch.object(table, 'remove_selected') as remove:
+                self.view._edit_selected()
+                self.view._remove()
+            edit.assert_not_called()
+            remove.assert_not_called()
 
     def test_double_click_edits_only_leaves_and_leaves_disclosure_to_tk(self):
+        self.category_view(STOCK_MARKET)
         tree = self.view.tree
         table, _ = self.select(STOCK_MARKET)
         leaf = tree.selection()[0]
@@ -274,6 +367,7 @@ class HoldingsViewTests(unittest.TestCase):
             edit.assert_called_once_with()
 
     def test_keyboard_collapses_and_expands_groups_without_editing(self):
+        self.category_view(STOCK_MARKET)
         self.view.pack(fill='both', expand=True)
         self.root.deiconify()
         self.root.update()
@@ -295,6 +389,7 @@ class HoldingsViewTests(unittest.TestCase):
 
     def test_edit_delegates_to_selected_source(self):
         for category, table in self.tables.items():
+            self.category_view(category)
             _, item = self.select(category)
             with self.subTest(category=category), patch.object(table, 'edit_selected') as edit:
                 self.view._edit_selected()
@@ -302,6 +397,7 @@ class HoldingsViewTests(unittest.TestCase):
                 self.assertEqual(table.tree.selection(), (item,))
 
     def test_remove_uses_original_confirmation_validation_and_callback(self):
+        self.category_view(CASH)
         table, item = self.select(CASH, 1)
         table.tree.selection_set(table.tree.get_children()[0])
         table.can_delete, table.on_change = Mock(), Mock()
@@ -311,9 +407,10 @@ class HoldingsViewTests(unittest.TestCase):
         table.on_change.assert_called_once_with('remove', {'amount': '0', 'currency': 'USD'}, None)
         self.assertFalse(table.tree.exists(item))
         self.assertEqual(table.get_rows(), [{'amount': '-20.25', 'currency': 'EUR'}])
-        self.assertEqual(len(self.view._sources), 5)
+        self.assertEqual(len(self.view._sources), 1)
 
     def test_rejected_remove_preserves_both_views(self):
+        self.category_view(STOCK_MARKET)
         table, _ = self.select(STOCK_MARKET)
         original = self.source_rows()
         table.can_delete = Mock(side_effect=ValueError('Keep the representative'))
@@ -323,29 +420,32 @@ class HoldingsViewTests(unittest.TestCase):
         error.assert_called_once()
         confirm.assert_not_called()
         self.assertEqual(self.source_rows(), original)
-        self.assertEqual(len(self.view._sources), 6)
+        self.assertEqual(len(self.view._sources), 3)
 
-    def test_disabled_view_cannot_mutate_sources(self):
+    def test_disabled_view_cannot_mutate_its_source(self):
+        self.category_view(TREASURY)
         table, _ = self.select(TREASURY)
         self.view.set_enabled(False)
-        for source_table in self.tables.values():
-            self.assertFalse(source_table._enabled)
-            self.assertTrue(all(str(button['state']) == 'disabled' for button in source_table._buttons))
+        self.assertFalse(table._enabled)
+        self.assertTrue(all(str(button['state']) == 'disabled' for button in table._buttons))
+        self.assertTrue(self.tables[CASH]._enabled)
+        self.assertTrue(self.tables[STOCK_MARKET]._enabled)
         for button in (self.view.add_button, self.view.edit_button, self.view.remove_button):
             self.assertEqual(str(button['state']), 'disabled')
         with patch.object(table, 'edit_selected') as edit, patch.object(table, 'remove_selected') as remove, \
                 patch.object(table, 'add') as add:
-            self.view._add_to(TREASURY)
+            self.view._add()
             self.view._edit_selected()
             self.view._remove()
         edit.assert_not_called()
         remove.assert_not_called()
         add.assert_not_called()
         self.view.set_enabled(True)
-        self.assertTrue(all(table._enabled for table in self.tables.values()))
+        self.assertTrue(table._enabled)
         self.assertEqual(str(self.view.add_button['state']), 'normal')
 
     def test_removed_source_selection_does_not_open_stale_editor(self):
+        self.category_view(TREASURY)
         table, _ = self.select(TREASURY)
         table.set_rows([])
         with patch.object(table, 'edit_selected') as edit:
@@ -355,6 +455,7 @@ class HoldingsViewTests(unittest.TestCase):
         self.assertFalse(self.view.tree.selection())
 
     def test_actions_follow_selection_and_refresh(self):
+        self.category_view(CASH)
         self.root.update()
         for button in (self.view.edit_button, self.view.remove_button):
             self.assertTrue(button.instate(['disabled']))
@@ -368,6 +469,7 @@ class HoldingsViewTests(unittest.TestCase):
             self.assertTrue(button.instate(['disabled']))
 
     def test_keyboard_edit_uses_selected_source_and_retains_focus(self):
+        self.category_view(CASH)
         self.view.pack(fill='both', expand=True)
         self.root.deiconify()
         self.root.update()

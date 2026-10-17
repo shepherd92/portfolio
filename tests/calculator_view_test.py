@@ -1,14 +1,15 @@
 """Calculator edits, live rate references and saved drafts remain independent."""
 
-from dataclasses import replace
 from datetime import date, timedelta
 import os
 from pathlib import Path
 import tempfile
 import tkinter as tk
+from tkinter import font, ttk
 import unittest
 from unittest.mock import Mock, patch
 
+from portfolio.calculator import CashFlow
 from portfolio.storage import load_settings
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY
 from ui.calculator import CalculatorView
@@ -29,20 +30,48 @@ class CalculatorViewTests(unittest.TestCase):
         configure_theme(self.root)
         self.current_total = Mock(return_value=0.)
         self.currency = tk.StringVar(self.root, value='HUF')
-        self.show_projection = Mock()
+        self.return_parents = {branch: ttk.Frame(self.root) for branch in (STOCK_MARKET, TREASURY)}
         self.allocation = Mock(return_value=AllocationTargets({STOCK_MARKET: {'World': 60},
                                                               TREASURY: {'HUF': 40}, CASH: {}}, {'World': 'Equities'}))
         self.changed = Mock()
         self.rates = Mock(return_value={'HUF': 1, 'EUR': 400, 'USD': 360, 'GBP': 480})
         self.view = CalculatorView(self.root, get_total=self.current_total,
-                                   show_projection=self.show_projection, currency=self.currency,
+                                   return_parents=self.return_parents, currency=self.currency,
                                    get_allocation=self.allocation, get_rates=self.rates,
                                    currency_choices=lambda: ('HUF', 'EUR', 'USD', 'GBP'), on_change=self.changed)
         self.view.load(self.directory)
 
+    def flow_rows(self, kind):
+        return [row for row in self.view.cashflows.get_rows() if row['kind'] == kind]
+
+    def set_flow_rows(self, kind, rows):
+        other = [row for row in self.view.cashflows.get_rows() if row['kind'] != kind]
+        self.view.cashflows.set_rows(other + [dict(row, kind=kind) for row in rows])
+
+    def set_flows(self, kind, flows):
+        self.set_flow_rows(kind, [self.view.cashflows._row(flow, kind) for flow in flows])
+
+    def set_income(self, amount, currency=None):
+        rows = [] if str(amount) == '0' else [dict(name='Salary', amount=str(amount),
+                                                  currency=currency or self.view._currency.get(),
+                                                  frequency='monthly', start=date.today().isoformat()[:7])]
+        self.set_flow_rows('Income', rows)
+        self.view._changed()
+
+    def set_cost_rows(self, rows):
+        existing = [row for row in self.flow_rows('Outgoing') if row['frequency'] == 'once']
+        costs = [dict(row, frequency='monthly', start=date.today().isoformat()[:7], count='', end='') for row in rows]
+        self.set_flow_rows('Outgoing', costs + existing)
+
+    def set_single_rows(self, rows):
+        existing = [row for row in self.flow_rows('Outgoing') if row['frequency'] != 'once']
+        payments = [dict(name=row['name'], amount=row['amount'], currency=row['currency'],
+                         frequency='once', start=row['due'][:7], count='', end='') for row in rows]
+        self.set_flow_rows('Outgoing', existing + payments)
+
     def set_monthly_cost(self, amount, currency='HUF'):
         rows = [{'name': 'Living costs', 'amount': str(amount), 'currency': currency}] if float(amount) else []
-        self.view.monthly_costs.set_rows(rows)
+        self.set_cost_rows(rows)
         self.view._changed()
 
     def wait_for_autosave(self):
@@ -54,15 +83,14 @@ class CalculatorViewTests(unittest.TestCase):
         self.current_total.return_value = 1234567.89123
         self.view.refresh()
         self.assertEqual(self.view.portfolio_value.get(), '1\u202f234\u202f568')
-        self.assertAlmostEqual(sum(row['amount'] for row in self.view._values.values()), 1234567.89123)
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 1234567.89123)
         self.assertFalse(self.view.dirty)
         self.changed.assert_not_called()
         self.allocation.return_value = AllocationTargets({STOCK_MARKET: {'World': 59.875},
                                                          TREASURY: {'HUF': 30.125}, CASH: {'EUR': 10}}, {'World': 'Equities'})
         self.view.refresh()
         self.assertEqual(self.view.return_weights['Equities'].get(), '59.88%')
-        self.assertEqual(self.view.return_weights[TREASURY].get(), '30.12%')
-        self.assertNotIn(CASH, self.view.return_weights)
+        self.assertEqual(set(self.view.return_weights), {'Equities', 'Bonds', 'Gold'})
         self.assertIn('59.88%', self.view.allocation_summary.set(STOCK_MARKET, 'share'))
         self.assertIn('10%', self.view.allocation_summary.set(CASH, 'share'))
         self.assertNotIn('stock_percent', self.view._inputs)
@@ -75,7 +103,7 @@ class CalculatorViewTests(unittest.TestCase):
 
     def test_market_value_refresh_preserves_exact_calculations_and_saved_inputs(self):
         self.view.set_base_rate(5.5, 'Effective today')
-        self.view._inputs['monthly_income'].set('1')
+        self.set_income('1')
         self.current_total.return_value = 1000.125
         self.view.refresh()
         self.assertTrue(self.view.save())
@@ -85,12 +113,11 @@ class CalculatorViewTests(unittest.TestCase):
         self.current_total.return_value = 1250.875
         self.view.refresh()
         self.assertEqual(self.view.portfolio_value.get(), '1\u202f251')
-        self.assertAlmostEqual(sum(row['amount'] for row in self.view._values.values()), 1250.875)
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 1250.875)
         self.currency.set('EUR')
         self.view.refresh()
         self.assertEqual(self.view.portfolio_value.get(), '3')
-        self.assertAlmostEqual(sum(row['amount'] for row in self.view._values.values()), 1250.875)
-        self.assertTrue(self.view._currency_box.instate(['readonly']))
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 1250.875)
         self.assertEqual(self.view.settings(), settings)
         self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
         self.assertFalse(self.view.dirty)
@@ -104,99 +131,6 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertTrue(self.view.save())
         self.assertEqual(self.view.settings(), settings)
 
-    def test_monthly_amounts_and_currency_suffixes_share_columns(self):
-        self.root.deiconify()
-        self.view.pack(fill='both', expand=True)
-        self.root.update_idletasks()
-        income = self.view._income_entry
-        budget = income.master
-        amounts = [budget.grid_slaves(row=row, column=1)[0] for row in range(3)]
-        suffixes = [budget.grid_slaves(row=row, column=2)[0] for row in range(3)]
-        self.assertEqual(len({widget.winfo_x() for widget in amounts}), 1)
-        self.assertEqual(len({widget.winfo_width() for widget in amounts}), 1)
-        self.assertEqual(len({widget.winfo_x() for widget in suffixes}), 1)
-        self.assertTrue(all(str(widget.cget('textvariable')) == str(self.currency) for widget in suffixes))
-        self.assertEqual(str(income.cget('justify')), 'right')
-        self.assertTrue(all(str(widget.cget('anchor')) == 'e' for widget in amounts[1:]))
-
-    def test_converted_income_preserves_native_precision_through_refresh_save_and_reload(self):
-        native = replace(self.view.settings(), monthly_income=300.25123456789, income_currency='USD')
-        self.view._set_inputs(native)
-        self.view._changed()
-        self.assertTrue(self.view.save())
-        original = (self.directory / 'calculator.json').read_bytes()
-        self.changed.reset_mock()
-        for currency in ('EUR', 'HUF', 'GBP', 'USD', 'HUF') * 3:
-            self.currency.set(currency)
-            self.view.refresh()
-            self.assertEqual(self.view.settings(), native)
-        self.rates.return_value = {**self.rates(), 'USD': 365.125}
-        self.view.refresh()
-        self.assertAlmostEqual(float(self.view._inputs['monthly_income'].get()), native.monthly_income * 365.125)
-        self.view._income_entry.event_generate('<FocusOut>')
-        self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
-        self.assertFalse(self.view.dirty)
-        self.changed.assert_not_called()
-        self.view._inputs['cash_months'].set('3')
-        self.assertTrue(self.view.save())
-        self.view.load(self.directory)
-        self.assertEqual(self.view.settings(), replace(native, cash_months=3))
-
-    def test_editing_converted_income_uses_shown_currency_and_rejects_typed_huf_fractions(self):
-        self.view._set_inputs(replace(self.view.settings(), monthly_income=1.01, income_currency='USD'))
-        self.view.refresh()
-        income = self.view._income_entry
-        self.assertEqual(income.get(), '364')
-        self.assertAlmostEqual(float(self.view._inputs['monthly_income'].get()), 363.6)
-        self.assertEqual(self.view.settings().monthly_income, 1.01)
-        income._display.set('364.5')
-        with self.assertRaisesRegex(ValueError, 'whole'):
-            self.view.settings()
-        income._display.set('364')
-        self.assertEqual((self.view.settings().monthly_income, self.view.settings().income_currency), (364, 'HUF'))
-        self.currency.set('EUR')
-        self.view.refresh()
-        income._display.set('12.125')
-        self.view.refresh()
-        self.assertEqual(self.view._inputs['monthly_income'].get(), '12.125')
-        self.assertEqual((self.view.settings().monthly_income, self.view.settings().income_currency), (12.125, 'EUR'))
-        self.currency.set('HUF')
-        self.view.refresh()
-        self.assertEqual(income.get(), '4\u202f850')
-        self.assertTrue(self.view.save())
-        self.assertEqual(load_settings(self.directory)[0].income_currency, 'EUR')
-
-    def test_missing_fx_disables_only_unavailable_income_and_recovers_without_editing_settings(self):
-        self.rates.return_value = {}
-        native = replace(self.view.settings(), monthly_income=100.25, income_currency='USD')
-        self.view._set_inputs(native)
-        self.view.refresh()
-        income = self.view._income_entry
-        self.assertEqual(income.get(), '—')
-        self.assertTrue(income.instate(['disabled']))
-        self.view.set_enabled(False)
-        self.view.set_enabled(True)
-        self.assertTrue(income.instate(['disabled']))
-        self.assertEqual(self.view.settings(), native)
-        self.assertEqual(self.view.required_currencies, {'HUF', 'USD'})
-        self.rates.return_value = {'HUF': 1, 'USD': 360}
-        self.view.refresh()
-        self.assertEqual(income.get(), '36\u202f090')
-        self.assertTrue(income.instate(['!disabled']))
-        self.assertFalse(self.view.dirty)
-
-    def test_invalid_income_draft_keeps_its_currency_when_switch_is_attempted(self):
-        self.view._inputs['monthly_income'].set('1200')
-        self.assertTrue(self.view.save())
-        for draft in ('', 'unfinished', '-1', '1.5'):
-            self.view._income_entry._display.set(draft)
-            self.currency.set('EUR')
-            self.assertFalse(self.view.change_currency())
-            self.assertEqual(self.currency.get(), 'HUF')
-            self.assertEqual(self.view._inputs['monthly_income'].get(), draft)
-            self.assertIn('Complete the income edit', self.view.message.get())
-            self.assertFalse(self.view.save())
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 1200)
 
     def test_overall_table_weights_returns_by_recommended_stock_mak_and_cash(self):
         self.view.set_base_rate(5.5, 'Effective today')
@@ -206,12 +140,12 @@ class CalculatorViewTests(unittest.TestCase):
         self.allocation.return_value = AllocationTargets({STOCK_MARKET: {'World': 30},
                                                          TREASURY: {'HUF': 70}, CASH: {}}, {'World': 'Equities'})
         self.view.refresh()
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 5.45%')
+        self.assertEqual(self.view.overall_return.get(), '5.45%')
         self.assertEqual(self.view.allocation_summary.item(TREASURY, 'values'), ('MÁK', '70%', '700'))
         self.allocation.return_value = AllocationTargets({STOCK_MARKET: {'World': 20},
                                                          TREASURY: {'HUF': 70}, CASH: {'HUF': 10}}, {'World': 'Equities'})
         self.view.refresh()
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 4.92%')
+        self.assertEqual(self.view.overall_return.get(), '4.92%')
         self.view._summary_sorting.sort('share')
         self.assertEqual(self.view.allocation_summary.get_children(), (CASH, STOCK_MARKET, TREASURY))
         self.view.refresh()
@@ -219,7 +153,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.current_total.side_effect = ValueError('Missing portfolio prices.')
         self.view.refresh()
         self.assertFalse(self.view.allocation_summary.get_children())
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: —')
+        self.assertEqual(self.view.overall_return.get(), '—')
 
     def test_three_rows_keep_cost_inputs_and_results_visible_at_minimum_window_size(self):
         self.root.geometry('1050x760')
@@ -228,24 +162,42 @@ class CalculatorViewTests(unittest.TestCase):
         self.view.set_base_rate(5.5, 'Effective today')
         self.current_total.return_value = 1_000_000
         self.set_monthly_cost('1000')
-        self.view.expenses.set_rows([{'name': 'Trip', 'amount': '100', 'currency': 'HUF', 'due': '2030-01-01'}])
+        self.set_single_rows([{'name': 'Trip', 'amount': '100', 'currency': 'HUF', 'due': '2030-01-01'}])
         self.view.refresh()
         self.view.message.set('Calculator settings saved.')
-        self.root.update_idletasks()
-        returns = self.view._mak_entry.master
-        costs, expenses = self.view.monthly_costs.master, self.view.expenses.master
+        self.root.update()
+        self.assertIsInstance(self.view.cashflows.master, ttk.Notebook)
+        costs = self.view.cashflows.master.master
+        monthly = self.view.monthly_summary.master
+        reserves = next(entry.master for entry in self.view._entries
+                        if str(entry.cget('textvariable')) == str(self.view._inputs['emergency_months']))
         overall, funding = self.view.allocation_summary.master, self.view.breakdown.master
-        self.assertEqual(returns.cget('text'), 'Expected annual returns')
+        summary = self.view._summary_panel
+        self.assertEqual(reserves.cget('text'), 'Settings')
+        self.assertEqual(summary.cget('text'), 'Portfolio summary')
+        self.assertFalse(any(isinstance(widget, ttk.Combobox) for widget in reserves.winfo_children()))
+        self.assertFalse(hasattr(self.view, 'projection_button'))
+        self.assertTrue(all(panel.master in self.return_parents.values()
+                            for panel in self.view.return_panels.values()))
         self.assertEqual(overall.cget('text'), 'Recommended overall allocations')
-        self.assertLess(returns.winfo_rooty(), costs.winfo_rooty())
-        self.assertEqual(costs.winfo_rooty(), expenses.winfo_rooty())
-        self.assertLess(costs.winfo_rootx(), expenses.winfo_rootx())
+        self.assertLess(reserves.winfo_rootx(), summary.winfo_rootx())
+        self.assertEqual(reserves.winfo_rooty(), summary.winfo_rooty())
+        self.assertEqual(costs.winfo_rooty(), monthly.winfo_rooty())
+        self.assertGreaterEqual(funding.winfo_rooty(), monthly.winfo_rooty() + monthly.winfo_height())
+        self.assertGreaterEqual(overall.winfo_rooty(), funding.winfo_rooty() + funding.winfo_height())
+        self.assertEqual(reserves.winfo_rootx(), costs.winfo_rootx())
+        self.assertEqual(costs.winfo_rootx(), overall.winfo_rootx())
+        self.assertEqual(summary.winfo_rootx(), monthly.winfo_rootx())
+        self.assertEqual(monthly.winfo_rootx(), funding.winfo_rootx())
+        self.assertEqual(funding.winfo_rootx(), summary.winfo_rootx())
+        self.assertLess(summary.winfo_rooty(), costs.winfo_rooty())
         self.assertLess(costs.winfo_rooty(), overall.winfo_rooty())
         self.assertLess(overall.winfo_rootx(), funding.winfo_rootx())
         right = self.root.winfo_rootx() + self.root.winfo_width()
-        for panel in (returns, costs, expenses, overall, funding):
+        self.assertEqual(int(overall.grid_info()['columnspan']), 2)
+        for panel in (reserves, costs, monthly, overall, funding, summary):
             self.assertLessEqual(panel.winfo_rootx() + panel.winfo_width(), right)
-        for table in (self.view.monthly_costs, self.view.expenses):
+        for table in (self.view.cashflows,):
             row = table.tree.bbox(table.tree.get_children()[0])
             self.assertTrue(row, 'Each input table must show a complete row.')
             self.assertLessEqual(row[1] + row[3], table.tree.winfo_height())
@@ -253,6 +205,20 @@ class CalculatorViewTests(unittest.TestCase):
         last = self.view.allocation_summary.bbox(self.view.allocation_summary.get_children()[-1])
         self.assertTrue(last)
         self.assertLessEqual(last[1] + last[3], self.view.allocation_summary.winfo_height())
+        for widget in summary.winfo_children():
+            self.assertLessEqual(widget.winfo_y() + widget.winfo_height(), summary.winfo_height())
+            if isinstance(widget, ttk.Label):
+                actual = font.Font(root=self.root, font=ttk.Style(self.root).lookup(
+                    widget.cget('style') or 'TLabel', 'font')).actual()
+                normal = font.Font(root=self.root, font=ttk.Style(self.root).lookup('TLabel', 'font')).actual()
+                self.assertEqual(actual['size'], normal['size'])
+                self.assertEqual(actual['weight'], normal['weight'])
+        expense = self.view.breakdown.bbox(self.view.breakdown.get_children()[0])
+        self.assertTrue(expense, 'The middle-right funding table must show a complete row.')
+        self.assertLessEqual(expense[1] + expense[3], self.view.breakdown.winfo_height())
+        monthly_last = self.view.monthly_summary.bbox('Net')
+        self.assertLessEqual(monthly_last[1] + monthly_last[3], self.view.monthly_summary.winfo_height())
+        self.assertLessEqual(self.view.monthly_summary.winfo_y() + self.view.monthly_summary.winfo_height(), monthly.winfo_height())
 
     def test_planning_uses_unsaved_inputs_independently_of_market_valuation(self):
         self.current_total.side_effect = ValueError('Missing portfolio prices.')
@@ -283,7 +249,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.view.set_base_rate(5.5, 'Effective today')
         self.assertEqual(self.view._auto_rate_box.cget('text'), 'Use MNB base rate')
         self.assertEqual(self.view.rate_description, 'MNB base rate: 5.5% · Effective today')
-        self.assertTrue(self.view.breakdown.get_children())
+        self.assertTrue(self.view.allocation_summary.get_children())
         self.assertTrue(self.view._mak_entry.instate(['disabled']))
         self.assertIsNone(self.view.settings().returns.mak)
         self.assertTrue(self.view.save())
@@ -312,15 +278,15 @@ class CalculatorViewTests(unittest.TestCase):
         self.allocation.return_value = AllocationTargets(weights, categories)
         self.view.refresh()
         self.assertEqual({name: variable.get() for name, variable in self.view.return_weights.items()},
-                         {'Equities': '40%', 'Bonds': '10%', 'Gold': '10%', TREASURY: '40%'})
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 5.1%')
+                         {'Equities': '40%', 'Bonds': '10%', 'Gold': '10%'})
+        self.assertEqual(self.view.overall_return.get(), '5.1%')
         self.view._inputs['gold'].set('4')
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 5.3%')
+        self.assertEqual(self.view.overall_return.get(), '5.3%')
         self.allocation.return_value = AllocationTargets(weights, {**categories, 'Gold fund': 'Bonds'})
         self.view.refresh()
         self.assertEqual(self.view.return_weights['Bonds'].get(), '20%')
         self.assertEqual(self.view.return_weights['Gold'].get(), '0%')
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 5.2%')
+        self.assertEqual(self.view.overall_return.get(), '5.2%')
         self.allocation.return_value = AllocationTargets(weights, {**categories, 'World': ''})
         self.view.refresh()
         self.assertIn('World', self.view.message.get())
@@ -332,14 +298,35 @@ class CalculatorViewTests(unittest.TestCase):
         def order():
             return sorted(self.view._return_rows,
                           key=lambda name: self.view._return_rows[name][0].grid_info()['row'])
-        self.assertEqual(order(), ['Gold', 'Bonds', TREASURY, 'Equities'])
+        self.assertEqual(order(), ['Gold', 'Bonds', 'Equities'])
         editor = self.view._return_rows['Gold'][1]
         self.view._inputs['gold'].set('7')
-        self.assertEqual(order(), ['Bonds', TREASURY, 'Equities', 'Gold'])
+        self.assertEqual(order(), ['Bonds', 'Equities', 'Gold'])
         self.assertIs(self.view._return_rows['Gold'][1], editor)
         self.view._sort_return_rows(2)
-        self.assertEqual(order(), ['Bonds', 'Gold', TREASURY, 'Equities'])
+        self.assertEqual(order(), ['Bonds', 'Gold', 'Equities'])
         self.assertEqual(self.view._return_rows['Equities'][2].winfo_class(), 'TLabel')
+
+    def test_mak_return_is_one_field_with_auto_rate_option(self):
+        panel = self.view.return_panels[TREASURY]
+        self.assertIsInstance(panel, ttk.Frame)
+        self.assertNotIn(TREASURY, self.view._return_rows)
+        self.assertFalse(any(isinstance(widget, (ttk.Button, ttk.Treeview))
+                             for widget in panel.winfo_children()))
+        self.assertIs(self.view._mak_entry.master, panel)
+        self.assertEqual(self.view._mak_entry.grid_info()['row'], self.view._auto_rate_box.grid_info()['row'])
+        self.view.set_base_rate(5.5, 'Effective today')
+        self.assertEqual(self.view._mak_entry.get(), '5.5%')
+        self.assertTrue(self.view._mak_entry.instate(['disabled']))
+        self.view._auto_rate_box.invoke()
+        self.assertTrue(self.view._mak_entry.instate(['!disabled']))
+        self.view._inputs['mak'].set('5.1234567')
+        self.assertEqual(self.view.settings().returns.mak, 5.1234567)
+        self.view.set_enabled(False)
+        self.assertTrue(self.view._mak_entry.instate(['disabled']))
+        self.assertTrue(self.view._auto_rate_box.instate(['disabled']))
+        self.view.set_enabled(True)
+        self.assertTrue(self.view._mak_entry.instate(['!disabled']))
 
     def test_all_percentage_entries_limit_display_precision_without_rounding_saved_values(self):
         from ui.widgets import PercentEntry
@@ -353,51 +340,62 @@ class CalculatorViewTests(unittest.TestCase):
             self.assertRegex(entry.get(), r'^7\.12%?$')
             self.assertEqual(float(variable.get()), 7.1234567)
 
-    def test_expense_editor_uses_calendar_date_field_and_cancel_keeps_original(self):
-        from ui.dates import DateEntry
+    def test_expense_editor_uses_month_field_and_cancel_keeps_original(self):
+        from ui.dates import MonthEntry
 
+        self.root.deiconify()
+        self.view.pack(fill='both', expand=True)
+        self.root.update()
         row = {'name': 'Car', 'amount': '500', 'currency': 'HUF', 'due': '2030-01-01'}
-        self.view.expenses.set_rows([row])
+        self.set_single_rows([row])
         failures = []
+        remaining = 50
 
         def inspect():
-            dialog = next(child for child in self.view.expenses.winfo_children() if isinstance(child, tk.Toplevel))
-
+            nonlocal remaining
+            dialog = next(child for child in self.view.cashflows.winfo_children() if isinstance(child, tk.Toplevel))
             def descendants(widget):
                 for child in widget.winfo_children():
                     yield child
                     yield from descendants(child)
 
+            months = [widget for widget in descendants(dialog) if isinstance(widget, MonthEntry)]
+            visible = [widget for widget in months if widget.winfo_viewable()]
+            if not visible and remaining:
+                remaining -= 1
+                self.root.after(20, inspect)
+                return
             try:
-                dates = [widget for widget in descendants(dialog) if isinstance(widget, DateEntry)]
-                self.assertEqual(len(dates), 1)
-                self.assertEqual(dates[0].entry.get(), '2030-01-01')
+                self.assertEqual(len(months), 2)
+                self.assertEqual(len(visible), 1)
+                self.assertEqual(visible[0].entry.get(), '2030-01')
             except Exception as error:
                 failures.append(error)
             finally:
                 dialog.destroy()
 
         self.root.after(30, inspect)
-        item = self.view.expenses.tree.get_children()[0]
-        self.view.expenses._edit(item)
+        item = self.view.cashflows.tree.get_children()[0]
+        self.view.cashflows._edit(item)
         if failures:
             raise failures[0]
-        self.assertEqual(self.view.expenses.get_rows(), [row])
+        self.assertEqual(self.flow_rows('Outgoing')[0]['start'], row['due'][:7])
+        self.assertEqual(self.flow_rows('Outgoing')[0]['amount'], row['amount'])
 
-    def test_discounted_expenses_show_due_amounts_and_overcommitment_keeps_funded_rows(self):
+    def test_discounted_expenses_show_current_reserves_and_overcommitment_keeps_funded_rows(self):
         self.view.set_base_rate(5, 'Effective today')
         self.current_total.return_value = 1000
         self.view.refresh()
         due = date.today().replace(year=date.today().year + 3).isoformat()
-        self.view.expenses.set_rows([{'name': 'Car', 'amount': '500', 'currency': 'HUF', 'due': due}])
+        self.set_single_rows([{'name': 'Car', 'amount': '500', 'currency': 'HUF', 'due': due}])
         self.view._changed()
-        rows = [dict(zip(self.view.breakdown['columns'], self.view.breakdown.item(item, 'values')))
+        rows = [dict(purpose=self.view.breakdown.item(item, 'text'), **dict(zip(self.view.breakdown['columns'], self.view.breakdown.item(item, 'values'))))
                 for item in self.view.breakdown.get_children()]
         car = next(row for row in rows if row['purpose'] == 'Car')
-        self.assertEqual(car['future'], '500')
+        self.assertNotIn('future', self.view.breakdown['columns'])
         self.assertEqual(car['income'], '0')
         self.assertLess(int(car['stock']) + int(car['mak']), 500)
-        self.assertEqual(self.view.settings().expenses[0].amount, 500)
+        self.assertEqual(self.view.settings().outgoings[-1].amount, 500)
         self.assertTrue(self.view.save())
         self.view.refresh()
         self.assertFalse(self.view.dirty)
@@ -407,7 +405,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertIn('40%', self.view.allocation_summary.set(CASH, 'share'))
         self.assertIn('0%', self.view.allocation_summary.set(STOCK_MARKET, 'share'))
         self.assertIn('HUF', self.view.message.get())
-        self.assertAlmostEqual(sum(value['amount'] for value in self.view._values.values()), 1000)
+        self.assertAlmostEqual(sum(value['amount'] for value in self.view._summary_values.values()), 1000)
         self.assertTrue(all(value['stock'] >= 0 and value['mak'] >= 0 and value['cash'] >= 0
                             for value in self.view._values.values()))
 
@@ -420,33 +418,32 @@ class CalculatorViewTests(unittest.TestCase):
         self.view._inputs['emergency_months'].set('0')
         self.view._inputs['cash_months'].set('0')
         due = (date.today() + timedelta(days=366)).isoformat()
-        self.view.expenses.set_rows([{'name': 'Car', 'amount': '500', 'currency': 'HUF', 'due': due}])
+        self.set_single_rows([{'name': 'Car', 'amount': '500', 'currency': 'HUF', 'due': due}])
         self.view.refresh()
         baseline = list(self.view._values.values())
 
-        self.view._inputs['monthly_income'].set('150')
-        self.assertEqual(self.view.settings().monthly_savings(), 0)
-        self.assertIn('0', self.view.monthly_savings.get())
+        self.set_income('150')
+        self.assertEqual(self.view._monthly_values['Net']['recurring'], -50)
+        self.assertEqual(self.view._saving_ratio.get(), '-33.33%')
+        self.assertIn('0', self.view.monthly_summary.set('Net', 'recurring'))
         self.assertEqual(list(self.view._values.values()), baseline)
 
-        self.view._inputs['monthly_income'].set('300')
-        self.assertEqual(self.view.settings().monthly_savings(), 100)
-        self.assertIn('100', self.view.monthly_savings.get())
+        self.set_income('300')
+        self.assertEqual(self.view._monthly_values['Net']['recurring'], 100)
+        self.assertIn('100', self.view.monthly_summary.set('Net', 'recurring'))
         rows = {value['purpose']: value for value in self.view._values.values()}
-        self.assertEqual(rows['Car']['income'], 500)
-        self.assertEqual(rows['Car']['amount'], 0)
-        self.assertIsNone(rows['Emergency reserve']['income'])
-        self.assertEqual(rows['Long-term allocation']['amount'], 1000)
-        self.assertEqual(sum(value['amount'] for value in rows.values()), 1000)
-        self.assertIn('60%', self.view.allocation_summary.set(STOCK_MARKET, 'share'))
-        self.assertIn('40%', self.view.allocation_summary.set(TREASURY, 'share'))
-        displayed = {self.view.breakdown.set(item, 'purpose'): self.view.breakdown.set(item, 'income')
+        self.assertAlmostEqual(rows['Car']['stock'], baseline[0]['stock'])
+        self.assertAlmostEqual(rows['Car']['income'] + rows['Car']['stock'], 500)
+        self.assertAlmostEqual(rows['Car']['mak'], 0)
+        self.assertEqual(set(rows), {'Car'})
+        self.assertAlmostEqual(sum(value['amount'] for value in self.view._summary_values.values()), 1000)
+        displayed = {self.view.breakdown.item(item, 'text'): self.view.breakdown.set(item, 'income')
                      for item in self.view.breakdown.get_children()}
-        self.assertEqual(displayed, {'Emergency reserve': '—', 'Bank cash buffer': '—', 'Car': '500', 'Long-term allocation': '—'})
+        self.assertEqual(displayed, {'Car': format_amount(rows['Car']['income'])})
         self.assertTrue(self.view.save())
         self.view.load(self.directory)
-        self.assertEqual(self.view.settings().monthly_income, 300)
-        self.assertEqual(self.view.settings().monthly_savings(), 100)
+        self.assertEqual(self.view.settings().incomes[0].amount, 300)
+        self.assertEqual(self.view._monthly_values['Net']['recurring'], 100)
 
     def test_overcommitment_preserves_required_mak_and_allocates_remaining_money_to_stock(self):
         self.view.set_base_rate(0, 'Effective today')
@@ -456,13 +453,13 @@ class CalculatorViewTests(unittest.TestCase):
         self.set_monthly_cost('100')
         self.view._inputs['emergency_months'].set('2')
         due = date.today().replace(year=date.today().year + 10).isoformat()
-        self.view.expenses.set_rows([{'name': 'Future expense', 'amount': '2000', 'currency': 'HUF', 'due': due}])
+        self.set_single_rows([{'name': 'Future expense', 'amount': '2000', 'currency': 'HUF', 'due': due}])
         self.view._changed()
         self.assertIn('60%', self.view.allocation_summary.set(STOCK_MARKET, 'share'))
         self.assertIn('20%', self.view.allocation_summary.set(CASH, 'share'))
         self.assertIn('20%', self.view.allocation_summary.set(TREASURY, 'share'))
         self.assertAlmostEqual(sum(value['stock'] for value in self.view._values.values()), 600)
-        self.assertAlmostEqual(sum(value['cash'] for value in self.view._values.values()), 200)
+        self.assertAlmostEqual(self.view._summary_values[CASH]['amount'], 200)
         self.assertIn('1\u202f400', self.view.message.get())
 
     def test_monthly_cost_total_drives_bank_cash_and_full_emergency_reserve(self):
@@ -470,23 +467,19 @@ class CalculatorViewTests(unittest.TestCase):
         self.current_total.return_value = 1000
         self.set_monthly_cost('100')
         self.view._inputs['emergency_months'].set('1')
-        rows = {value['purpose']: value for value in self.view._values.values()}
-        self.assertEqual(rows['Emergency reserve']['cash'], 0)
-        self.assertEqual(rows['Emergency reserve']['mak'], 100)
-        self.assertEqual(rows['Bank cash buffer']['cash'], 200)
-        self.assertEqual(rows['Long-term allocation']['amount'], 700)
-        self.assertEqual(self.view.monthly_spending.get(), '100')
+        self.assertFalse(self.view.breakdown.get_children())
+        self.assertEqual(self.view._summary_values[CASH]['amount'], 200)
+        self.assertEqual(self.view._summary_values[TREASURY]['amount'], 380)
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'recurring'), '100')
         self.view._inputs['cash_months'].set('4')
-        rows = {value['purpose']: value for value in self.view._values.values()}
-        self.assertEqual(rows['Bank cash buffer']['cash'], 400)
-        self.assertEqual(rows['Emergency reserve']['mak'], 100)
+        self.assertEqual(self.view._summary_values[CASH]['amount'], 400)
+        self.assertEqual(self.view._summary_values[TREASURY]['amount'], 300)
         self.assertTrue(self.view.save())
         self.view.load(self.directory)
         self.assertEqual(self.view.settings().cash_months, 4)
-        self.assertEqual(self.view.settings().monthly_costs[0].amount, 100)
+        self.assertEqual(self.view.settings().outgoings[0].amount, 100)
         self.view._inputs['cash_months'].set('0')
-        rows = {value['purpose']: value for value in self.view._values.values()}
-        self.assertEqual(rows['Bank cash buffer']['cash'], 0)
+        self.assertEqual(self.view._summary_values[CASH]['amount'], 0)
         for value in ('1.5', '-1', '121'):
             self.view._inputs['cash_months'].set(value)
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -495,13 +488,13 @@ class CalculatorViewTests(unittest.TestCase):
     def test_fractional_huf_income_and_costs_are_rejected_without_writing_settings(self):
         self.view.set_base_rate(5, 'Effective today')
         self.current_total.return_value = 1000
-        self.view._inputs['monthly_income'].set('100.5')
+        self.set_income('100.5')
         with self.assertRaisesRegex(ValueError, 'whole|integer'):
             self.view.settings()
         self.assertFalse(self.view.save())
-        self.view._inputs['monthly_income'].set('0')
-        for table in (self.view.monthly_costs, self.view.expenses):
-            table.set_rows([{'name': 'Cost', 'amount': '100.5', 'currency': 'HUF', 'due': '2030-01-01'}])
+        self.set_income('0')
+        for table in (self.view.cashflows,):
+            table.set_rows([{'kind': 'Outgoing', 'name': 'Cost', 'amount': '100.5', 'currency': 'HUF', 'start': '2030-01', 'frequency': 'once'}])
             with self.subTest(table=table), self.assertRaisesRegex(ValueError, 'whole|integer'):
                 self.view.settings()
             self.assertFalse(self.view.save())
@@ -513,43 +506,41 @@ class CalculatorViewTests(unittest.TestCase):
         self.current_total.return_value = 1_000_000
         costs = [{'name': 'Rent', 'amount': '100.5', 'currency': 'EUR'},
                  {'name': 'Food', 'amount': '5000', 'currency': 'HUF'}]
-        self.view.monthly_costs.set_rows(costs)
+        self.set_cost_rows(costs)
         self.currency.set('USD')
         self.view.refresh()
-        self.view._inputs['monthly_income'].set('300.25')
+        self.set_income('300.25')
         self.currency.set('HUF')
         self.view.refresh()
         expense = {'name': 'Car', 'amount': '500.25', 'currency': 'USD', 'due': date.today().isoformat()}
-        self.view.expenses.set_rows([expense])
+        self.set_single_rows([expense])
         self.view._changed()
         settings = self.view.settings()
         self.assertEqual(settings.monthly_spending(self.rates()), 45_200)
-        self.assertEqual(settings.monthly_savings(self.rates()), 62_890)
-        self.assertEqual(self.view.monthly_spending.get(), '45\u202f200')
-        self.assertEqual(self.view._income_entry.get(), '108\u202f090')
-        self.assertEqual(self.view.monthly_costs.display_value(costs[0], 'amount'), '100')
+        self.assertEqual(settings.monthly_totals(date.today().year, date.today().month, self.rates()).recurring_income - settings.monthly_spending(self.rates()), 62_890)
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'recurring'), '45\u202f200')
+        self.assertEqual(self.view.monthly_summary.set('Income', 'recurring'), '108\u202f090')
+        self.assertEqual(self.view.cashflows.display_value(costs[0], 'amount'), '100')
         self.assertEqual(self.view.required_currencies, {'HUF', 'EUR', 'USD'})
         self.assertTrue(self.view.save())
         original = (self.directory / 'calculator.json').read_bytes()
         self.currency.set('EUR')
         self.view.refresh()
-        self.assertEqual(self.view.monthly_spending.get(), '113')
-        self.assertEqual(self.view.monthly_savings.get(), '157')
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'recurring'), '113')
+        self.assertEqual(self.view.monthly_summary.set('Net', 'recurring'), '157')
         self.assertEqual(self.view.allocation_summary.heading('amount', 'text'), 'Amount (EUR)')
         item = next(item for item, row in self.view._values.items() if row['purpose'] == 'Car')
-        self.assertEqual(self.view.breakdown.set(item, 'future'), '450')
         self.assertEqual(self.view.breakdown.set(item, 'cash'), '450')
-        self.assertEqual(self.view._values[item]['future'], 180_090)
+        self.assertEqual(self.view._values[item]['cash'], 180_090)
         for item, values in self.view._summary_values.items():
             self.assertEqual(self.view.allocation_summary.set(item, 'amount'), format_amount(values['amount'] / 400))
         self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
         self.assertFalse(self.view.dirty)
         self.view.load(self.directory)
         self.assertEqual(self.view.settings(), settings)
-        self.assertEqual([(row['name'], float(row['amount']), row['currency']) for row in self.view.monthly_costs.get_rows()],
+        self.assertEqual([(row['name'], float(row['amount']), row['currency']) for row in self.flow_rows('Outgoing') if row['frequency'] != 'once'],
                          [('Rent', 100.5, 'EUR'), ('Food', 5000, 'HUF')])
-        self.assertEqual(self.view.expenses.get_rows()[0]['currency'], 'USD')
-        self.assertTrue(self.view._currency_box.instate(['readonly']))
+        self.assertEqual(self.flow_rows('Outgoing')[-1]['currency'], 'USD')
         self.rates.return_value = {'HUF': 1, 'USD': 360}
         self.view.refresh()
         self.assertFalse(self.view.allocation_summary.get_children())
@@ -562,17 +553,17 @@ class CalculatorViewTests(unittest.TestCase):
         self.view.refresh()
         self.currency.set('USD')
         self.view.refresh()
-        self.view._inputs['monthly_income'].set('100.5')
+        self.set_income('100.5')
         self.currency.set('HUF')
         self.view.refresh()
-        self.assertTrue(self.view.breakdown.get_children())
+        self.assertTrue(self.view.allocation_summary.get_children())
         self.rates.return_value = {}
         self.view.refresh()
         self.assertFalse(self.view.breakdown.get_children())
         self.assertIn('USD/HUF', self.view.message.get())
         self.assertTrue(self.view.save())
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 100.5)
-        self.view._inputs['monthly_income'].set('unfinished')
+        self.assertEqual(load_settings(self.directory)[0].incomes[0].amount, 100.5)
+        self.set_income('unfinished')
         self.assertEqual(self.view.required_currencies, {'HUF'})
 
     def test_invalid_file_is_not_rewritten_until_inputs_change_and_external_edits_are_protected(self):
@@ -607,32 +598,32 @@ class CalculatorViewTests(unittest.TestCase):
     def test_edits_autosave_after_typing_and_invalid_drafts_leave_saved_values_intact(self):
         path = self.directory / 'calculator.json'
         self.assertFalse(path.exists())
-        self.view._inputs['monthly_income'].set('12')
+        self.set_income('12')
         first_timer = self.view._autosave_id
-        self.view._inputs['monthly_income'].set('1200')
+        self.set_income('1200')
         self.assertNotEqual(self.view._autosave_id, first_timer)
         self.assertFalse(path.exists())
         self.wait_for_autosave()
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 1200)
+        self.assertEqual(load_settings(self.directory)[0].incomes[0].amount, 1200)
         self.assertFalse(self.view.dirty)
         self.assertIsNone(self.view._autosave_id)
-        self.view._inputs['monthly_income'].set('')
+        self.set_income('')
         self.wait_for_autosave()
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 1200)
+        self.assertEqual(load_settings(self.directory)[0].incomes[0].amount, 1200)
         self.assertTrue(self.view.dirty)
         self.assertIn('Cannot save calculator settings', self.view.message.get())
-        self.view._inputs['monthly_income'].set('2500')
-        self.view._income_entry.event_generate('<FocusOut>')
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 2500)
+        self.set_income('2500')
+        self.view.save()
+        self.assertEqual(load_settings(self.directory)[0].incomes[0].amount, 2500)
         self.assertFalse(self.view.dirty)
         self.assertNotIn('Cannot save', self.view.message.get())
 
     def test_load_and_refresh_do_not_save_and_loading_cancels_pending_edits(self):
-        self.view._inputs['monthly_income'].set('500')
+        self.set_income('500')
         self.assertIsNotNone(self.view._autosave_id)
         self.view.load(self.directory)
         self.assertIsNone(self.view._autosave_id)
-        self.assertEqual(self.view.settings().monthly_income, 0)
+        self.assertEqual(self.view.settings().incomes, ())
         with patch('ui.calculator.save_settings') as save:
             self.view.set_base_rate(6, 'Today')
             self.current_total.return_value = 2000
@@ -643,7 +634,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertFalse((self.directory / 'calculator.json').exists())
 
     def test_failed_autosave_is_visible_until_a_successful_retry(self):
-        self.view._inputs['monthly_income'].set('500')
+        self.set_income('500')
         with patch('ui.calculator.save_settings', side_effect=OSError('Disk is full')):
             self.wait_for_autosave()
         self.assertTrue(self.view.dirty)
@@ -655,31 +646,233 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertNotIn('Disk is full', self.view.message.get())
 
     def test_destroy_cancels_pending_autosave(self):
-        self.view._inputs['monthly_income'].set('500')
+        self.set_income('500')
         timer = self.view._autosave_id
         self.view.destroy()
         self.assertNotIn(timer, self.root.tk.call('after', 'info'))
 
     def test_disabled_controls_cannot_start_callbacks_and_expense_validation_is_recoverable(self):
         self.view.set_enabled(False)
-        self.view.projection_button.invoke()
-        self.show_projection.assert_not_called()
         self.assertTrue(all(entry.instate(['disabled']) for entry in self.view._entries))
-        self.assertFalse(self.view.expenses._enabled)
-        self.assertFalse(self.view.monthly_costs._enabled)
-        self.assertTrue(self.view._currency_box.instate(['disabled']))
+        self.assertTrue(self.view._auto_rate_box.instate(['disabled']))
+        self.assertFalse(self.view.cashflows._enabled)
         self.view.set_enabled(True)
-        self.assertTrue(self.view._currency_box.instate(['readonly']))
-        self.view.projection_button.invoke()
-        self.show_projection.assert_called_once_with()
         self.assertTrue(self.view._mak_entry.instate(['disabled']))
         for row in ({'name': '', 'amount': '5', 'currency': 'HUF', 'due': '2030-01-01'},
                     {'name': 'Car', 'amount': '-1', 'currency': 'HUF', 'due': '2030-01-01'},
                     {'name': 'Car', 'amount': '5.125', 'currency': 'HUF', 'due': '2030-01-01'},
                     {'name': 'Car', 'amount': '5', 'currency': 'HUF', 'due': 'bad-date'}):
             with self.subTest(row=row), self.assertRaises(ValueError):
-                self.view._validate_expense(row, None)
-        validated = self.view._validate_expense({'name': ' Car ', 'amount': '5', 'currency': 'HUF', 'due': '2030-01-01'}, None)
+                self.view.cashflows._validate(dict(row, kind='Outgoing', start=row['due'][:7], frequency='once'), None)
+        validated = self.view.cashflows._validate({'kind': 'Outgoing', 'name': ' Car ', 'amount': '5', 'currency': 'HUF', 'start': '2030-01', 'frequency': 'once'}, None)
         self.assertEqual(validated['name'], 'Car')
         self.assertEqual(float(validated['amount']), 5)
-        self.assertEqual(validated['due'], '2030-01-01')
+        self.assertEqual(validated['start'], '2030-01')
+
+    def test_schedule_editor_preserves_month_when_frequency_changes(self):
+        from ui.dates import MonthEntry
+
+        form = ttk.Frame(self.root)
+        self.addCleanup(form.destroy)
+        variables, _ = self.view.cashflows._edit_fields(form, None)
+        variables['name'].set('Loan')
+        variables['amount'].set('250')
+        variables['start'].set('2030-01')
+        values = lambda: {key: variable.get() for key, variable in variables.items()}
+        selector = next(widget for widget in form.winfo_children()
+                        if isinstance(widget, ttk.Combobox)
+                        and str(widget.cget('textvariable')) == str(variables['frequency']))
+        self.assertEqual(selector['values'], ('Once', 'Monthly', 'Annually'))
+        end = next(widget for widget in form.winfo_children()
+                   if isinstance(widget, MonthEntry) and str(widget._value) == str(variables['end']))
+        self.assertFalse(end.grid_info())
+        for label, frequency in (('Monthly', 'monthly'), ('Annually', 'annual')):
+            variables['frequency'].set(label)
+            variables['ending'].set('End month')
+            variables['end'].set('2031-01')
+            self.assertTrue(end.grid_info())
+            starts = [widget for widget in form.winfo_children()
+                      if type(widget) is MonthEntry and str(widget._value) == str(variables['start'])]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(variables['start'].get(), '2030-01')
+            row = self.view.cashflows._validate(values(), None)
+            self.assertEqual((row['frequency'], row['end'], row['count']), (frequency, '2031-01', ''))
+            variables['ending'].set('Number of payments')
+            variables['count'].set('12')
+            row = self.view.cashflows._validate(values(), None)
+            self.assertEqual((row['count'], row['end']), ('12', ''))
+            variables['frequency'].set('Once')
+            row = self.view.cashflows._validate(values(), None)
+            self.assertEqual((row['frequency'], row['count'], row['end']), ('once', '', ''))
+            self.assertEqual(row['start'], '2030-01')
+        variables['frequency'].set('Monthly')
+        variables['start'].set('2030-02')
+        variables['frequency'].set('Once')
+        self.assertEqual(variables['start'].get(), '2030-02')
+        variables['frequency'].set('Monthly')
+        variables['count'].set('1.5')
+        with self.assertRaisesRegex(ValueError, 'whole'):
+            self.view.cashflows._validate(values(), None)
+
+    def test_annual_schedule_round_trips_with_month_dates_and_updates_selected_month(self):
+        from ui.dates import MonthEntry
+
+        self.view.set_base_rate(0, 'Today')
+        table = self.view.cashflows
+        flow = CashFlow('Annual bonus', 1200, date(2030, 7, 1), frequency='annual', count=3)
+        self.set_flows('Income', (flow,))
+        self.view._changed()
+        self.assertTrue(self.view.save())
+        self.view.load(self.directory)
+        self.assertEqual(self.view.settings().incomes, (flow,))
+        row = table.get_rows()[0]
+        self.assertEqual(row['start'], '2030-07')
+        self.assertEqual(table.display_value(row, 'frequency'), 'Annually')
+        self.assertIsInstance(self.view._month_box, MonthEntry)
+        self.view._month.set('2031-07')
+        self.assertEqual(self.view.monthly_summary.set('Income', 'recurring'), '1\u202f200')
+        self.view._month.set('2031-08')
+        self.assertEqual(self.view.monthly_summary.set('Income', 'recurring'), '0')
+        self.view._month.set('2031-')
+        self.assertFalse(self.view.monthly_summary.get_children())
+        self.assertFalse(self.view.dirty)
+
+    def test_funding_only_displays_once_outgoings_while_all_schedules_remain_saved(self):
+        self.view.set_base_rate(0, 'Effective today')
+        self.current_total.return_value = 100_000
+        start = date.today() + timedelta(days=400)
+        self.set_flows('Outgoing', (CashFlow('Loan', 100, start, frequency='monthly', count=3),
+                                    CashFlow('Loan', 250, start, frequency='monthly', count=2),
+                                    CashFlow('Trip', 600, start), CashFlow('Car', 1000, start)))
+        self.view._changed()
+        self.assertEqual([self.view.breakdown.item(item, 'text') for item in self.view.breakdown.get_children()],
+                         ['Trip', 'Car'])
+        self.assertNotIn('future', self.view.breakdown['columns'])
+        self.assertTrue(all(not self.view.breakdown.get_children(item) for item in self.view.breakdown.get_children()))
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 100_000)
+        self.view._sorting.sort('stock')
+        self.assertEqual(self.view.breakdown.item(self.view.breakdown.get_children()[0], 'text'), 'Trip')
+        self.assertTrue(self.view.save())
+        expected = self.view.settings()
+        self.view.load(self.directory)
+        self.assertEqual(self.view.settings(), expected)
+
+    def test_ongoing_costs_define_baseline_and_finite_instalments_are_funded_separately(self):
+        from portfolio.calculator import CashFlow
+
+        self.view.set_base_rate(0, 'Effective today')
+        self.current_total.return_value = 100_000
+        self.set_income('1000')
+        self.set_flows('Outgoing', (CashFlow('Food', 200, date.today(), frequency='monthly'),
+                                          CashFlow('Loan', 300, date.today(), frequency='monthly', count=12)))
+        self.view._changed()
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'recurring'), '500')
+        self.assertEqual(self.view.monthly_summary.set('Net', 'recurring'), '500')
+        names = [self.view.breakdown.item(item, 'text') for item in self.view.breakdown.get_children()]
+        self.assertNotIn('Food', names)
+        self.assertNotIn('Loan', names)
+        self.assertEqual(names, [])
+        self.assertEqual(self.view.cashflows.display_value(self.flow_rows('Outgoing')[0], 'ending'), 'Ongoing')
+
+    def test_selected_month_shows_recurring_single_and_net_without_changing_the_plan(self):
+        self.view.set_base_rate(0, 'Today')
+        self.current_total.return_value = 100_000
+        self.set_flows('Income', (CashFlow('Salary', 1000, date(2030, 1, 31), frequency='monthly', count=3),
+                                         CashFlow('Bonus', 250, date(2030, 2, 10))))
+        self.set_flows('Outgoing', (CashFlow('Rent', 400, date(2030, 1, 31), frequency='monthly'),
+                                           CashFlow('Loan', 100, date(2030, 1, 31), frequency='monthly', count=2),
+                                           CashFlow('Trip', 300, date(2030, 2, 15))))
+        self.view._changed()
+        self.assertTrue(self.view.save())
+        settings, original = self.view.settings(), (self.directory / 'calculator.json').read_bytes()
+        recommended = dict(self.view._summary_values)
+        self.changed.reset_mock()
+        self.view._month.set('2030-02')
+        self.assertEqual(self.view.monthly_summary.item('Income', 'values'), ('Income', '1\u202f000', '250', '1\u202f250'))
+        self.assertEqual(self.view.monthly_summary.item('Outgoings', 'values'), ('Outgoings', '500', '300', '800'))
+        self.assertEqual(self.view.monthly_summary.item('Net', 'values'), ('Net', '500', '-50', '450'))
+        self.assertEqual(self.view._saving_ratio.get(), '50%')
+        for currency in ('EUR', 'HUF'):
+            self.currency.set(currency)
+            self.view.refresh()
+            self.assertEqual(self.view._saving_ratio.get(), '50%')
+        self.view._month.set('2030-')
+        self.assertEqual(self.view._saving_ratio.get(), '—')
+        self.view._month.set('2030-04')
+        self.assertEqual(self.view.monthly_summary.set('Net', 'total'), '-400')
+        self.assertEqual(self.view._saving_ratio.get(), '—')
+        self.view._monthly_sorting.sort('total')
+        self.assertEqual(self.view.monthly_summary.get_children(), ('Net', 'Income', 'Outgoings'))
+        self.assertEqual(self.view.settings(), settings)
+        self.assertEqual(self.view._summary_values, recommended)
+        self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
+        self.assertFalse(self.view.dirty)
+        self.assertIsNone(self.view._autosave_id)
+        self.changed.assert_not_called()
+
+    def test_income_rows_keep_native_precision_through_currency_refresh_and_missing_rates(self):
+        self.view.set_base_rate(0, 'Today')
+        self.set_income('100.25123456789', 'USD')
+        self.assertTrue(self.view.save())
+        native = self.view.settings()
+        original = (self.directory / 'calculator.json').read_bytes()
+        self.changed.reset_mock()
+        for currency in ('EUR', 'HUF', 'GBP', 'USD', 'HUF'):
+            self.currency.set(currency)
+            self.view.refresh()
+            self.assertEqual(self.view.settings(), native)
+        self.assertEqual(self.view.monthly_summary.set('Income', 'recurring'), '36\u202f090')
+        self.rates.return_value = {}
+        self.view.refresh()
+        self.assertFalse(self.view.monthly_summary.get_children())
+        self.assertEqual(self.view._saving_ratio.get(), '—')
+        self.assertTrue(self.view.cashflows._enabled)
+        self.assertEqual(self.view.required_currencies, {'HUF', 'USD'})
+        self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
+        self.assertFalse(self.view.dirty)
+        self.changed.assert_not_called()
+        self.view.load(self.directory)
+        self.assertEqual(self.view.settings(), native)
+
+    def test_unified_cashflow_type_edit_moves_the_schedule_and_updates_summary_and_storage(self):
+        self.view.set_base_rate(0, 'Today')
+        self.current_total.return_value = 100_000
+        self.set_flows('Outgoing', (CashFlow('Refund', 300, date.today()),))
+        table = self.view.cashflows
+        self.assertEqual(table.tree['columns'][0], 'kind')
+        self.assertEqual(table.tree.heading('kind', 'text'), 'Type')
+        self.assertEqual(table.tree.heading('start', 'text'), 'Begins')
+        self.view._changed()
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'single'), '300')
+        self.assertEqual(len(self.view.breakdown.get_children()), 1)
+        old = table.get_rows()[0]
+        new = table._validate(dict(old, kind='Income'), old)
+        table.set_rows([new])
+        table._notify('edit', old, new)
+        self.wait_for_autosave()
+        settings = load_settings(self.directory)[0]
+        self.assertEqual(settings.outgoings, ())
+        self.assertEqual(settings.incomes[0].name, 'Refund')
+        self.assertEqual(self.view.monthly_summary.set('Income', 'single'), '300')
+        self.assertEqual(self.view.monthly_summary.set('Outgoings', 'single'), '0')
+        self.assertFalse(self.view.breakdown.get_children())
+        self.view.load(self.directory)
+        self.assertEqual(table.get_rows()[0]['kind'], 'Income')
+        with self.assertRaisesRegex(ValueError, 'Choose Income or Outgoing'):
+            table._validate(dict(new, kind='Other'), new)
+
+    def test_schedule_end_dates_have_no_prefix_and_type_is_a_dropdown(self):
+        from tkinter import ttk
+
+        table = self.view.cashflows
+        flow = CashFlow('Rent', 300, date(2030, 1, 1), frequency='monthly', end=date(2030, 6, 1))
+        self.assertEqual(table.display_value(table._row(flow, 'Outgoing'), 'ending'), '2030-06')
+        form = ttk.Frame(self.root)
+        self.addCleanup(form.destroy)
+        variables, _ = table._edit_fields(form, None)
+        selector = next(widget for widget in form.winfo_children()
+                        if isinstance(widget, ttk.Combobox)
+                        and str(widget.cget('textvariable')) == str(variables['kind']))
+        self.assertEqual(selector['values'], ('Income', 'Outgoing'))
+        self.assertTrue(selector.instate(['readonly']))
+        self.assertEqual(variables['kind'].get(), 'Outgoing')

@@ -33,10 +33,9 @@ class ModalDialogTests(unittest.TestCase):
             editor = AllocationEditor(self.root)
             editor.set_rows([{'parent': category, 'group': group, 'target': target}
                              for category, group, target in ((STOCK_MARKET, 'US', '60'), (TREASURY, 'EUR', '30'), (CASH, 'EUR', '10'))])
-            item = next(item for item, row in editor._rows.items() if row['parent'] == CASH)
-            return editor, lambda: editor._edit(item), lambda: float(next(
+            return editor, editor._edit, lambda: float(next(
                 row['target'] for row in editor.get_rows() if row['parent'] == CASH))
-        parent = HoldingsView(self.root) if kind == 'holdings' else self.root
+        parent = HoldingsView(self.root, category=CASH) if kind == 'holdings' else self.root
         editor = DataTable(parent, [('amount', 'Amount', 100), ('currency', 'Currency', 80)],
                            choices={'currency': lambda: ('EUR', 'HUF')})
         editor.set_rows([{'amount': '10', 'currency': 'EUR'}])
@@ -49,14 +48,18 @@ class ModalDialogTests(unittest.TestCase):
         return editor, open_dialog, lambda: float(editor.get_rows()[0]['amount'])
 
     def save(self, dialog):
-        form = dialog.winfo_children()[0]
-        entry = next(child for child in form.winfo_children()
-                     if isinstance(child, ttk.Entry) and not isinstance(child, ttk.Combobox))
-        entry.delete(0, 'end')
-        entry.insert(0, '15')
-        button = next(child for frame in form.winfo_children() for child in frame.winfo_children()
-                      if isinstance(child, ttk.Button) and child.cget('text') == 'Save')
-        button.invoke()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(dialog))
+        entries = [widget for widget in widgets if isinstance(widget, ttk.Entry)
+                   and not isinstance(widget, ttk.Combobox)]
+        values = ('55', '30', '15') if len(entries) == 3 else ('15',)
+        for entry, value in zip(entries, values):
+            entry.delete(0, 'end')
+            entry.insert(0, value)
+        next(widget for widget in widgets if isinstance(widget, ttk.Button) and widget['text'] == 'Save').invoke()
 
     def test_editors_wait_for_mapping_then_grab_and_save(self):
         original = tk.Toplevel

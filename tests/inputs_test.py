@@ -11,7 +11,7 @@ from main import main
 from portfolio.market import BaseRate, fetch_market_data
 from portfolio.planning import rebalance
 from portfolio.storage import load_portfolio, save_settings
-from portfolio.calculator import CalculatorSettings, Expense, MonthlyCost, ReturnAssumptions
+from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions
 
 
 class InputTests(unittest.TestCase):
@@ -96,10 +96,13 @@ class InputTests(unittest.TestCase):
                 fetch.assert_called_once_with(load_portfolio(self.directory), 'EUR', extra_currencies=('HUF',))
 
     def test_cli_combines_saved_currency_reserves_with_actual_wealth(self):
-        settings = CalculatorSettings(monthly_costs=(MonthlyCost('Rent', .5, 'EUR'), MonthlyCost('Food', 200)),
-                                       monthly_income=5, income_currency='USD', returns=ReturnAssumptions(mak=0),
-                                       cash_months=4,
-                                       expenses=(Expense('Purchase', 1, date.today() + timedelta(days=100), 'GBP'),))
+        today = date.today()
+        settings = CalculatorSettings(outgoings=(
+            CashFlow('Rent', .5, today, 'EUR', 'monthly'),
+            CashFlow('Food', 200, today, frequency='monthly'),
+            CashFlow('Purchase', 1, today + timedelta(days=100), 'GBP')),
+            incomes=(CashFlow('Income', 5, today, 'USD', 'monthly'),),
+            returns=ReturnAssumptions(mak=0), cash_months=4)
         save_settings(settings, self.directory, None)
         market = MarketData(self.market.quotes, {'HUF': .0025, 'USD': .9, 'GBP': 1.2})
         before = {path.name: path.read_bytes() for path in self.directory.iterdir()}

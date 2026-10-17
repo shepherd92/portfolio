@@ -175,6 +175,7 @@ class AssetDetails:
     ter: float | None = None
     name: str = ""
     ibkr_name: str = ""
+    color_hue: float | None = None
 
     def __post_init__(self):
         for name in ("isin", "exchange", "currency", "name", "ibkr_name"):
@@ -194,6 +195,11 @@ class AssetDetails:
             if ter > 100:
                 raise ValueError("TER percentage cannot exceed 100")
             object.__setattr__(self, "ter", ter)
+        if self.color_hue is not None:
+            hue = number(self.color_hue, "Chart color hue", minimum=0)
+            if hue > 360:
+                raise ValueError("Chart color hue cannot exceed 360 degrees")
+            object.__setattr__(self, "color_hue", hue)
 
 
 @dataclass(frozen=True)

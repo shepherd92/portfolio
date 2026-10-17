@@ -1,13 +1,14 @@
 """Deterministic projections of the calculator's allocation and protected reserves."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from math import exp, fsum, isfinite, log, log1p
 from numbers import Integral
 
-from portfolio.calculator import (expense_cash_date, expense_income, expense_reserve,
+from portfolio.calculator import (payment_cash_date, expense_income, expense_income_capacity, expense_reserve,
                                   huf_value, month_after, recommend)
 from portfolio.models import CASH, STOCK_MARKET, TREASURY, currency_code
+from portfolio.networth import net_worth_series
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class Projection:
     shortfalls: tuple[tuple[date, float], ...]
     currency: str
     deadline_shortfalls: tuple[tuple[date, float], ...] = ()
+    net_worth: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
 
 def project(settings, as_of, allocation, *, total, rates=None, years=30, currency='HUF'):
@@ -37,14 +39,21 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
     end = month_after(as_of, 12 * years)
     if end is None:
         raise ValueError('The projection horizon extends beyond the supported calendar.')
+    if hasattr(settings, 'wealth'):
+        settings.validate_context(as_of, rates, end)
     currency = currency_code(currency)
     conversion = huf_value(1, currency, rates)
-    ledger = _Ledger(settings, as_of, allocation, recommendation, rates)
+    ledger = _Ledger(settings, as_of, allocation, recommendation, rates, end)
+    wealth_projection = settings.wealth.project(as_of, end) if hasattr(settings, 'wealth') else None
+    wealth_days = {snapshot.day for snapshot in wealth_projection.snapshots if snapshot.before_payments} if wealth_projection else set()
     months = {month_after(as_of, month) for month in range(1, 12 * years + 1)}
-    events = {end, *months}
+    events = {end, *months, *wealth_days}
+    events.update(day for day in ledger.receipts if day <= end)
+    events.update(outgoing.start for outgoing in settings.outgoings
+                  if outgoing.ongoing and as_of < outgoing.start <= end)
     for pot in ledger.expenses:
         events.update(day for day in (pot.deadline, pot.due) if as_of < day <= end)
-    dates, portfolio, purpose = [], {}, {}
+    dates, portfolio, purpose, before_payments = [], {}, {}, []
 
     def record(day, *, before_cash=False):
         try:
@@ -53,6 +62,7 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
         except OverflowError as error:
             raise ValueError('Projection exceeds the supported numeric range; review its horizon and returns.') from error
         dates.append(day)
+        before_payments.append(before_cash)
         for target, source in ((portfolio, parts), (purpose, purposes)):
             for name, value in source.items():
                 target.setdefault(name, []).append(_display_value(value, conversion))
@@ -65,16 +75,22 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
     for day in sorted(events):
         ledger.grow(previous, day)
         record(day, before_cash=True)
-        changed = ledger.receive_income(day) if day in months else False
+        changed = ledger.receive_income(day)
         changed = ledger.reserve_cash(day) or changed
         changed = ledger.pay_expenses(day) or changed
-        if changed:
+        if changed or day in wealth_days:
             record(day)
         previous = day
+    net_worth = {}
+    if hasattr(settings, 'wealth'):
+        totals = tuple(fsum(values) for values in zip(*portfolio.values()))
+        net_worth = net_worth_series(settings.wealth, as_of, dates, totals, rates, currency,
+                                     before_payments=before_payments, projection=wealth_projection)
     return Projection(tuple(dates), {key: tuple(values) for key, values in portfolio.items()},
                       {key: tuple(values) for key, values in purpose.items()},
                       tuple((day, _display_value(value, conversion)) for day, value in ledger.shortfalls), currency,
-                      tuple((day, _display_value(value, conversion)) for day, value in ledger.deadline_shortfalls))
+                      tuple((day, _display_value(value, conversion)) for day, value in ledger.deadline_shortfalls),
+                      net_worth)
 
 
 @dataclass
@@ -82,45 +98,63 @@ class _ExpensePot:
     due: date
     deadline: date
     target: float
-    reserve: float
-    stock_scale: float
+    baseline: float
+    defensive: float
     income: float = 0
     paid: bool = False
     deadline_checked: bool = False
+    linked: bool = False
 
-    def stock_fraction(self, day, horizon_days):
-        return min(1., max(0, (self.deadline - day).days) / horizon_days) * self.stock_scale
+    @property
+    def value(self):
+        return self.baseline + self.defensive + self.income
+
+    def stock(self, day, horizon_days):
+        return self.baseline * min(1., max(0, (self.deadline - day).days) / horizon_days)
 
 
 class _Ledger:
-    def __init__(self, settings, as_of, allocation, recommendation, rates):
+    def __init__(self, settings, as_of, allocation, recommendation, rates, end):
+        self.settings, self.rates = settings, rates
         self.market_return = recommendation.market_return
         self.mak_return = recommendation.mak_return
         self.mix = {name: weight / 100 for name, weight in allocation.totals.items()}
         self.long_return = self.mix[STOCK_MARKET] * self.market_return + self.mix[TREASURY] * self.mak_return
-        self.savings = settings.monthly_savings(rates)
-        spending = settings.monthly_spending(rates)
-        self.fixed_targets = [spending * settings.emergency_months, spending * settings.cash_months]
+        self._set_buffer_targets(as_of)
         self.emergency, self.cash = (row.amount for row in recommendation.rows[:2])
         self.long_term = recommendation.rows[-1].amount
         self.horizon_days = (month_after(as_of, 12 * settings.horizon_years) - as_of).days
-        amounts = [huf_value(expense.amount, expense.currency, rates) for expense in settings.expenses]
-        _, self.payments = expense_income(settings.expenses, amounts, self.savings, as_of,
-                                          self.mak_return, settings.cash_months)
+        expenses = settings.scheduled_payments(as_of)
+        amounts = [huf_value(expense.amount, expense.currency, rates) for expense in expenses]
+        last_deadline = max((payment_cash_date(expense, settings.cash_months) for expense in expenses), default=end)
+        self.receipts = dict(settings.income_receipts(as_of, max(end, last_deadline), rates))
+        capacities = [expense_income_capacity(amount, max(0, (payment_cash_date(expense, settings.cash_months) - as_of).days),
+                                             self.horizon_days, self.mak_return if expense.defensive else self.market_return,
+                                             self.mak_return, defensive=expense.defensive)
+                      for expense, amount in zip(expenses, amounts)]
+        _, self.payments = expense_income(expenses, capacities, tuple(self.receipts.items()), self.mak_return, settings.cash_months,
+                                          buffer_increases=settings.buffer_increases(as_of, rates))
         self.expenses, self.shortfalls, self.deadline_shortfalls = [], [], []
-        for expense, amount, row in zip(settings.expenses, amounts, recommendation.rows[2:-1]):
-            deadline = expense_cash_date(expense.due, settings.cash_months)
-            fraction = min(1., max(0, (deadline - as_of).days) / self.horizon_days)
-            scale = min(1., row.stock / row.amount / fraction) if row.amount and fraction else 0.
-            self.expenses.append(_ExpensePot(expense.due, deadline, amount, row.amount, scale))
+        for expense, amount, row in zip(expenses, amounts, recommendation.rows[2:-1]):
+            deadline = payment_cash_date(expense, settings.cash_months)
+            fraction = 0. if expense.defensive else min(1., max(0, (deadline - as_of).days) / self.horizon_days)
+            baseline = row.stock / fraction if fraction else 0.
+            # A negative adjustment is the absent defensive principal replaced by
+            # future receipts. It is never counted as money the portfolio owns.
+            self.expenses.append(_ExpensePot(expense.due, deadline, amount, baseline, row.amount - baseline,
+                                             linked=expense.outgoing_index < 0))
+        if hasattr(settings, 'operating_payments'):
+            for payment in settings.operating_payments(as_of, end):
+                amount = huf_value(payment.amount, payment.currency, rates)
+                self.expenses.append(_ExpensePot(payment.due, payment.due, amount, 0., 0., linked=True))
 
     def allocations(self, day, *, before_cash=False):
         cash_day = day - timedelta(days=1) if before_cash else day
-        stock = fsum(pot.reserve * pot.stock_fraction(day, self.horizon_days)
+        stock = fsum(pot.stock(day, self.horizon_days)
                      for pot in self.expenses if not pot.paid)
-        cash = fsum(pot.reserve + pot.income for pot in self.expenses
+        cash = fsum(pot.value for pot in self.expenses
                     if not pot.paid and cash_day >= pot.deadline)
-        invested = fsum(pot.reserve + pot.income for pot in self.expenses
+        invested = fsum(pot.value for pot in self.expenses
                         if not pot.paid and cash_day < pot.deadline)
         parts = {STOCK_MARKET: self.long_term * self.mix[STOCK_MARKET] + stock,
                  TREASURY: self.long_term * self.mix[TREASURY] + self.emergency + max(0., invested - stock),
@@ -141,20 +175,22 @@ class _Ledger:
                     continue
                 end_days = max(0, (pot.deadline - end).days)
                 start_days = (pot.deadline - start).days
-                market_return = self.mak_return + pot.stock_scale * (self.market_return - self.mak_return)
-                if pot.reserve:
-                    before = expense_reserve(1., start_days, self.horizon_days, market_return, self.mak_return)
-                    after = expense_reserve(1., end_days, self.horizon_days, market_return, self.mak_return)
-                    pot.reserve *= after / before
+                if pot.baseline:
+                    before = expense_reserve(1., start_days, self.horizon_days, self.market_return, self.mak_return)
+                    after = expense_reserve(1., end_days, self.horizon_days, self.market_return, self.mak_return)
+                    pot.baseline *= after / before
+                pot.defensive = _grow(pot.defensive, self.mak_return, start_days - end_days)
                 pot.income = _grow(pot.income, self.mak_return, start_days - end_days)
         except (OverflowError, ZeroDivisionError) as error:
             raise ValueError('Projection exceeds the supported numeric range; review its horizon and returns.') from error
+        self._set_buffer_targets(end)
         self.long_term = self._fill_buffers(self.long_term)
 
     def receive_income(self, day):
-        if not self.savings:
+        savings = self.receipts.get(day, 0.)
+        if not savings:
             return False
-        available = self._fund_expense_cash(day, self._fill_buffers(self.savings))
+        available = self._fund_expense_cash(day, self._fill_buffers(savings))
         for index, scheduled in self.payments.get(day, ()):
             pot = self.expenses[index]
             if not pot.paid and day < pot.deadline:
@@ -174,24 +210,27 @@ class _Ledger:
         for pot in sorted(self.expenses, key=lambda pot: pot.due):
             if pot.paid or pot.due > day:
                 continue
-            value = pot.reserve + pot.income
+            value = pot.value
             deficit = max(0., pot.target - value)
             extra = min(self.long_term, deficit)
             self.long_term += max(0., value - pot.target) - extra
             if deficit - extra > max(1e-7, pot.target * 1e-12):
+                if pot.linked:
+                    raise ValueError(f'Cannot project: a linked payment in {day:%Y-%m} has an unfunded '
+                                     f'{deficit - extra:.0f} HUF. Review income, balances or its schedule.')
                 self.shortfalls.append((day, deficit - extra))
-            pot.reserve = pot.income = 0.
+            pot.baseline = pot.defensive = pot.income = 0.
             pot.paid = True
             changed = True
         return changed
 
     def _fund_expense_cash(self, day, available, *, check_deadlines=False):
-        for pot in sorted(self.expenses, key=lambda pot: pot.due):
+        for pot in sorted(self.expenses, key=lambda pot: pot.deadline):
             if pot.paid or day < pot.deadline:
                 continue
-            deficit = max(0., pot.target - pot.reserve - pot.income)
+            deficit = max(0., pot.target - pot.value)
             amount = min(available, deficit)
-            pot.reserve += amount
+            pot.defensive += amount
             available -= amount
             if check_deadlines and not pot.deadline_checked:
                 if deficit - amount > max(1e-7, pot.target * 1e-12):
@@ -205,6 +244,11 @@ class _Ledger:
         emergency = min(amount - cash, max(0., self.fixed_targets[0] - self.emergency))
         self.emergency += emergency
         return max(0., amount - cash - emergency)
+
+    def _set_buffer_targets(self, day):
+        spending = self.settings.monthly_spending(self.rates, as_of=day)
+        self.fixed_targets = [spending * self.settings.emergency_months,
+                              spending * self.settings.cash_months]
 
 
 def _grow(value, annual_return, days):

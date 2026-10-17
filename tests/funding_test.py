@@ -5,7 +5,7 @@ from datetime import date
 from math import fsum
 import unittest
 
-from portfolio.calculator import CalculatorSettings, Expense, MonthlyCost, ReturnAssumptions, recommend
+from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions, recommend
 from portfolio.funding import prepare_allocation
 from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY,
                               Holding, ManualHolding, MarketData, Portfolio, Quote)
@@ -21,8 +21,13 @@ class FundingTests(unittest.TestCase):
                                    self.allocation, {'HUF': 1_000})
         self.market = MarketData({'US': Quote(1, 'EUR'), 'EU': Quote(1, 'EUR')},
                                  {'EUR': 1, 'HUF': .0025})
-        self.settings = CalculatorSettings(monthly_costs=(MonthlyCost('Rent', 60), MonthlyCost('Food', 40)),
-                                            returns=ReturnAssumptions(equities=0, mak=0))
+        self.settings = CalculatorSettings(
+            returns=ReturnAssumptions(equities=0, mak=0),
+            outgoings=(
+                CashFlow('Rent', 60, date.min, frequency='monthly'),
+                CashFlow('Food', 40, date.min, frequency='monthly'),
+            ),
+        )
 
     def prepare(self, **settings):
         return prepare_allocation(self.portfolio, self.market,
@@ -58,7 +63,7 @@ class FundingTests(unittest.TestCase):
         self.assertEqual(dict(huf.minimum_values), {(CASH, 'HUF'): 200, (TREASURY, 'HUF'): 600})
 
     def test_no_reserves_preserve_home_targets_without_creating_protected_balances(self):
-        result = self.prepare(monthly_costs=())
+        result = self.prepare(outgoings=())
         self.assertEqual(result.portfolio.allocation, self.allocation)
         self.assertEqual(dict(result.minimum_values), {})
         self.assertEqual(result.recommendation.rows[-1].amount, 1_000)
@@ -78,14 +83,16 @@ class FundingTests(unittest.TestCase):
                 self.assertAlmostEqual(fsum(result.minimum_values.values()), cash * .0025)
 
     def test_expense_stock_uses_home_market_mix_and_defensive_portion_is_huf(self):
-        result = self.prepare(monthly_costs=(), horizon_years=1,
-                              expenses=(Expense('Half year', 200, date(2024, 9, 2)),))
+        result = self.prepare(horizon_years=1, outgoings=(CashFlow('Half year', 200, date(2024, 9, 2)),))
         values = self.target_values(result)
-        self.assertAlmostEqual(values[STOCK_MARKET, 'US'], 800 * .4 + 100 * 2 / 3)
-        self.assertAlmostEqual(values[STOCK_MARKET, 'EU'], 800 * .2 + 100 / 3)
+        stock = 200 * 182 / 366  # Jan 1–Jul 1 cash deadline in leap year 2024.
+        defensive = 200 - stock
+        self.assertAlmostEqual(values[STOCK_MARKET, 'US'], 800 * .4 + stock * 2 / 3)
+        self.assertAlmostEqual(values[STOCK_MARKET, 'EU'], 800 * .2 + stock / 3)
         self.assertAlmostEqual(values[TREASURY, 'EUR'], 160)
-        self.assertAlmostEqual(values[TREASURY, 'HUF'], 260)
-        self.assertEqual(dict(result.minimum_values), {(TREASURY, 'HUF'): .25})
+        self.assertAlmostEqual(values[TREASURY, 'HUF'], 160 + 100.54)
+        self.assertAlmostEqual(result.minimum_values[TREASURY, 'HUF'], 100.54 / 400)
+        self.assertAlmostEqual(result.minimum_values[CASH, 'HUF'], (defensive - 100.54) / 400)
 
     def test_long_term_cash_and_its_zero_return_are_separate_from_protected_cash(self):
         allocation = AllocationTargets({STOCK_MARKET: {'US': 40, 'EU': 20},
@@ -117,17 +124,22 @@ class FundingTests(unittest.TestCase):
             self.assertAlmostEqual(self.target_values(result)[key] * .0025, value)
 
     def test_salary_already_received_is_current_wealth_and_future_payments_begin_next_month(self):
-        expenses = (Expense('Now', 100, self.today), Expense('Next month', 100, date(2024, 4, 1)))
-        result = self.prepare(monthly_costs=(), monthly_income=100, expenses=expenses)
+        expenses = (CashFlow('Now', 100, self.today), CashFlow('Next month', 100, date(2024, 4, 1)))
+        result = self.prepare(incomes=(CashFlow('Salary', 100, self.today, frequency='monthly'),), outgoings=expenses)
         self.assertEqual(result.recommendation.total, 1_000)
-        self.assertEqual([row.income_funded for row in result.recommendation.rows[2:-1]], [0, 100])
-        self.assertEqual(result.recommendation.rows[-1].amount, 900)
+        now, later = result.recommendation.rows[2:-1]
+        fraction = 31 / (date(2031, 1, 1) - self.today).days
+        self.assertEqual(now.income_funded, 0)
+        self.assertAlmostEqual(later.income_funded, 100 * (1 - fraction))
+        self.assertAlmostEqual(later.stock, 100 * fraction)
+        self.assertAlmostEqual(later.mak, 0)
+        self.assertAlmostEqual(result.recommendation.rows[-1].amount, 900 - later.stock)
 
     def test_reserve_stock_requires_home_mix_but_unfunded_stock_does_not(self):
         allocation = AllocationTargets({STOCK_MARKET: {'US': 0, 'EU': 0},
                                          TREASURY: {'HUF': 100}, CASH: {}})
         portfolio = replace(self.portfolio, allocation=allocation)
-        settings = replace(self.settings, expenses=(Expense('Later', 100, date(2031, 1, 1)),))
+        settings = replace(self.settings, outgoings=(*self.settings.outgoings, CashFlow('Later', 100, date(2031, 1, 1))))
         with self.assertRaisesRegex(ValueError, 'Stock market mix on Portfolio'):
             prepare_allocation(portfolio, self.market, settings, self.today)
         result = prepare_allocation(replace(portfolio, cash={'HUF': 100}), self.market, settings, self.today)

@@ -6,16 +6,19 @@ from numbers import Real
 from portfolio.models import AssetDetails, currency_code, identifier
 
 
-def fetch_asset_details(ticker):
+def fetch_asset_details(ticker, *, cache=None):
     """Look up an exact Yahoo ticker, without guessing another listing or broker name.
 
     Yahoo's annual-report expense ratio is a fraction, converted here to percent.
     It may be unavailable or older than the issuer's current published charge.
     yfinance's experimental, name-matched ISIN search is deliberately not used.
     """
+    ticker = identifier(ticker, 'Ticker').upper()
+    if cache is not None:
+        return cache._get(('metadata', ticker), lambda: fetch_asset_details(ticker))[0]
+
     import yfinance as yf
 
-    ticker = identifier(ticker, 'Ticker').upper()
     try:
         asset = yf.Ticker(ticker)
         info = asset.get_info()

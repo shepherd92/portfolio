@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from portfolio.models import (AllocationTargets, AssetDetails, CASH, STOCK_MARKE
                               Holding, ManualHolding, MarketData, Portfolio, Quote)
 from portfolio.market import BaseRate
 from portfolio.funding import prepare_allocation
+from portfolio.calculator import CashFlow
 from portfolio.storage import load_settings
 from portfolio.storage import save_portfolio
 from ui.app import PortfolioApp
@@ -85,9 +87,37 @@ class CalculatorIntegrationTests(unittest.TestCase):
     def csv_bytes(self):
         return {path.name: path.read_bytes() for path in self.directory.glob('*.csv')}
 
+    def flow_rows(self, kind):
+        return [row for row in self.view.cashflows.get_rows() if row['kind'] == kind]
+
+    def set_flow_rows(self, kind, rows):
+        other = [row for row in self.view.cashflows.get_rows() if row['kind'] != kind]
+        self.view.cashflows.set_rows(other + [dict(row, kind=kind) for row in rows])
+
+    def set_flows(self, kind, flows):
+        self.set_flow_rows(kind, [self.view.cashflows._row(flow, kind) for flow in flows])
+
+    def set_income(self, amount, currency=None):
+        rows = [] if str(amount) == '0' else [dict(name='Salary', amount=str(amount),
+                                                  currency=currency or self.view._currency.get(),
+                                                  frequency='monthly', start=date.today().isoformat()[:7])]
+        self.set_flow_rows('Income', rows)
+        self.view._changed()
+
+    def set_cost_rows(self, rows):
+        existing = [row for row in self.flow_rows('Outgoing') if row['frequency'] == 'once']
+        costs = [dict(row, frequency='monthly', start=date.today().isoformat()[:7], count='', end='') for row in rows]
+        self.set_flow_rows('Outgoing', costs + existing)
+
+    def set_single_rows(self, rows):
+        existing = [row for row in self.flow_rows('Outgoing') if row['frequency'] != 'once']
+        payments = [dict(name=row['name'], amount=row['amount'], currency=row['currency'],
+                         frequency='once', start=row['due'][:7], count='', end='') for row in rows]
+        self.set_flow_rows('Outgoing', existing + payments)
+
     def set_monthly_cost(self, amount, currency='HUF'):
         rows = [{'name': 'Living costs', 'amount': str(amount), 'currency': currency}] if float(amount) else []
-        self.view.monthly_costs.set_rows(rows)
+        self.set_cost_rows(rows)
         self.view._changed()
 
     def test_returns_follow_category_assumptions_and_portfolio_targets_automatically(self):
@@ -96,10 +126,10 @@ class CalculatorIntegrationTests(unittest.TestCase):
             self.view._inputs[name].set(value)
         self.assertNotIn('market_return', self.view._inputs)
         self.assertEqual({name: value.get() for name, value in self.view.return_weights.items()},
-                         {'Equities': '60%', 'Gold': '20%', 'Bonds': '10%', 'MÁK': '10%'})
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 6.1%')
+                         {'Equities': '60%', 'Gold': '20%', 'Bonds': '10%'})
+        self.assertEqual(self.view.overall_return.get(), '6.1%')
         self.view._inputs['equities'].set('10')
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 7.3%')
+        self.assertEqual(self.view.overall_return.get(), '7.3%')
         rows = self.app.target_table.get_rows()
         for row in rows:
             if row['parent'] == STOCK_MARKET and row['group'] in ('World', 'Bullion'):
@@ -108,7 +138,108 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.app._edited()
         self.assertEqual(self.view.return_weights['Equities'].get(), '20%')
         self.assertEqual(self.view.return_weights['Gold'].get(), '60%')
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 4.1%')
+        self.assertEqual(self.view.overall_return.get(), '4.1%')
+
+    def test_portfolio_return_editors_share_autosave_and_clear_invalid_projection(self):
+        self.configure_calculator()
+        before = self.csv_bytes()
+        self.app.projection_button.invoke()
+        window = self.app.projection_window
+        self.assertIsNotNone(window._projection)
+        starting_value = sum(series[0] for series in window._projection.portfolio.values())
+        self.assertAlmostEqual(starting_value, 160)
+        self.app.plan = object()
+        editor = self.view._return_rows['Equities'][1]
+        editor.delete(0, 'end')
+        editor.insert(0, '7.1234567')
+        self.assertEqual(self.view.settings().returns.equities, 7.1234567)
+        self.assertIsNone(self.app.plan)
+        self.assertIsNotNone(window._projection)
+        self.root.after(550, self.root.quit)
+        self.root.mainloop()
+        settings, _ = load_settings(self.directory)
+        self.assertEqual(settings.returns.equities, 7.1234567)
+        self.assertEqual(settings.returns.mak, 5)
+        saved = (self.directory / 'calculator.json').read_bytes()
+        editor.delete(0, 'end')
+        editor.insert(0, 'invalid')
+        self.assertFalse(self.view.allocation_summary.get_children())
+        self.assertEqual(self.view.overall_return.get(), '—')
+        self.assertIsNone(window._projection)
+        self.assertFalse(window.canvas.find_withtag('area'))
+        self.assertIn('Equities', window._message)
+        self.assertFalse(self.view.save())
+        self.assertEqual((self.directory / 'calculator.json').read_bytes(), saved)
+        editor.delete(0, 'end')
+        editor.insert(0, '8.25')
+        self.assertTrue(self.view.save())
+        self.assertIsNotNone(window._projection)
+        self.assertEqual(self.csv_bytes(), before)
+        self.assertFalse(self.app.dirty)
+        self.reopen()
+        self.assertEqual(self.view.settings().returns.equities, 8.25)
+        self.assertEqual(self.view.settings().returns.mak, 5)
+
+    def test_return_controls_and_projection_exist_only_on_corresponding_portfolio_pages(self):
+        self.root.deiconify()
+        self.root.geometry('1050x760')
+        self.app.notebook.select(self.app.portfolio_page)
+        self.app.portfolio_notebook.select(self.app.summary_page)
+        self.root.update()
+        self.assertTrue(self.app.projection_button.winfo_ismapped())
+        self.assertIs(self.app.projection_button.master.master, self.app.summary_page)
+        self.assertIs(self.app.target_table.edit_button.master, self.app.projection_button.master)
+        self.assertEqual(self.app.target_table.edit_button.winfo_rooty(), self.app.projection_button.winfo_rooty())
+        right = self.root.winfo_rootx() + self.root.winfo_width()
+        bottom = self.root.winfo_rooty() + self.root.winfo_height()
+        for branch in (STOCK_MARKET, TREASURY):
+            page = self.app.allocation_pages[branch]
+            if branch == STOCK_MARKET:
+                self.app.portfolio_notebook.select(self.app.stock_page)
+                self.app.stock_notebook.select(page)
+            else:
+                self.app.portfolio_notebook.select(page)
+            self.root.update()
+            self.assertFalse(self.app.projection_button.winfo_ismapped())
+            self.assertIs(self.view.return_panels[branch].master, page.return_controls)
+            if branch == STOCK_MARKET:
+                controls = [widget for widgets in self.view._return_rows.values() for widget in widgets]
+            else:
+                controls = [self.view._mak_entry, self.view._auto_rate_box]
+            for widget in (*controls, page.targets, page.holdings):
+                self.assertTrue(widget.winfo_ismapped())
+                self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(), right)
+                self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), bottom)
+            self.assertEqual(self.view._auto_rate_box.winfo_ismapped(), branch == TREASURY)
+            for widget in (page.targets.edit_button, page.holdings.add_button, page.holdings.edit_button,
+                           page.holdings.remove_button):
+                self.assertTrue(widget.winfo_ismapped())
+                self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), page.winfo_rooty() + page.winfo_height())
+            self.view.message.set('Equities: enter a number.')
+            self.root.update()
+            self.assertTrue(self.view._return_messages[0 if branch == STOCK_MARKET else 1].winfo_ismapped())
+            self.assertLessEqual(page.holdings.add_button.winfo_rooty() + page.holdings.add_button.winfo_height(),
+                                 page.winfo_rooty() + page.winfo_height())
+            self.view.refresh()
+        self.app._set_busy(True)
+        self.app.projection_button.invoke()
+        self.assertIsNone(self.app.projection_window)
+        self.assertTrue(self.view._auto_rate_box.instate(['disabled']))
+        self.assertTrue(self.view._mak_entry.instate(['disabled']))
+        self.assertTrue(all(widgets[1].instate(['disabled']) for widgets in self.view._return_rows.values()))
+        self.app._set_busy(False)
+        self.assertTrue(self.view._mak_entry.instate(['disabled']))
+        self.app.portfolio_notebook.select(self.app.summary_page)
+        self.app.projection_button.invoke()
+        window = self.app.projection_window
+        self.assertIsNotNone(window._projection)
+        self.app.projection_button.invoke()
+        self.assertIs(self.app.projection_window, window)
+        self.app.notebook.select(self.view)
+        self.root.update()
+        self.assertFalse(self.app.projection_button.winfo_ismapped())
+        self.assertFalse(any(widgets[1].winfo_ismapped() for widgets in self.view._return_rows.values()))
+        self.assertFalse(self.view._mak_entry.winfo_ismapped())
 
     def test_unclassified_positive_targets_block_calculation_and_planning(self):
         self.configure_calculator()
@@ -132,7 +263,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
                 row['target'] = '80'
         self.app.target_table.set_rows(rows)
         self.app._edited()
-        self.assertEqual(self.view.overall_return.get(), 'Overall annual return: 5.6%')
+        self.assertEqual(self.view.overall_return.get(), '5.6%')
         self.errors.reset_mock()
         self.app.generate_plan()
         self.finish_work()
@@ -142,14 +273,14 @@ class CalculatorIntegrationTests(unittest.TestCase):
     def test_portfolio_value_is_available_on_startup_without_a_calculator_visit(self):
         self.assertEqual(self.view.portfolio_value.get(), '160')
         self.assertEqual(self.app._calculator_total(), 64_000)
-        self.assertEqual(sum(row['amount'] for row in self.view._values.values()), 64_000)
+        self.assertEqual(sum(row['amount'] for row in self.view._summary_values.values()), 64_000)
         self.prices.assert_not_called()
         self.assertIs(self.app.market, self.market)
         self.assertFalse(self.app.dirty)
         self.assertFalse(self.view.dirty)
 
     def test_cash_and_quote_changes_refresh_exact_value_without_editing_calculator_settings(self):
-        self.view._inputs['monthly_income'].set('1')
+        self.set_income('1')
         self.assertTrue(self.view.save())
         original = (self.directory / 'calculator.json').read_bytes()
         settings = self.view.settings()
@@ -161,7 +292,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.app._accept_market(updated)
         self.assertEqual(self.view.portfolio_value.get(), '210')
         self.assertEqual(self.app._calculator_total(), 84_150)
-        self.assertAlmostEqual(sum(row['amount'] for row in self.view._values.values()), 84_150)
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 84_150)
         self.assertEqual(self.view.settings(), settings)
         self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
         self.assertFalse(self.view.dirty)
@@ -171,51 +302,36 @@ class CalculatorIntegrationTests(unittest.TestCase):
 
     def test_calculator_currency_is_shared_and_refreshes_quotes_without_changing_huf_recommendations(self):
         portfolio = self.app.portfolio()
-        box = self.view._currency_box
+        box = self.app.base_entry
         self.assertEqual(str(box.cget('textvariable')), str(self.app.base_currency))
         self.assertTrue(box.instate(['readonly']))
         self.prices.return_value = MarketData(self.market.quotes, {'EUR': 1.1, 'HUF': .00275}, 'USD')
         self.app.base_currency.set('USD')
         self.finish_work()
-        self.prices.assert_called_once_with(portfolio, 'USD', extra_currencies=('HUF',))
+        self.prices.assert_called_once_with(portfolio, 'USD', extra_currencies=('HUF',), cache=self.app.market_cache)
         self.assertEqual(self.view.portfolio_value.get(), '176')
         self.assertAlmostEqual(self.app._calculator_total(), 64_000)
-        self.assertAlmostEqual(sum(row['amount'] for row in self.view._values.values()), 64_000)
+        self.assertAlmostEqual(sum(row['amount'] for row in self.view._summary_values.values()), 64_000)
         self.assertEqual(self.app.portfolio(), portfolio)
         self.assertFalse(self.view.dirty)
 
     def test_currency_switch_preserves_unsaved_income_during_pending_quote_refresh(self):
-        income = self.view._income_entry
-        income._display.set('12.125')
+        self.set_income('12.125', 'EUR')
         settings = self.view.settings()
-        self.assertEqual(settings.income_currency, 'EUR')
+        self.assertEqual(settings.incomes[0].currency, 'EUR')
         self.prices.return_value = MarketData(self.market.quotes, {'EUR': 1.1, 'HUF': .00275}, 'USD')
         self.app.base_currency.set('USD')
-        self.assertEqual(income.get(), '—')
-        self.assertTrue(income.instate(['disabled']))
+        self.assertFalse(self.view.cashflows._enabled)
         self.assertEqual(self.view.settings(), settings)
         self.assertTrue(self.view.save())
         original = (self.directory / 'calculator.json').read_bytes()
         self.finish_work()
-        self.prices.assert_called_once_with(self.app.portfolio(), 'USD', extra_currencies=('EUR', 'HUF'))
-        self.assertAlmostEqual(float(self.view._inputs['monthly_income'].get()), 13.3375)
-        self.assertTrue(income.instate(['!disabled']))
+        self.prices.assert_called_once_with(self.app.portfolio(), 'USD', extra_currencies=('EUR', 'HUF'), cache=self.app.market_cache)
+        self.assertEqual(self.view.monthly_summary.set('Income', 'recurring'), '13')
         self.assertEqual(self.view.settings(), settings)
         self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
         self.assertFalse(self.view.dirty)
 
-    def test_currency_switch_waits_for_an_incomplete_income_draft(self):
-        income = self.view._income_entry
-        income._display.set('unfinished')
-        revision = self.app.revision
-        self.app.base_currency.set('USD')
-        self.assertEqual(self.app.base_currency.get(), 'EUR')
-        self.assertEqual(income.get(), 'unfinished')
-        self.assertIs(self.app.market, self.market)
-        self.assertEqual(self.app.revision, revision)
-        self.assertIn('Complete the income edit', self.view.message.get())
-        self.prices.assert_not_called()
-        self.errors.assert_not_called()
 
     def test_missing_valuation_clears_results_without_inventing_a_zero_portfolio(self):
         for market in (None, MarketData(self.market.quotes, {}), MarketData({}, {'HUF': .0025})):
@@ -263,7 +379,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
     def test_target_pie_switches_current_reserves_and_long_term_without_editing_targets(self):
         self.configure_calculator()
         self.set_monthly_cost('1000')
-        self.view.expenses.set_rows([{'name': 'Upcoming bill', 'amount': '6000', 'currency': 'HUF',
+        self.set_single_rows([{'name': 'Upcoming bill', 'amount': '6000', 'currency': 'HUF',
                                      'due': (date.today() + timedelta(days=40)).isoformat()}])
         self.view._changed()
         portfolio = self.app.portfolio()
@@ -271,18 +387,19 @@ class CalculatorIntegrationTests(unittest.TestCase):
         revision = self.app.revision
         funding = prepare_allocation(portfolio, self.market, self.view.planning_settings(), date.today())
         expected = funding.portfolio.allocation.weights
-        self.app.target_basis.set('Current')
+        self.app.target_basis.set('Whole portfolio')
         for branch, weights in expected.items():
-            self.assertAlmostEqual(self.app.target_chart._data[branch], sum(weights.values()))
-        self.app.chart_scope.set(CASH)
-        self.assertGreater(self.app.target_chart._data['HUF'], 0)
+            self.assertAlmostEqual(self.app.target_chart._fractions.get(branch, 0), sum(weights.values()) / 100)
         self.assertNotIn('HUF', portfolio.allocation.weights[CASH])
-        self.assertAlmostEqual(self.app.target_chart._data['HUF'], expected[CASH]['HUF'])
-        self.app.chart_scope.set(TREASURY)
-        self.assertAlmostEqual(self.app.target_chart._data['HUF'], expected[TREASURY]['HUF'])
-        self.app.chart_scope.set('All')
+        self.assertGreater(expected[CASH]['HUF'], 0)
+        mak = self.app.allocation_pages[TREASURY]
+        mak.target_basis.set('Whole portfolio')
+        self.assertAlmostEqual(mak.target_chart._data['HUF'],
+                               expected[TREASURY]['HUF'] / sum(expected[TREASURY].values()) * 100)
+        mak.target_basis.set('Long-term')
         self.app.target_basis.set('Long-term')
-        self.assertEqual(self.app.target_chart._data, {STOCK_MARKET: 90, TREASURY: 10, CASH: 0})
+        self.assertAlmostEqual(self.app.target_chart._fractions[STOCK_MARKET], .9)
+        self.assertAlmostEqual(self.app.target_chart._fractions[TREASURY], .1)
         self.assertEqual(self.app.target_table.get_rows(), targets)
         self.assertEqual(self.app.portfolio(), portfolio)
         self.assertEqual(self.app.revision, revision)
@@ -293,9 +410,9 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.app.plan_report = 'Existing plan'
         self.configure_calculator()
         self.set_monthly_cost('1000')
-        self.view._inputs['monthly_income'].set('12.5')
+        self.set_income('12.5')
         self.view._inputs['cash_months'].set('4')
-        self.view.expenses.set_rows([{'name': 'Expense', 'amount': '5000', 'currency': 'HUF', 'due': '2030-01-01'}])
+        self.set_single_rows([{'name': 'Expense', 'amount': '5000', 'currency': 'HUF', 'due': '2030-01-01'}])
         self.view.refresh()
         self.assertTrue(self.view.dirty)
         self.assertFalse(self.app.dirty)
@@ -303,11 +420,11 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.root.mainloop()
         settings, _ = load_settings(self.directory)
         self.assertEqual(settings.monthly_spending(), 1000)
-        self.assertEqual(settings.monthly_income, 12.5)
-        self.assertEqual(settings.income_currency, 'EUR')
+        self.assertEqual(settings.incomes[0].amount, 12.5)
+        self.assertEqual(settings.incomes[0].currency, 'EUR')
         self.assertEqual(settings.cash_months, 4)
-        self.assertEqual(settings.monthly_savings(self.app._calculator_rates()), 4000)
-        self.assertEqual(settings.expenses[0].amount, 5000)
+        self.assertEqual(settings.monthly_totals(date.today().year, date.today().month, self.app._calculator_rates()).recurring_income - settings.monthly_spending(self.app._calculator_rates()), 4000)
+        self.assertEqual(settings.outgoings[-1].amount, 5000)
         self.assertFalse(self.view.dirty)
         self.assertEqual(self.csv_bytes(), before)
         self.assertEqual(self.app.portfolio(), portfolio)
@@ -319,7 +436,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         before, portfolio = self.csv_bytes(), self.app.portfolio()
         self.configure_calculator()
         self.set_monthly_cost('1000')
-        self.view._inputs['monthly_income'].set('12.5')
+        self.set_income('12.5')
         self.app.generate_plan()
         self.finish_work()
         self.errors.assert_not_called()
@@ -339,14 +456,10 @@ class CalculatorIntegrationTests(unittest.TestCase):
         before, portfolio = self.csv_bytes(), self.app.portfolio()
         self.configure_calculator()
         self.set_monthly_cost('1000')
-        self.view._inputs['monthly_income'].set('25')
-        self.view.expenses.set_rows([{'name': 'Upcoming bill', 'amount': '6000', 'currency': 'HUF',
+        self.set_income('25')
+        self.set_single_rows([{'name': 'Upcoming bill', 'amount': '6000', 'currency': 'HUF',
                                      'due': (date.today() + timedelta(days=40)).isoformat()}])
         self.view._changed()
-        reserves = {row['purpose']: row for row in self.view._values.values()}
-        self.assertEqual(reserves['Emergency reserve']['mak'], 6000)
-        self.assertEqual(reserves['Emergency reserve']['cash'], 0)
-        self.assertEqual(reserves['Bank cash buffer']['cash'], 2000)
         expense = next(value for value in self.view._values.values() if value['purpose'] == 'Upcoming bill')
         self.assertEqual((expense['cash'], expense['mak'], expense['stock']), (6000, 0, 0))
         self.assertEqual(expense['income'], 0)
@@ -363,9 +476,9 @@ class CalculatorIntegrationTests(unittest.TestCase):
     def test_longer_cash_buffer_also_moves_expense_funding_deadline_earlier(self):
         self.configure_calculator()
         self.set_monthly_cost('1000')
-        self.view._inputs['monthly_income'].set('25')
+        self.set_income('25')
         self.view._inputs['cash_months'].set('4')
-        self.view.expenses.set_rows([{'name': 'Later bill', 'amount': '6000', 'currency': 'HUF',
+        self.set_single_rows([{'name': 'Later bill', 'amount': '6000', 'currency': 'HUF',
                                      'due': (date.today() + timedelta(days=100)).isoformat()}])
         self.view._changed()
         expense = next(value for value in self.view._values.values() if value['purpose'] == 'Later bill')
@@ -380,7 +493,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
 
     def test_startup_loads_mnb_on_portfolio_and_generate_reuses_it_without_opening_calculator(self):
         self.assertFalse(self.view.needs_base_rate)
-        self.base_rate.assert_called_once_with()
+        self.base_rate.assert_called_once_with(cache=self.app.market_cache)
         self.assertFalse(self.view.dirty)
         self.assertEqual(self.view.portfolio_value.get(), '160')
         self.assertGreater(self.app.next_base_rate_refresh, time.monotonic() + 890)
@@ -389,7 +502,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.set_monthly_cost('1000')
         self.app.generate_plan()
         self.finish_work()
-        self.base_rate.assert_called_once_with()
+        self.base_rate.assert_called_once_with(cache=self.app.market_cache)
         self.errors.assert_not_called()
         self.assertFalse(self.view.needs_base_rate)
         self.assertIsNotNone(self.app.plan)
@@ -402,7 +515,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.base_rate.side_effect = ValueError('MNB offline')
         self.reopen()
         self.assertTrue(self.view.needs_base_rate)
-        self.base_rate.assert_called_once_with()
+        self.base_rate.assert_called_once_with(cache=self.app.market_cache)
         self.set_monthly_cost('1000')
         self.app.generate_plan()
         self.finish_work()
@@ -420,7 +533,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.set_monthly_cost('1000')
         self.app.generate_plan()
         self.finish_work()
-        self.base_rate.assert_called_once_with()
+        self.base_rate.assert_called_once_with(cache=self.app.market_cache)
         self.errors.assert_not_called()
         self.assertIsNotNone(self.app.plan)
         self.assertIn('5.5%', self.app.plan_report)
@@ -432,11 +545,11 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.configure_calculator()
         self.view._inputs['mak'].set('0')
         self.set_monthly_cost('10.5', 'EUR')
-        self.view._set_inputs(replace(self.view.settings(), monthly_income=100.25, income_currency='USD'))
-        self.view.expenses.set_rows([{'name': 'Expense', 'amount': '20.75', 'currency': 'GBP',
+        self.view._set_inputs(replace(self.view.settings(), incomes=(CashFlow('Salary', 100.25, date.today(), 'USD', 'monthly'),)))
+        self.set_single_rows([{'name': 'Expense', 'amount': '20.75', 'currency': 'GBP',
                                      'due': date.today().isoformat()}])
         self.view._changed()
-        self.assertIn('USD/HUF', self.view.message.get())
+        self.assertIn('Missing exchange rate', self.view.message.get())
         self.assertTrue(self.app._prices_needed(self.app.portfolio()))
         self.prices.return_value = MarketData(self.market.quotes, {'HUF': .0025, 'USD': .9, 'GBP': 1.2})
         self.app.mode.set('Allowed')
@@ -449,7 +562,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(self.app.plan.cash['HUF'], 18_360 - 1e-5)
         mak = sum(holding.amount for holding in self.app.plan.final_manual_holdings if holding.currency == 'HUF')
         self.assertGreaterEqual(mak, 25_200 - 1e-5)
-        self.assertEqual(self.view.monthly_savings.get(), '80')
+        self.assertEqual(self.view.monthly_summary.set('Net', 'recurring'), '80')
         self.assertEqual(self.app.portfolio(), portfolio)
         self.assertEqual(self.csv_bytes(), before)
 
@@ -469,7 +582,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.csv_bytes(), before)
 
     def test_close_preserves_failed_calculator_edits_unless_explicitly_discarded(self):
-        self.view._inputs['monthly_income'].set('invalid')
+        self.set_income('invalid')
         with patch('ui.app.messagebox.askyesno', return_value=False) as discard:
             self.app.close()
         self.assertFalse(self.app.closed)
@@ -484,7 +597,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
     def test_switching_directory_flushes_calculator_edits_before_discarding_portfolio_edits(self):
         self.visit()
         before = self.csv_bytes()
-        self.view._inputs['monthly_income'].set('500')
+        self.set_income('500')
         self.app.cash_table.set_rows([{'currency': 'EUR', 'amount': '75'}])
         self.app._edited()
         other = self.directory / 'other'
@@ -499,9 +612,9 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.view.portfolio_value.get(), '210')
         self.assertEqual(self.app._calculator_total(), 84_000)
         self.assertFalse(self.view.dirty)
-        self.assertEqual(load_settings(self.directory)[0].monthly_income, 500)
+        self.assertEqual(load_settings(self.directory)[0].incomes[0].amount, 500)
         self.assertEqual(self.csv_bytes(), before)
-        self.assertEqual(self.view.settings().monthly_income, 0)
+        self.assertEqual(self.view.settings().incomes, ())
         self.assertFalse((other / 'calculator.json').exists())
 
     def test_automatic_mnb_failure_retry_and_refresh_preserve_manual_override(self):
@@ -519,13 +632,13 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.view.settings().returns.mak)
         with patch('ui.app.monotonic', return_value=999):
             self.app._update_calculator()
-            self.base_rate.assert_called_once_with()
+            self.base_rate.assert_called_once_with(cache=self.app.market_cache)
         with patch('ui.app.monotonic', return_value=1000):
             self.app._update_calculator()
             self.finish_work()
         self.assertEqual(float(self.view._inputs['mak'].get()), 5.75)
         self.assertIn('effective 2026-10-01', self.view.rate_description)
-        self.assertTrue(self.view.breakdown.get_children())
+        self.assertTrue(self.view.allocation_summary.get_children())
         self.view._auto_rate.set(False)
         self.view._inputs['mak'].set('4.25')
         self.assertTrue(self.view.save())
@@ -535,8 +648,8 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.view.settings().returns.mak, 4.25)
         self.assertFalse(self.view.dirty)
         self.assertFalse(self.app.dirty)
-        self.assertIn('5.5%', self.view.rate_description)
-        self.assertEqual(self.base_rate.call_count, 3)
+        self.assertIn('5.75%', self.view.rate_description)
+        self.assertEqual(self.base_rate.call_count, 2)
         self.assertEqual(self.app.notebook.select(), str(self.app.portfolio_page))
 
     def test_calculator_controls_fit_the_complete_application_at_minimum_size(self):
@@ -545,7 +658,7 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.visit()
         self.app.cash_table.set_rows([{'currency': 'HUF', 'amount': '80000000'}])
         self.app._edited()
-        self.view._inputs['monthly_income'].set('1000000')
+        self.set_income('1000000')
         self.set_monthly_cost('400000')
         self.root.update()
         self.assertEqual(self.app.notebook.index(self.view), 1)
@@ -553,16 +666,27 @@ class CalculatorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.view._auto_rate_box.cget('text'), 'Use MNB base rate')
         right = self.root.winfo_rootx() + self.root.winfo_width()
         bottom = self.root.winfo_rooty() + self.root.winfo_height()
-        income_entry = next(entry for entry in self.view._entries
-                            if getattr(entry, '_value', None) is self.view._inputs['monthly_income'])
-        for widget in (*self.view._entries, self.view._currency_box, self.view._auto_rate_box,
-                       self.view._message_label, self.app.cancel_button, *income_entry.master.winfo_children()):
+        for widget in (*self.view._entries, self.app.base_entry, self.view._auto_rate_box,
+                       self.view._message_label, self.app.cancel_button, *self.view.monthly_summary.master.winfo_children(),
+                       *self.view.allocation_summary.master.winfo_children(),
+                       *self.view._summary_panel.winfo_children()):
             if not widget.winfo_ismapped():
                 continue
             with self.subTest(widget=str(widget)):
                 self.assertGreaterEqual(widget.winfo_rootx(), self.root.winfo_rootx())
                 self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(), right)
                 self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), bottom)
+        summary = self.view._summary_panel
+        self.assertFalse(hasattr(self.view, 'projection_button'))
+        self.assertIs(self.app.projection_button.master.master, self.app.summary_page)
+        for widget in summary.winfo_children():
+            self.assertLessEqual(widget.winfo_y() + widget.winfo_height(), summary.winfo_height())
+        monthly = self.view.monthly_summary.master
+        self.assertLessEqual(self.view.monthly_summary.winfo_y() + self.view.monthly_summary.winfo_height(), monthly.winfo_height())
+        net = self.view.monthly_summary.bbox('Net')
+        self.assertTrue(net, 'All three monthly cash-flow rows must remain visible.')
+        self.assertLessEqual(net[1] + net[3], self.view.monthly_summary.winfo_height())
+        self.assertLessEqual(abs(monthly.winfo_height() - self.view._funding_panel.winfo_height()), 1)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,7 @@ from tkinter import ttk
 import unittest
 
 from ui.charts import PieChart
+from ui.palette import SUMMARY_COLORS
 from ui.theme import configure_theme
 
 
@@ -28,6 +29,19 @@ class ChartTests(unittest.TestCase):
         chart.set_data({str(i): i + 1 for i in range(20)}, {})
         self.assertEqual(len(chart.canvas.find_all()), 20)
         self.assertAlmostEqual(sum(chart._fractions.values()), 1)
+
+    def test_slice_order_and_colors_do_not_follow_values_or_the_available_labels(self):
+        chart = PieChart(self.root)
+        order = ('Stock market', 'Properties', 'MÁK', 'Cash', 'Pension funds')
+        for values in ({name: index + 1 for index, name in enumerate(reversed(order))},
+                       {name: 10 - index for index, name in enumerate(order)}):
+            chart.set_data(values, SUMMARY_COLORS)
+            self.assertEqual(tuple(chart._data), order)
+            fills = [chart.canvas.itemcget(item, 'fill') for item in chart.canvas.find_all()]
+            self.assertEqual(fills, list(SUMMARY_COLORS.values()))
+        chart.set_data({'Gold': 99, 'Global': 1},
+                       {'New asset': '#123456', 'Global': '#234567', 'Gold': '#345678'})
+        self.assertEqual(tuple(chart._data), ('Global', 'Gold'))
 
     def test_pie_legend_scrolls_only_when_content_overflows(self):
         window = tk.Toplevel(self.root)

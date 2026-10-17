@@ -5,7 +5,7 @@ from datetime import date
 from itertools import product
 import unittest
 
-from portfolio.calculator import CalculatorSettings, Expense, MonthlyCost, ReturnAssumptions
+from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions
 from portfolio.funding import prepare_allocation
 from portfolio.models import (AllocationTargets, CASH, STOCK_MARKET, TREASURY,
                               Holding, ManualHolding, MarketData, Portfolio, Quote)
@@ -25,9 +25,14 @@ class ReservePlanningTests(unittest.TestCase):
                            AllocationTargets({STOCK_MARKET: {'Stocks': 60}, TREASURY: {'HUF': 40}, CASH: {}},
                                              {'Stocks': 'Equities'}), {'EUR': 100})
         market = MarketData({'ETF': Quote(10, 'EUR')}, {'HUF': .0025})
-        settings = CalculatorSettings(monthly_costs=(MonthlyCost('Living costs', 1000),), monthly_income=1_000_000,
-                                      returns=ReturnAssumptions(mak=5),
-                                      expenses=(Expense('Ready today', 2000, date(2026, 3, 1)),))
+        settings = CalculatorSettings(
+            incomes=(CashFlow('Salary', 1_000_000, date(2026, 1, 1), frequency='monthly'),),
+            returns=ReturnAssumptions(mak=5),
+            outgoings=(
+                CashFlow('Living costs', 1000, date.min, frequency='monthly'),
+                CashFlow('Ready today', 2000, date(2026, 3, 1)),
+            ),
+        )
         funding = prepare_allocation(source, market, settings, date(2026, 1, 1))
         self.assertEqual(dict(funding.minimum_values), {(CASH, 'HUF'): 10, (TREASURY, 'HUF'): 15})
         self.assertEqual(funding.recommendation.rows[2].income_funded, 0)

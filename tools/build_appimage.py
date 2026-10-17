@@ -24,7 +24,7 @@ DOWNLOADS = {
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=ROOT / "appimage" / "PortfolioPlanner-x86_64.AppImage")
+    parser.add_argument("--output", type=Path, default=ROOT / "binaries" / "PortfolioPlanner-x86_64.AppImage")
     args = parser.parse_args(argv)
     if sys.platform != "linux" or platform.machine() != "x86_64":
         parser.error("Build on x86-64 Linux with Python and Tkinter installed.")

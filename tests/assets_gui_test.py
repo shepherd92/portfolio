@@ -15,6 +15,7 @@ from portfolio.models import AllocationTargets, AssetDetails, CASH, STOCK_MARKET
 from portfolio.market import BaseRate
 from portfolio.storage import load_portfolio, save_portfolio
 from ui.app import PortfolioApp
+from ui.target_mix import change_mix_share
 
 
 @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1',
@@ -50,7 +51,7 @@ class AssetsGuiTests(unittest.TestCase):
     def test_assets_table_contains_information_and_zero_share_catalogue_entries(self):
         table = self.app.assets_table
         self.assertEqual(tuple(table.tree['columns']),
-                         ('ticker', 'group', 'name', 'isin', 'exchange', 'price', 'currency', 'ter', 'ibkr_name'))
+                         ('ticker', 'group', 'name', 'isin', 'exchange', 'price', 'currency', 'ter', 'ibkr_name', 'color_hue'))
         self.assertEqual(table.tree.set(self.item(table, 'MAIN'), 'ter'), '0.19%')
         self.assertEqual(table.tree.set(self.item(table, 'OLD'), 'ter'), '0%')
         self.assertEqual({row['ticker'] for row in table.get_rows()}, {'MAIN', 'OLD', 'BOND'})
@@ -77,6 +78,20 @@ class AssetsGuiTests(unittest.TestCase):
         self.assertTrue(self.app.save())
         saved = {holding.ticker: holding.details.ter for holding in load_portfolio(self.directory).holdings}
         self.assertEqual(saved, {'MAIN': .1949, 'OLD': .1911, 'BOND': None})
+
+    def test_manual_color_hue_saves_full_precision_and_clears_back_to_automatic(self):
+        from ui.palette import hue_color
+        table = self.app.assets_table
+        for value in ('123.456789', '0', ''):
+            self.edit(table, {'color_hue': value}, item=self.item(table, 'MAIN'))
+            details = next(holding.details for holding in self.app.portfolio().holdings if holding.ticker == 'MAIN')
+            self.assertEqual(details.color_hue, float(value) if value else None)
+            shown = table.tree.set(self.item(table, 'MAIN'), 'color_hue')
+            self.assertEqual(shown, f'{float(value):.2f}°' if value else 'Automatic')
+            if value:
+                self.assertEqual(self.app._chart_colors(STOCK_MARKET)['Stocks'], hue_color(float(value)))
+            self.assertTrue(self.app.save())
+            self.assertEqual(load_portfolio(self.directory), self.app.portfolio())
 
     def test_home_dropdown_uses_assets_and_adding_an_existing_ticker_updates_its_balance(self):
         self.edit(self.app.assets_table, {'ticker': 'NEW', 'group': 'Bonds', 'name': 'New fund'})
@@ -151,10 +166,47 @@ class AssetsGuiTests(unittest.TestCase):
             table.remove_selected()
         self.assertNotIn('OLD', self.app._holding_tickers())
 
-    def test_assets_page_automatically_fills_only_blank_fields_and_home_remains_editable(self):
+    def test_class_removal_requires_zero_target_even_without_holdings(self):
+        self.app.holdings_table.set_rows([{**row, 'shares': '0'} for row in self.app.holdings_table.get_rows()])
+        self.app._edited()
+        table = self.app.class_table
+        item = next(item for item in table.tree.get_children() if table.row(item)['group'] == 'Stocks')
+        table.tree.selection_set(item)
+        before = self.app.portfolio()
+        with patch('ui.table.messagebox.showerror') as error, patch('ui.table.messagebox.askyesno') as confirm:
+            table.remove_selected()
+        self.assertIn('Stock market → Allocations', error.call_args.args[1])
+        confirm.assert_not_called()
+        self.assertEqual(self.app.portfolio(), before)
+
+        self.app.target_table.set_rows(change_mix_share(self.app.target_table.get_rows(), CASH, 'EUR', 100, activation_total=100))
+        self.app._edited()
+        with patch('ui.table.messagebox.askyesno', return_value=True):
+            table.remove_selected()
+        self.assertNotIn('Stocks', self.app.portfolio().allocation.weights[STOCK_MARKET])
+        self.assertEqual(self.app.portfolio().allocation.totals, {STOCK_MARKET: 0, TREASURY: 0, CASH: 100})
+        self.assertTrue(self.app.save())
+        self.assertEqual(load_portfolio(self.directory), self.app.portfolio())
+
+    def test_metadata_lookup_updates_shared_holdings_without_unlocking_summary(self):
         fetched = AssetDetails('IE00B4L5Y983', 'Provider venue', 'USD', .75, 'Provider name')
         self.fetch_asset_details.return_value = fetched
-        self.app.notebook.select(self.app.assets_page)
+        original_items = set(self.app.holdings_table.tree.get_children())
+        self.app.notebook.select(self.app.portfolio_page)
+        for middle, inner in ((self.app.summary_page, self.app.assets_page),
+                              (self.app.stock_page, self.app.classes_page),
+                              (self.app.stock_page, self.app.allocation_pages[STOCK_MARKET]),
+                              (self.app.allocation_pages[TREASURY], self.app.assets_page)):
+            self.app.portfolio_notebook.select(middle)
+            self.app.stock_notebook.select(inner)
+            self.poll()
+            self.fetch_asset_details.assert_not_called()
+        self.app.portfolio_notebook.select(self.app.stock_page)
+        self.app.stock_notebook.select(self.app.assets_page)
+        self.app.notebook.select(self.app.wealth.pages['loans'])
+        self.poll()
+        self.fetch_asset_details.assert_not_called()
+        self.app.notebook.select(self.app.portfolio_page)
         self.poll()
         self.finish_worker()
         self.assertEqual({call.args[0] for call in self.fetch_asset_details.call_args_list}, {'OLD', 'BOND'})
@@ -165,13 +217,25 @@ class AssetsGuiTests(unittest.TestCase):
         self.assertEqual(holdings['BOND'].details, fetched)
         self.assertTrue(self.app.dirty)
         self.app.notebook.select(0)
-        view = self.app.real_allocations
-        leaf = next(item for item, (table, source) in view._sources.items()
-                    if table is self.app.holdings_table and table.row(source)['ticker'] == 'OLD')
-        view.tree.selection_set(leaf)
-        with patch.object(self.app.holdings_table, 'edit_selected') as edit:
-            view._edit_selected()
-            edit.assert_called_once()
+        self.app.portfolio_notebook.select(self.app.summary_page)
+        current_items = set(self.app.holdings_table.tree.get_children())
+        self.assertTrue(original_items.isdisjoint(current_items))
+        for view in (self.app.real_allocations, self.app.allocation_pages[STOCK_MARKET].holdings):
+            self.assertTrue(all(source in current_items for table, source in view._sources.values()
+                                if table is self.app.holdings_table))
+            leaf = next(item for item, (table, source) in view._sources.items()
+                        if table is self.app.holdings_table and table.row(source)['ticker'] == 'OLD')
+            view.tree.selection_set(leaf)
+            view._update_buttons()
+            with patch.object(self.app.holdings_table, 'edit_selected') as edit:
+                view._edit_selected()
+                if view is self.app.real_allocations:
+                    self.assertFalse(hasattr(view, 'edit_button'))
+                    edit.assert_not_called()
+                else:
+                    self.assertFalse(view.edit_button.instate(['disabled']))
+                    edit.assert_called_once()
+                    self.assertEqual(self.app.holdings_table.row(self.app.holdings_table.tree.selection()[0])['ticker'], 'OLD')
         self.assertTrue(self.app.save())
         self.assertEqual(load_portfolio(self.directory), self.app.portfolio())
         self.poll()
@@ -180,7 +244,9 @@ class AssetsGuiTests(unittest.TestCase):
     def test_failed_lookup_preserves_inputs_and_can_be_retried_explicitly(self):
         before = self.app.portfolio()
         self.fetch_asset_details.side_effect = ValueError('No provider data')
-        self.app.notebook.select(self.app.assets_page)
+        self.app.notebook.select(self.app.portfolio_page)
+        self.app.portfolio_notebook.select(self.app.stock_page)
+        self.app.stock_notebook.select(self.app.assets_page)
         self.poll()
         self.finish_worker()
         self.assertEqual(self.app.portfolio(), before)
@@ -201,7 +267,7 @@ class AssetsGuiTests(unittest.TestCase):
         release, finished = threading.Event(), threading.Event()
         self.addCleanup(release.set)
 
-        def lookup(ticker):
+        def lookup(ticker, *, cache):
             release.wait(2)
             finished.set()
             return AssetDetails(name='Too late')

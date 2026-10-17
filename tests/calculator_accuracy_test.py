@@ -8,7 +8,7 @@ import unittest
 
 from support import calculator_allocation as allocation
 
-from portfolio.calculator import (CalculatorSettings, Expense, ReturnAssumptions,
+from portfolio.calculator import (CalculatorSettings, CashFlow, ReturnAssumptions,
                                   expense_reserve, recommend)
 
 
@@ -33,8 +33,6 @@ def reference_reserve(amount, days, horizon_days, market_return, mak_return):
         growth += max(Decimal(0), years - horizon) * (1 + market).ln()
         reserve = Decimal.from_float(float(amount)) * (-growth).exp()
         return float(reserve)
-
-
 
 
 class ExpenseProjectionAccuracyTests(unittest.TestCase):
@@ -74,10 +72,11 @@ class ExpenseProjectionAccuracyTests(unittest.TestCase):
         settings = CalculatorSettings(
             horizon_years=1,
             returns=ReturnAssumptions(mak=-99.9),
-            expenses=(Expense('One-year cost', 1_000_000, date(2027, 12, 16)),),
+            outgoings=(CashFlow('One-year cost', 1000000, date(2027, 12, 16)),),
         )
         result = recommend(settings, date(2026, 10, 16), allocation(), total=3_000_000)
-        required = reference_reserve(1_000_000, 365, 365, 6, -99.9)
+        days = (date(2027, 10, 1) - date(2026, 10, 16)).days
+        required = reference_reserve(1_000_000, days, 365, 6, -99.9)
         self.assertAlmostEqual(result.rows[2].amount, required, delta=.000001)
         self.assertAlmostEqual(result.rows[-1].amount, 3_000_000 - required, delta=.000001)
         self.assertAlmostEqual(result.total, 3_000_000)

@@ -10,7 +10,7 @@ from tools import build_appimage
 
 
 class AppImageBuildTests(unittest.TestCase):
-    def test_default_build_writes_binary_checksum_and_launcher_under_appimage(self):
+    def test_default_build_writes_binary_checksum_and_launcher_under_binaries(self):
         with tempfile.TemporaryDirectory(prefix='portfolio build ') as temporary:
             root = Path(temporary)
             (root / 'assets').mkdir()
@@ -32,7 +32,7 @@ class AppImageBuildTests(unittest.TestCase):
                     patch.object(build_appimage, '_download'), \
                     patch.object(build_appimage.subprocess, 'run', side_effect=run):
                 build_appimage.main([])
-            directory = root / 'appimage'
+            directory = root / 'binaries'
             binary = directory / 'PortfolioPlanner-x86_64.AppImage'
             checksum = directory / 'PortfolioPlanner-x86_64.AppImage.sha256'
             launcher = directory / 'PortfolioPlanner-x86_64.desktop'

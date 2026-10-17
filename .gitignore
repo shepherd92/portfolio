@@ -16,7 +16,9 @@ docs/build/
 config/
 calculator.json
 .calculator.*.tmp
+wealth.json
+.wealth.*.tmp
 
 # Local binaries and packaging intermediates
 /build/
-/appimage/
+/binaries/

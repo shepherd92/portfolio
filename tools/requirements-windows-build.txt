@@ -1,0 +1,5 @@
+# 64-bit Windows Python 3.12 uses the shared release-build lock.
+-r requirements-build.txt
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+tzdata==2026.5

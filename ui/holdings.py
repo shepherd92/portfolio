@@ -1,24 +1,24 @@
 """An allocation tree that delegates holding edits to the canonical tables."""
 
 from collections import Counter
-import tkinter as tk
 from tkinter import ttk
 
 from portfolio.models import CASH, STOCK_MARKET, TREASURY
 from ui.links import open_cell_link, quote_url
 from ui.sorting import TreeSort
-from ui.theme import MENU_STYLE
-from ui.widgets import AutoScrollbar, bind_shortcuts, retain_visible_selection, shade_allocation_groups
+from ui.reporting import format_amount
+from ui.widgets import AutoScrollbar, bind_shortcuts, shade_allocation_groups
 
 
 class HoldingsView(ttk.Frame):
-    """Show asset groups and their holdings consistently in every scope."""
+    """Read-only Summary or one editable category backed by canonical tables."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, *, category=None):
         super().__init__(parent)
-        self.scope = 'All'
+        self.category = category
         self._tables, self._sources, self._branches = {}, {}, {}
         self._categories = {}
+        self._other_balances, self._other_items = (), {}
         self._enabled = True
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -38,53 +38,44 @@ class HoldingsView(ttk.Frame):
         horizontal = AutoScrollbar(self, orient='horizontal', command=self.tree.xview)
         horizontal.grid(row=1, column=0, sticky='ew')
         self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        controls = ttk.Frame(self)
-        controls.grid(row=2, column=0, columnspan=2, sticky='w', pady=(7, 0))
-        self.add_button = ttk.Button(controls, text='Add', command=self._add)
-        self.edit_button = ttk.Button(controls, text='Edit', command=self._edit_selected)
-        self.remove_button = ttk.Button(controls, text='Remove', command=self._remove)
-        for button in (self.add_button, self.edit_button, self.remove_button):
-            button.pack(side='left', padx=(0, 6))
-        self._menu = tk.Menu(self, tearoff=False, **MENU_STYLE)
         self.tree.bind('<Double-1>', self._double_click)
-        self.tree.bind('<<TreeviewSelect>>', self._update_buttons)
-        bind_shortcuts(self.tree, {'<Return>': self._edit_selected, '<F2>': self._edit_selected,
-                                  '<Delete>': self._remove, '<Insert>': self._add})
-        self._update_buttons()
+        if category is not None:
+            self._build_controls()
 
     def set_tables(self, tables):
-        self._tables = dict(tables)
-        self._menu.delete(0, 'end')
-        for category, table in self._tables.items():
-            self._menu.add_command(label=category, command=lambda category=category: self._add_to(category))
+        self._tables = ({self.category: tables[self.category]} if self.category is not None else dict(tables))
+        for table in self._tables.values():
             table.grid_remove()
-            table.set_enabled(self._enabled)
+            if self.category is not None:
+                table.set_enabled(self._enabled)
         self.refresh()
-
-    def set_scope(self, scope):
-        if scope != 'All' and scope not in self._tables:
-            raise ValueError(f'Unknown holdings category: {scope}')
-        self.scope = scope
-        self._filter_rows()
 
     def set_categories(self, categories):
         if self._categories != categories:
             self._categories = dict(categories)
             self.refresh()
 
-    def refresh(self, source=None):
+    def set_other_assets(self, balances):
+        """Show manually valued assets and debt without adding them to trading inputs."""
+        self._other_balances = tuple(balances)
+        self.refresh()
+
+    def refresh(self, source=None, *, categories=None):
+        if categories is not None:
+            self._categories = dict(categories)
         selected = next(iter(self.tree.selection()), None)
         selected_source = source or self._sources.get(selected)
         selected_branch = next((key for key, item in self._branches.items() if item == selected), None)
         expanded = {key: self.tree.item(item, 'open') for key, item in self._branches.items()}
-        self.tree.delete(*(item for key, item in self._branches.items() if len(key) == 1))
+        self.tree.delete(*self.tree.get_children())
         self._sources.clear()
         self._branches.clear()
+        self._other_items.clear()
         for category in (STOCK_MARKET, TREASURY, CASH):
             table = self._tables.get(category)
             if table is None:
                 continue
-            root = self._branch('', (category,), expanded)
+            root = '' if self.category is not None else self._branch('', (category,), expanded)
             rows = [(item, table.row(item)) for item in table.tree.get_children()]
             if category == STOCK_MARKET:
                 rows = [(item, row) for item, row in rows if int(row['shares']) != 0]
@@ -102,6 +93,12 @@ class HoldingsView(ttk.Frame):
                     item = self.tree.insert(root, 'end', text=row['currency'],
                                             values=('', table.display_value(row, 'amount'), row['currency']))
                 self._sources[item] = table, source_item
+        for balance in self._other_balances if self.category is None else ():
+            category = balance.category
+            root = self._branches.get((category,)) or self._branch('', (category,), expanded)
+            item = self.tree.insert(root, 'end', text=balance.name,
+                                    values=('', format_amount(balance.amount), balance.currency))
+            self._other_items[item] = balance
         restored = (next((item for item, value in self._sources.items() if value == selected_source), None)
                     if selected_source else self._branches.get(selected_branch))
         if restored:
@@ -109,12 +106,27 @@ class HoldingsView(ttk.Frame):
             self.tree.focus(restored)
             if source:
                 self.tree.see(restored)
-        self._filter_rows()
+        self.sorting.apply()
+        self._update_buttons()
 
     def set_enabled(self, enabled):
         self._enabled = bool(enabled)
-        for table in self._tables.values():
-            table.set_enabled(self._enabled)
+        if self.category is not None:
+            for table in self._tables.values():
+                table.set_enabled(self._enabled)
+        self._update_buttons()
+
+    def _build_controls(self):
+        controls = ttk.Frame(self)
+        controls.grid(row=2, column=0, columnspan=2, sticky='w', pady=(7, 0))
+        self.add_button = ttk.Button(controls, text='Add', command=self._add)
+        self.edit_button = ttk.Button(controls, text='Edit', command=self._edit_selected)
+        self.remove_button = ttk.Button(controls, text='Remove', command=self._remove)
+        for button in (self.add_button, self.edit_button, self.remove_button):
+            button.pack(side='left', padx=(0, 6))
+        self.tree.bind('<<TreeviewSelect>>', self._update_buttons)
+        bind_shortcuts(self.tree, {'<Return>': self._edit_selected, '<F2>': self._edit_selected,
+                                  '<Delete>': self._remove, '<Insert>': self._add})
         self._update_buttons()
 
     def _branch(self, parent, key, expanded):
@@ -130,40 +142,21 @@ class HoldingsView(ttk.Frame):
             table, source = self._sources[item]
             row = table.row(source)
             return row.get('shares', row.get('amount', ''))
+        if column == 'amount' and item in self._other_items:
+            return self._other_items[item].amount
         return self.tree.set(item, column)
 
-    def _filter_rows(self):
-        for key, item in self._branches.items():
-            if len(key) == 1:
-                if self.scope == 'All' or key[0] == self.scope:
-                    self.tree.move(item, '', 'end')
-                else:
-                    self.tree.detach(item)
-        self.sorting.apply()
-        retain_visible_selection(self.tree)
-        self._update_buttons()
-
     def _update_buttons(self, _event=None):
+        if self.category is None:
+            return
         self.add_button.configure(state='normal' if self._enabled else 'disabled')
         selected = bool(self._selection())
-        for button in (self.edit_button, self.remove_button):
-            button.configure(state='normal' if selected else 'disabled')
+        self.edit_button.configure(state='normal' if selected else 'disabled')
+        self.remove_button.configure(state='normal' if selected else 'disabled')
 
     def _add(self):
-        if not self._enabled:
-            return
-        if self.scope != 'All':
-            self._add_to(self.scope)
-            return
-        try:
-            self._menu.tk_popup(self.add_button.winfo_rootx(),
-                                self.add_button.winfo_rooty() + self.add_button.winfo_height())
-        finally:
-            self._menu.grab_release()
-
-    def _add_to(self, category):
-        if self._enabled:
-            table = self._tables[category]
+        if self.category is not None and self._enabled:
+            table = self._tables[self.category]
             added = table.add()
             if added:
                 self.refresh((table, added))
@@ -171,9 +164,9 @@ class HoldingsView(ttk.Frame):
 
     def _selection(self):
         selected = self.tree.selection()
-        source = self._sources.get(selected[0]) if self._enabled and selected else None
-        if source and source[0].tree.exists(source[1]):
-            return source if self.scope == 'All' or source[0] is self._tables[self.scope] else None
+        source = self._sources.get(selected[0]) if self.category is not None and self._enabled and selected else None
+        if source and source[0] is self._tables.get(self.category) and source[0].tree.exists(source[1]):
+            return source
         return None
 
     def _edit_selected(self):
@@ -199,7 +192,8 @@ class HoldingsView(ttk.Frame):
         if open_cell_link(event, self.tree, {'asset': lambda item: quote_url(self.tree.set(item, 'asset'))}):
             return 'break'
         item = self.tree.identify_row(event.y)
-        if item in self._sources and 'indicator' not in self.tree.identify_element(event.x, event.y):
+        if (self.category is not None and item in self._sources
+                and 'indicator' not in self.tree.identify_element(event.x, event.y)):
             self.tree.selection_set(item)
             self._edit_selected()
             return 'break'

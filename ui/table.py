@@ -3,10 +3,10 @@
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from ui.dates import DateEntry
 from ui.links import open_cell_link
 from ui.reporting import format_percent
 from ui.sorting import TreeSort
+from ui.help import HELP, add_help, info_label
 from ui.widgets import AutoScrollbar, PercentEntry, RoundedEntry, bind_shortcuts, is_whole, show_modal, whole_number
 
 
@@ -16,8 +16,7 @@ class DataTable(ttk.Frame):
     def __init__(self, parent, columns, choices=None, validate=None, on_change=None,
                  can_delete=None, height=8, sort_key=None,
                  field_rows=None, rounded_columns=(), numeric_columns=(), locked_fields=None,
-                 dialog_title='row', resolve_add=None, links=None, percent_columns=(),
-                 date_columns=()):
+                 dialog_title='row', resolve_add=None, links=None, percent_columns=()):
         super().__init__(parent)
         self.columns = list(columns)
         self.field_rows = field_rows or tuple((key,) for key, _, _ in self.columns)
@@ -27,7 +26,6 @@ class DataTable(ttk.Frame):
         self.links = links or {}
         self.sort_key = sort_key
         self.percent_columns = set(percent_columns)
-        self.date_columns = set(date_columns)
         self.rounded_columns = set(rounded_columns)
         self.locked_fields, self.dialog_title = locked_fields, dialog_title
         self._enabled, self._rows = True, {}
@@ -55,6 +53,10 @@ class DataTable(ttk.Frame):
         self._buttons = [self.add_button, self.edit_button, self.remove_button]
         for button in self._buttons:
             button.pack(side="left", padx=(0, 6))
+        for button, text in ((self.add_button, f'Add a {dialog_title}. Values are validated before they are applied.'),
+                             (self.edit_button, f'Edit the selected {dialog_title}. Double-click or press F2 to edit.'),
+                             (self.remove_button, f'Remove the selected {dialog_title} after confirmation.')):
+            add_help(button, text)
         self.tree.bind("<Double-1>", self._double_click)
         self.tree.bind("<<TreeviewSelect>>", self._update_buttons)
         bind_shortcuts(self.tree, {'<Return>': self.edit_selected, '<F2>': self.edit_selected,
@@ -176,8 +178,6 @@ class DataTable(ttk.Frame):
                 if row.get('currency') == 'HUF' and 'amount' in variables and not is_whole(row['amount']):
                     label = next(label for key, label, _ in self.columns if key == 'amount')
                     raise ValueError(f'{label} must be a whole number.')
-                for key in self.date_columns:
-                    DateEntry.validate_date(row[key])
                 target = item or (self.resolve_add(row) if self.resolve_add else None)
                 previous = self.row(target) if target else None
                 row = self._normalize(self.validate(dict(row), previous) if self.validate else row)
@@ -225,7 +225,7 @@ class DataTable(ttk.Frame):
             for column, key in enumerate(fields):
                 padding = (0, 12) if column < len(fields) - 1 else 0
                 span = max(map(len, self.field_rows)) if len(fields) == 1 else 1
-                ttk.Label(form, text=labels[key]).grid(row=2 * index, column=column,
+                info_label(form, labels[key], HELP[key]).grid(row=2 * index, column=column,
                                                      sticky="w", columnspan=span, padx=padding, pady=(6, 2))
                 variable = tk.StringVar(value=(old or {}).get(key, ""))
                 variables[key] = variable
@@ -237,11 +237,12 @@ class DataTable(ttk.Frame):
                     if old is None and len(values) == 1:
                         variable.set(values[0])
                 else:
-                    entry = (DateEntry if key in self.date_columns else PercentEntry if key in self.percent_columns
+                    entry = (PercentEntry if key in self.percent_columns
                              else RoundedEntry if key in self.rounded_columns else ttk.Entry)
                     editor = entry(form, textvariable=variable, width=width,
                                    state="readonly" if key in readonly else "normal")
                 editors[key] = editor
+                add_help(editor, HELP[key])
                 editor.grid(row=2 * index + 1, column=column, columnspan=span, sticky="ew", padx=padding, pady=(0, 6))
                 if first is None and key not in readonly:
                     first = editor

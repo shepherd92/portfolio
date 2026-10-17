@@ -2,6 +2,7 @@
 
 import csv
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -45,7 +46,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(set(self.contents()), set(self.original))
         rows = list(csv.DictReader(io.StringIO((self.directory / "asset.csv").read_text())))
         self.assertEqual(list(rows[0]), ["asset_group", "ticker", "is_main", "shares", "ibkr_id", "notes",
-                                         "isin", "exchange", "currency", "ter", "name", "ibkr_name"])
+                                         "isin", "exchange", "currency", "ter", "name", "ibkr_name", "color_hue"])
         self.assertEqual(rows[0]["ibkr_id"], "123")
         self.assertEqual(rows[0]["notes"], "Keep, exactly")
         self.assertEqual(rows[1]["ticker"], "NEW")
@@ -130,30 +131,44 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(list(directory.iterdir()), [])
 
     def test_staging_failure_leaves_originals_untouched(self):
-        real_stage = portfolio_io._stage
+        real_stage = portfolio_io.stage_bytes
         calls = []
 
-        def fail_third(path, contents):
+        def fail_third(path, contents, *, preserve_mode):
             calls.append(path)
             if len(calls) == 3:
                 raise OSError("injected staging failure")
-            return real_stage(path, contents)
+            return real_stage(path, contents, preserve_mode=preserve_mode)
 
-        with patch.object(portfolio_io, "_stage", fail_third):
+        with patch.object(portfolio_io, "stage_bytes", fail_third):
             with self.assertRaisesRegex(OSError, "injected staging failure"):
                 save_portfolio(self.portfolio, self.directory)
         self.assertEqual(self.contents(), self.original)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX permission bits')
+    def test_replacement_preserves_existing_permissions(self):
+        for path in self.directory.iterdir():
+            path.chmod(0o640)
+        save_portfolio(self.portfolio, self.directory)
+        for path in self.directory.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_failed_fsync_cleans_staged_file_and_keeps_originals(self):
+        with patch('portfolio.files.os.fsync', side_effect=OSError('disk error')):
+            with self.assertRaisesRegex(OSError, 'disk error'):
+                save_portfolio(self.portfolio, self.directory)
+        self.assertEqual(self.contents(), self.original)
+
     def test_change_during_staging_is_detected_before_replacement(self):
-        real_stage = portfolio_io._stage
+        real_stage = portfolio_io.stage_bytes
         external = b"currency,amount,account\nEUR,999,External\n"
 
-        def stage_and_change(path, contents):
-            result = real_stage(path, contents)
+        def stage_and_change(path, contents, *, preserve_mode):
+            result = real_stage(path, contents, preserve_mode=preserve_mode)
             (self.directory / "cash.csv").write_bytes(external)
             return result
 
-        with patch.object(portfolio_io, "_stage", stage_and_change):
+        with patch.object(portfolio_io, "stage_bytes", stage_and_change):
             with self.assertRaisesRegex(ValueError, "changed while saving"):
                 save_portfolio(self.portfolio, self.directory)
         self.assertEqual(self.contents(), {**self.original, "cash.csv": external})

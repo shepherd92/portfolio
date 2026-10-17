@@ -1,14 +1,14 @@
-"""ISO date entry with an optional keyboard-accessible Tk calendar."""
+"""Month entries with keyboard-accessible Tk calendar pickers."""
 
 import calendar
-from datetime import date, timedelta
+from datetime import date
 import re
 import tkinter as tk
 from tkinter import ttk
 
 
-class DateEntry(ttk.Frame):
-    def __init__(self, parent, *, textvariable, width=12, state='normal', **kwargs):
+class MonthEntry(ttk.Frame):
+    def __init__(self, parent, *, textvariable, width=9, state='normal', **kwargs):
         super().__init__(parent, **kwargs)
         self._value, self._calendar = textvariable, None
         self.columnconfigure(0, weight=1)
@@ -21,13 +21,13 @@ class DateEntry(ttk.Frame):
         self.entry.bind('<F4>', self.open_calendar)
 
     @staticmethod
-    def validate_date(value):
+    def validate_month(value):
         try:
-            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            if not re.fullmatch(r'\d{4}-\d{2}', value):
                 raise ValueError
-            return date.fromisoformat(value)
+            return date.fromisoformat(f'{value}-01')
         except ValueError as error:
-            raise ValueError('Enter a valid date as YYYY-MM-DD.') from error
+            raise ValueError('Enter a valid month as YYYY-MM.') from error
 
     def focus_set(self):
         self.entry.focus_set()
@@ -36,22 +36,23 @@ class DateEntry(ttk.Frame):
         if self._calendar is not None or self.button.instate(['disabled']):
             return 'break'
         try:
-            self._selected = self.validate_date(self._value.get())
+            self._selected = self.validate_month(self._value.get())
         except ValueError:
-            self._selected = date.today()
+            self._selected = date.today().replace(day=1)
         self._previous_grab = self.tk.call('grab', 'current', self._w)
         popup = self._calendar = tk.Toplevel(self)
-        popup.title('Select date')
+        popup.title('Select month')
         popup.transient(self.winfo_toplevel())
         popup.resizable(False, False)
         popup.protocol('WM_DELETE_WINDOW', self._close)
         popup.bind('<Destroy>', self._calendar_destroyed)
         popup.bind('<Escape>', self._close)
-        popup.bind('<Return>', lambda _event: self._choose(self._selected))
-        for key, days in (('Left', -1), ('Right', 1), ('Up', -7), ('Down', 7)):
-            popup.bind(f'<{key}>', lambda _event, days=days: self._move_days(days))
-        popup.bind('<Prior>', lambda _event: self._move_month(-1))
-        popup.bind('<Next>', lambda _event: self._move_month(1))
+        popup.bind('<Return>', self._confirm)
+        for key, direction in (('Left', -1), ('Right', 1), ('Up', -4), ('Down', 4)):
+            popup.bind(f'<{key}>', lambda event, direction=direction:
+                       self._move_month(direction) if event.widget is not self._year else None)
+        popup.bind('<Prior>', lambda _event: self._page(-1))
+        popup.bind('<Next>', lambda _event: self._page(1))
         popup.bind('<Shift-Prior>', lambda _event: self._move_month(-12))
         popup.bind('<Shift-Next>', lambda _event: self._move_month(12))
         self._build_calendar(popup)
@@ -78,62 +79,63 @@ class DateEntry(ttk.Frame):
         frame.pack()
         navigation = ttk.Frame(frame)
         navigation.pack(fill='x')
-        ttk.Button(navigation, text='‹', width=3, command=lambda: self._move_month(-1)).pack(side='left')
-        self._month = ttk.Combobox(navigation, values=list(calendar.month_name)[1:], state='readonly', width=11)
-        self._month.pack(side='left', padx=4)
-        self._month.bind('<<ComboboxSelected>>', self._select_month)
-        self._year = ttk.Spinbox(navigation, from_=1, to=9999, width=5, command=self._select_month)
-        self._year.pack(side='left')
-        self._year.bind('<Return>', self._select_month)
-        self._year.bind('<FocusOut>', self._select_month)
-        ttk.Button(navigation, text='›', width=3, command=lambda: self._move_month(1)).pack(side='left', padx=(4, 0))
-        self._days = ttk.Frame(frame)
-        self._days.pack(fill='x', pady=8)
-        ttk.Button(frame, text='Today', command=lambda: self._choose(date.today())).pack(fill='x')
+        navigation.columnconfigure(1, weight=1)
+        ttk.Button(navigation, text='‹', width=3, command=lambda: self._page(-1)).grid(row=0, column=0)
+        self._year = ttk.Spinbox(navigation, from_=1, to=9999, width=6, justify='center',
+                                 command=self._select_year)
+        self._year.grid(row=0, column=1, padx=4)
+        self._year.bind('<Return>', self._select_year)
+        ttk.Button(navigation, text='›', width=3, command=lambda: self._page(1)).grid(row=0, column=2)
+        self._months = ttk.Frame(frame)
+        self._months.pack(fill='x', pady=8)
+        ttk.Button(frame, text='This month',
+                   command=lambda: self._choose(date.today())).pack(fill='x')
 
     def _draw_calendar(self):
-        self._month.current(self._selected.month - 1)
         self._year.set(str(self._selected.year))
-        for child in self._days.winfo_children():
+        for child in self._months.winfo_children():
             child.destroy()
-        for column, name in enumerate(calendar.day_abbr):
-            ttk.Label(self._days, text=name, anchor='center').grid(row=0, column=column, sticky='ew')
-        weeks = calendar.monthcalendar(self._selected.year, self._selected.month)
-        for row, week in enumerate(weeks, 1):
-            for column, day in enumerate(week):
-                if day:
-                    value = self._selected.replace(day=day)
-                    style = 'Primary.TButton' if value == self._selected else 'TButton'
-                    ttk.Button(self._days, text=str(day), width=3, style=style,
-                               command=lambda value=value: self._choose(value)).grid(row=row, column=column)
+        for month in range(1, 13):
+            style = 'Primary.TButton' if month == self._selected.month else 'TButton'
+            ttk.Button(self._months, text=calendar.month_abbr[month], width=6, style=style,
+                       command=lambda month=month: self._select_month(month)).grid(
+                           row=(month - 1) // 4, column=(month - 1) % 4)
 
-    def _select_month(self, _event=None):
-        try:
-            year, month = int(self._year.get()), self._month.current() + 1
-            self._selected = date(year, month, min(self._selected.day, calendar.monthrange(year, month)[1]))
-        except (ValueError, OverflowError):
-            self._year.set(str(self._selected.year))
+    def _select_year(self, _event=None):
+        if self._calendar is None:
             return 'break'
-        self._draw_calendar()
-        return 'break'
-
-    def _move_month(self, count):
-        index = min(max((self._selected.year - 1) * 12 + self._selected.month - 1 + count, 0), 9999 * 12 - 1)
-        year, month = index // 12 + 1, index % 12 + 1
-        self._selected = date(year, month, min(self._selected.day, calendar.monthrange(year, month)[1]))
-        self._draw_calendar()
-        return 'break'
-
-    def _move_days(self, count):
         try:
-            self._selected += timedelta(days=count)
-        except OverflowError:
+            year = int(self._year.get())
+            self._selected = self._selected.replace(year=year)
+        except (ValueError, OverflowError):
             pass
         self._draw_calendar()
         return 'break'
 
+    def _select_month(self, month):
+        self._select_year()
+        self._selected = self._selected.replace(month=month)
+        return self._choose(self._selected)
+
+    def _confirm(self, event=None):
+        if event is not None and isinstance(event.widget, ttk.Button):
+            event.widget.invoke()
+            return 'break'
+        return self._select_month(self._selected.month)
+
+    def _page(self, direction):
+        self._select_year()
+        return self._move_month(direction * 12)
+
+    def _move_month(self, count):
+        index = min(max((self._selected.year - 1) * 12 + self._selected.month - 1 + count, 0), 9999 * 12 - 1)
+        year, month = index // 12 + 1, index % 12 + 1
+        self._selected = date(year, month, 1)
+        self._draw_calendar()
+        return 'break'
+
     def _choose(self, value):
-        self._value.set(value.isoformat())
+        self._value.set(value.isoformat()[:7])
         return self._close()
 
     def _close(self, _event=None):
