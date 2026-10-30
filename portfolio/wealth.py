@@ -10,6 +10,7 @@ from datetime import date
 from math import exp, log
 
 from portfolio.calculator import CashFlow, month_after
+from portfolio.growth import annual_percent
 from portfolio.models import currency_code, identifier, number, parse_currency_amount
 
 
@@ -18,22 +19,18 @@ class PropertyCashFlow:
     """A scheduled owner payment, weighted by expected rental occupancy.
 
     The amount applies in the schedule's beginning month. Its annual
-    appreciation compounds monthly from there, independently of property value.
+    growth policy belongs to the schedule, independently of property value.
     """
     flow: CashFlow
     direction: str = 'outgoing'
     occupancy: str = 'always'
-    appreciation_percent: float = 0
 
     def __post_init__(self):
         _flow(self.flow)
-        if self.flow.appreciation_percent:
-            raise ValueError('Set property cash-flow appreciation on the property payment, not its nested schedule.')
         if self.direction not in ('income', 'outgoing'):
             raise ValueError('Property cash-flow direction must be income or outgoing.')
         if self.occupancy not in ('always', 'rented', 'vacant'):
             raise ValueError('Property cash-flow occupancy must be always, rented, or vacant.')
-        _percent(self, 'appreciation_percent', -99.99, 1000)
 
 
 @dataclass(frozen=True)
@@ -198,10 +195,10 @@ class WealthSettings:
                          {item.id: item.balance for item in self.pensions},
                          {item.id: item.balance for item in self.loans})
 
-    def events(self, as_of, end):
-        return self.project(as_of, end).events
+    def events(self, as_of, end, *, inflation_percent=0):
+        return self.project(as_of, end, inflation_percent=inflation_percent).events
 
-    def project(self, as_of, end):
+    def project(self, as_of, end, *, inflation_percent=0):
         """Project up to 100 years, at fixed currencies and expected vacancy.
 
         Monthly dates use day one. The current month is already recorded, so
@@ -212,6 +209,7 @@ class WealthSettings:
         months / 12, then use the property's expected occupancy fraction.
         """
         _range(as_of, end)
+        inflation_percent = annual_percent(inflation_percent, 'Expected inflation')
         properties = {item.id: item.value for item in self.properties}
         pensions = {item.id: item.balance for item in self.pensions}
         loans = {item.id: item.balance for item in self.loans}
@@ -238,7 +236,7 @@ class WealthSettings:
             if day in schedules:
                 snapshots.append(WealthSnapshot(day, _balances(self, properties, pensions, loans), True))
             for item, flow, role in schedules.get(day, ()):
-                event = _pay(item, flow, role, day, pensions, loans, interest_due)
+                event = _pay(item, flow, role, day, pensions, loans, interest_due, inflation_percent)
                 if event is not None:
                     events.append(event)
             snapshots.append(WealthSnapshot(day, _balances(self, properties, pensions, loans)))
@@ -325,16 +323,20 @@ def _schedules(settings, start, end):
     return schedules
 
 
-def _pay(item, flow, role, day, pensions, loans, interest_due):
-    amount, principal, interest = flow.amount_on(day), 0., 0.
+def _pay(item, flow, role, day, pensions, loans, interest_due, inflation_percent=0):
+    if isinstance(item, Loan) and not loans[item.id]:
+        return None
+    if isinstance(item, Pension) and item.kind == 'balance' and role == 'withdrawal' and not pensions[item.id]:
+        return None
     if isinstance(item, Property):
-        source, direction, essential = 'Properties', role.direction, True
         vacancy = item.vacancy_percent / 100
         weight = {'always': 1., 'rented': 1 - vacancy, 'vacant': vacancy}[role.occupancy]
         if not weight:
             return None
-        months = (day.year - flow.start.year) * 12 + day.month - flow.start.month
-        amount = _grow(amount, 1 + role.appreciation_percent / 100, months / 12) * weight
+    amount, principal, interest = flow.amount_on(day, inflation_percent), 0., 0.
+    if isinstance(item, Property):
+        source, direction, essential = 'Properties', role.direction, True
+        amount *= weight
     elif isinstance(item, Pension):
         source, direction, essential = 'Pensions', 'outgoing', False
         if role == 'withdrawal':

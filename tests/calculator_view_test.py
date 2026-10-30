@@ -311,7 +311,7 @@ class CalculatorViewTests(unittest.TestCase):
                 self.root.after(20, inspect)
                 return
             try:
-                self.assertEqual(len(months), 2)
+                self.assertEqual(len(months), 3)
                 self.assertEqual(len(visible), 1)
                 self.assertEqual(visible[0].entry.get(), '2030-01')
             except Exception as error:
@@ -335,6 +335,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.view.refresh()
         self.view._inputs['equities'].set('0')
         self.set_monthly_cost('100')
+        self.set_income('100')
         self.view._inputs['emergency_months'].set('2')
         due = date.today().replace(year=date.today().year + 10).isoformat()
         self.set_single_rows([{'name': 'Future expense', 'amount': '2000', 'currency': 'HUF', 'due': due}])
@@ -350,6 +351,7 @@ class CalculatorViewTests(unittest.TestCase):
         self.view.set_base_rate(0, 'Effective today')
         self.current_total.return_value = 1000
         self.set_monthly_cost('100')
+        self.set_income('100')
         self.view._inputs['emergency_months'].set('1')
         self.assertFalse(self.expense_values())
         self.assertEqual(self.view._summary_values[CASH]['amount'], 200)
@@ -867,43 +869,86 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertEqual(self.view.settings().returns.mak_eur, 2)
         self.assertIsNone(self.view.settings().returns.mak_huf)
 
-    def test_cash_flow_appreciation_editor_defaults_and_precise_percentage_validation(self):
+    def test_cash_flow_growth_controls_and_precise_custom_percentage_validation(self):
         from ui.widgets import PercentEntry
 
         table = self.view.cashflows
-        self.assertEqual(table.tree['columns'].count('appreciation_percent'), 1)
-        self.assertEqual(table.tree.heading('appreciation_percent', 'text'), 'Appreciation')
+        self.assertIn('growth_mode', table.tree['columns'])
         form = ttk.Frame(self.root)
         self.addCleanup(form.destroy)
         variables, _ = table._edit_fields(form, None)
         entry = next(widget for widget in form.winfo_children()
                      if isinstance(widget, PercentEntry) and widget._value is variables['appreciation_percent'])
-        self.assertEqual(variables['appreciation_percent'].get(), '0')
-        self.assertTrue(entry.instate(['disabled']))
+        self.assertFalse(entry.grid_info())
         variables['kind'].set('Income')
         variables['name'].set('Salary')
         variables['amount'].set('1000')
         variables['frequency'].set('Monthly')
-        self.assertTrue(entry.instate(['!disabled']))
+        self.assertFalse(entry.grid_info())
+        variables['growth_mode'].set('Custom rate')
+        self.assertTrue(entry.grid_info())
         variables['appreciation_percent'].set('-3.1234567')
         values = lambda: {key: variable.get() for key, variable in variables.items()}
         row = table._validate(values(), None)
         self.assertEqual(float(row['appreciation_percent']), -3.1234567)
-        self.assertEqual(table.display_value(row, 'appreciation_percent'), '-3.12%')
+        self.assertEqual(table.display_value(row, 'growth_mode'), 'Custom -3.12%')
         self.assertEqual(entry.get(), '-3.12%')
         for value in ('-100', '1000.01', 'nan', 'inf', 'invalid', ''):
             variables['appreciation_percent'].set(value)
             with self.subTest(value=value), self.assertRaises(ValueError):
                 table._validate(values(), None)
-        variables['appreciation_percent'].set('3.125')
-        variables['frequency'].set('Once')
-        self.assertTrue(entry.instate(['disabled']))
+        variables['growth_mode'].set('Follow inflation')
+        self.assertFalse(entry.grid_info())
         row = table._validate(values(), None)
-        self.assertEqual(table.display_value(row, 'appreciation_percent'), '—')
-        self.assertEqual(float(row['appreciation_percent']), 3.125)
-        variables['frequency'].set('Annually')
-        self.assertTrue(entry.instate(['!disabled']))
-        self.assertEqual(variables['appreciation_percent'].get(), '3.125')
+        self.assertEqual(row['growth_mode'], 'inflation')
+        self.assertEqual(float(row['appreciation_percent']), 0)
+        variables['frequency'].set('Once')
+        row = table._validate(values(), None)
+        self.assertEqual(table.display_value(row, 'growth_mode'), 'Future payment amount')
+        self.assertEqual(row['growth_mode'], 'fixed')
+
+    def test_today_money_basis_keeps_reference_month_and_previews_nominal_payment(self):
+        table = self.view.cashflows
+        self.view._inputs['inflation_percent'].set('10')
+        form = ttk.Frame(self.root)
+        self.addCleanup(form.destroy)
+        variables, _ = table._edit_fields(form, None)
+        variables['name'].set('Purchase')
+        variables['amount'].set('1000')
+        variables['start'].set('2031-01')
+        variables['amount_basis'].set("Today's money")
+        self.assertEqual(variables['price_month'].get(), date.today().strftime('%Y-%m'))
+        variables['price_month'].set('2030-01')
+        row = table._validate({key: variable.get() for key, variable in variables.items()}, None)
+        self.assertEqual(row['price_month'], '2030-01')
+        self.assertEqual(table._cashflow(row).amount, 1000)
+        self.assertTrue(any(isinstance(widget, ttk.Label) and '1\u202f100 HUF' in widget.cget('text')
+                            for widget in form.winfo_children()))
+        reopened = ttk.Frame(self.root)
+        self.addCleanup(reopened.destroy)
+        edited, _ = table._edit_fields(reopened, row)
+        self.assertEqual(edited['price_month'].get(), '2030-01')
+        self.assertEqual(edited['amount_basis'].get(), "Today's money")
+        variables['frequency'].set('Monthly')
+        row = table._validate({key: variable.get() for key, variable in variables.items()}, None)
+        self.assertEqual(row['price_month'], '')
+
+    def test_inflation_setting_saves_and_negative_monthly_budget_exposes_withdrawal(self):
+        from portfolio.calculator import month_after
+        self.view.set_base_rate(0, 'Today')
+        today = date.today().replace(day=1)
+        self.view._inputs['inflation_percent'].set('12.345')
+        self.current_total.return_value = 100000
+        self.set_flows('Outgoing', (CashFlow('Living', 1000, today, frequency='monthly', growth_mode='inflation'),))
+        self.view._changed()
+        self.assertTrue(self.view.save())
+        self.assertEqual(load_settings(self.directory)[0].inflation_percent, 12.345)
+        future = month_after(today, 1).strftime('%Y-%m')
+        calendar = self.view.calendar
+        self.assertLess(calendar._values[future + '/budget']['net'], 0)
+        self.assertTrue(calendar.tree.exists(future + '/withdrawal'))
+        self.assertEqual(calendar._values[future]['committed'], 0)
+        self.assertIn('Living-cost withdrawal needed:', calendar._budget_details[future])
 
     def test_appreciating_flows_save_exact_rates_and_drive_calendar_totals(self):
         from portfolio.calculator import month_after
@@ -931,15 +976,25 @@ class CalculatorViewTests(unittest.TestCase):
         self.assertEqual(self.view.settings(), saved)
         self.assertEqual((self.directory / 'calculator.json').read_bytes(), original)
 
-    def test_appreciation_column_sorts_numerically_and_once_is_not_appreciated(self):
+    def test_loading_a_legacy_once_rate_preserves_the_stored_input(self):
+        legacy = CashFlow('Once', 100, date.today(), appreciation_percent=25)
+        self.set_flows('Outgoing', (legacy,))
+        self.assertEqual(self.view.settings().outgoings, (legacy,))
+        table = self.view.cashflows
+        row = table.get_rows()[0]
+        normalized = table._validate(dict(row, amount='200'), row)
+        self.assertEqual(float(normalized['appreciation_percent']), 25)
+        self.assertEqual(table._cashflow(normalized).amount_on(date(2030, 1, 1)), 200)
+
+    def test_growth_column_describes_and_sorts_modes(self):
         today = date.today()
         table = self.view.cashflows
-        table.set_cashflows((CashFlow('Higher', 100, today, frequency='monthly', appreciation_percent=12),
-                             CashFlow('Lower', 100, today, frequency='monthly', appreciation_percent=-2),
-                             CashFlow('Once', 100, today, appreciation_percent=100)), ())
-        table.sorting.sort('appreciation_percent')
+        table.set_cashflows((CashFlow('Custom', 100, today, frequency='monthly', appreciation_percent=12),
+                             CashFlow('Inflation', 100, today, frequency='monthly', growth_mode='inflation'),
+                             CashFlow('Once', 100, today)), ())
+        table.sorting.sort('growth_mode')
         self.assertEqual([table.row(item)['name'] for item in table.tree.get_children()],
-                         ['Lower', 'Higher', 'Once'])
-        table.sorting.sort('appreciation_percent')
+                         ['Custom', 'Inflation', 'Once'])
+        table.sorting.sort('growth_mode')
         self.assertEqual([table.row(item)['name'] for item in table.tree.get_children()],
-                         ['Higher', 'Lower', 'Once'])
+                         ['Once', 'Inflation', 'Custom'])

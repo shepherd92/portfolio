@@ -22,7 +22,9 @@ class RecommendationTests(unittest.TestCase):
         )
 
     def test_defaults_and_emergency_money_are_separate_from_long_term_savings(self):
-        settings = CalculatorSettings(outgoings=(CashFlow('Living costs', 100000, date.min, frequency='monthly'),))
+        settings = CalculatorSettings(
+            incomes=(CashFlow('Income covering living costs', 100000, date.min, frequency='monthly'),),
+            outgoings=(CashFlow('Living costs', 100000, date.min, frequency='monthly'),))
         result = self.recommend(settings, date(2026, 10, 16), total=1_000_000)
         self.assertEqual([(row.amount, row.stock, row.mak) for row in result.rows],
                          [(600_000, 0, 600_000), (200_000, 0, 0), (200_000, 120_000, 80_000)])
@@ -58,6 +60,7 @@ class RecommendationTests(unittest.TestCase):
         settings = CalculatorSettings(
             emergency_months=10,
             horizon_years=1,
+            incomes=(CashFlow('Income covering living costs', 100, date.min, frequency='monthly'),),
             outgoings=(
                 CashFlow('Living costs', 100, date.min, frequency='monthly'),
                 CashFlow('Due now', 2000, today),
@@ -78,6 +81,7 @@ class RecommendationTests(unittest.TestCase):
         empty = self.recommend(CalculatorSettings(), date.today(), total=0)
         self.assertEqual((empty.total, empty.stock, empty.mak, empty.cash, empty.shortfall), (0, 0, 0, 0, 0))
         settings = CalculatorSettings(
+            incomes=(CashFlow('Income covering living costs', 20, date.min, frequency='monthly'),),
             outgoings=(
                 CashFlow('Living costs', 20, date.min, frequency='monthly'),
                 CashFlow('Bill', 50, date.today()),
@@ -88,6 +92,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual([row.amount for row in result.rows], [10, 40, 50, 0])
         huge = CalculatorSettings(
             emergency_months=120,
+            incomes=(CashFlow('Income covering living costs', 1e308, date.min, frequency='monthly'),),
             outgoings=(CashFlow('Living costs', 1e+308, date.min, frequency='monthly'),),
         )
         result = self.recommend(huge, date.today(), total=1e308)
@@ -113,6 +118,7 @@ class RecommendationTests(unittest.TestCase):
         today = date(2024, 1, 1)
         settings = CalculatorSettings(
             horizon_years=1,
+            incomes=(CashFlow('Income covering living costs', 10, date.min, frequency='monthly'),),
             outgoings=(
                 CashFlow('Living costs', 10, date.min, frequency='monthly'),
                 CashFlow('Later', 100, date(2025, 3, 1)),
@@ -153,6 +159,7 @@ class RecommendationTests(unittest.TestCase):
                     CalculatorSettings(
                         emergency_months=6,
                         cash_months=cash_months,
+                        incomes=(CashFlow('Income covering living costs', 10, date.min, frequency='monthly'),),
                         outgoings=(CashFlow('Living costs', 10, date.min, frequency='monthly'),),
                     ),
                     date(2025, 1, 1),
@@ -187,6 +194,7 @@ class RecommendationTests(unittest.TestCase):
     def test_underfunding_protects_bank_then_chronological_expense_cash_before_mak(self):
         today = date(2025, 1, 1)
         settings = CalculatorSettings(
+            incomes=(CashFlow('Income covering living costs', 10, date.min, frequency='monthly'),),
             outgoings=(
                 CashFlow('Living costs', 10, date.min, frequency='monthly'),
                 CashFlow('Later', 100, date(2025, 2, 1)),

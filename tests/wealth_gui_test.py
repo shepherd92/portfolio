@@ -152,21 +152,21 @@ class WealthGuiTests(unittest.TestCase):
         self.seed(properties=(Property('flat', 'Apartment', 100000, 'EUR', vacancy_percent=25),
                               Property('house', 'House', 500000, 'EUR')))
         self.assertTrue(self.view.select_source('flat'))
-        self.edit('properties', dict(kind='Income', occupancy='Rented', appreciation_percent='3.125%', name='Rent', amount='900', currency='EUR',
+        self.edit('properties', dict(kind='Income', occupancy='Rented', growth_mode='Custom rate', appreciation_percent='3.125%', name='Rent', amount='900', currency='EUR',
                                      frequency='Monthly', start='2027-01', ending='Ongoing'), flow=True)
-        self.edit('properties', dict(kind='Outgoing', occupancy='Vacant', appreciation_percent='2%', name='Power', amount='90', currency='GBP',
+        self.edit('properties', dict(kind='Outgoing', occupancy='Vacant', growth_mode='Custom rate', appreciation_percent='2%', name='Power', amount='90', currency='GBP',
                                      frequency='Monthly', start='2027-01', ending='Ongoing'), flow=True)
         flat, house = self.view.settings().properties
-        self.assertEqual([(entry.flow.amount, entry.direction, entry.occupancy, entry.appreciation_percent) for entry in flat.cashflows],
+        self.assertEqual([(entry.flow.amount, entry.direction, entry.occupancy, entry.flow.appreciation_percent) for entry in flat.cashflows],
                          [(900, 'income', 'rented', 3.125), (90, 'outgoing', 'vacant', 2)])
         self.assertEqual(flat.cashflows[1].flow.currency, 'GBP')
-        self.assertTrue(all(entry.flow.appreciation_percent == 0 for entry in flat.cashflows))
-        self.assertEqual(self.view.flows['properties'].tree['columns'].count('appreciation_percent'), 1)
+        self.assertTrue(all(entry.flow.growth_mode == 'custom' for entry in flat.cashflows))
+        self.assertEqual(self.view.flows['properties'].tree['columns'].count('growth_mode'), 1)
         self.assertFalse(house.cashflows)
         table = self.view.flows['properties']
         rows = table.tree.get_children()
         self.assertEqual(table.tree.set(rows[0], 'occupancy'), 'Rented')
-        self.assertEqual(table.tree.set(rows[0], 'appreciation_percent'), '3.12%')
+        self.assertEqual(table.tree.set(rows[0], 'growth_mode'), 'Custom 3.12%')
         self.assertEqual(self.view.required_currencies, {'EUR', 'GBP'})
         self.assertEqual(self.view.settings(), load_wealth(self.directory)[0])
 
@@ -215,7 +215,7 @@ class WealthGuiTests(unittest.TestCase):
             self.assertGreater(int(buttons.grid_info()['row']), int(field.grid_info()['row']))
         self.edit('properties', dict(kind='Income', occupancy='Rented', name='Rent', amount='1000',
                                      frequency='Monthly', start='2027-01', ending='Ongoing',
-                                     appreciation_percent='3'), flow=True, inspect=inspect)
+                                     growth_mode='Custom rate', appreciation_percent='3'), flow=True, inspect=inspect)
         table = self.view.flows['properties']
         item = table.tree.get_children()[0]
         before = (self.directory / 'wealth.json').read_bytes()
@@ -224,6 +224,31 @@ class WealthGuiTests(unittest.TestCase):
         self.edit('properties', dict(kind='Income', occupancy='Always', name='Reimbursement', amount='20',
                                      frequency='Monthly', start='2027-01', ending='Ongoing'), flow=True)
         self.assertEqual(len(self.view.settings().properties[0].cashflows), 2)
+
+    def test_today_priced_property_payment_preview_precedes_occupancy_and_buttons(self):
+        self.seed(properties=(Property('flat', 'Apartment', 100000),))
+        self.view.select_source('flat')
+
+        def inspect(form, variables):
+            form.update_idletasks()
+            preview = next(widget for widget in form.winfo_children()
+                           if isinstance(widget, ttk.Label) and widget.cget('text').startswith('Future payment:'))
+            occupancy = next(widget for widget in form.winfo_children() if isinstance(widget, ttk.Combobox)
+                             and str(widget.cget('textvariable')) == str(variables['occupancy']))
+            buttons = next(widget for widget in form.winfo_children()
+                           if any(isinstance(child, ttk.Button) and child['text'] == 'Save'
+                                  for child in widget.winfo_children()))
+            self.assertLess(int(preview.grid_info()['row']), int(occupancy.grid_info()['row']) - 1)
+            self.assertLess(int(occupancy.grid_info()['row']), int(buttons.grid_info()['row']))
+            self.assertLessEqual(preview.winfo_y() + preview.winfo_height(), occupancy.winfo_y())
+
+        self.edit('properties', dict(kind='Outgoing', occupancy='Always', name='Renovation', amount='1000',
+                                     frequency='Once', start='2031-01', amount_basis="Today's money",
+                                     price_month='2030-01'), flow=True, inspect=inspect)
+        flow = self.view.settings().properties[0].cashflows[0].flow
+        self.assertEqual(flow.price_month, date(2030, 1, 1))
+        table = self.view.flows['properties']
+        self.edit('properties', dict(amount='1200'), flow=True, item=table.tree.get_children()[0], inspect=inspect)
 
     def test_pension_access_uses_month_picker_and_payroll_is_not_bank_cash(self):
         def inspect(form, variables):
@@ -237,8 +262,20 @@ class WealthGuiTests(unittest.TestCase):
         self.edit('pensions', dict(kind='Payroll contribution', name='Payroll', amount='200', currency='EUR',
                                    frequency='Monthly', start='2027-01', ending='Ongoing'), flow=True)
         self.assertEqual(self.view.settings().pensions[0].contributions[0].source, 'payroll')
-        self.assertNotIn('appreciation_percent', self.view.flows['pensions'].tree['columns'])
+        self.assertIn('growth_mode', self.view.flows['pensions'].tree['columns'])
         self.assertFalse(self.view.settings().events(date(2026, 12, 1), date(2027, 1, 1)))
+
+    def test_pension_and_loan_payment_editors_share_growth_modes(self):
+        self.seed(pensions=(Pension('work', 'Work pension', balance=1000, access=date(2050, 1, 1)),),
+                  loans=(Loan('loan', 'Loan', 5000),))
+        for kind, source, role in (('pensions', 'work', 'Bank contribution'), ('loans', 'loan', 'Repayment')):
+            self.view.select_source(source)
+            self.edit(kind, dict(kind=role, name='Payment', amount='100', frequency='Monthly',
+                                 start='2027-01', ending='Ongoing', growth_mode='Follow inflation'), flow=True)
+        settings = load_wealth(self.directory)[0]
+        self.assertEqual(settings.pensions[0].contributions[0].flow.growth_mode, 'inflation')
+        self.assertEqual(settings.loans[0].payment.growth_mode, 'inflation')
+        self.assertEqual(settings, self.view.settings())
 
     def test_pension_withdrawal_before_access_is_rejected_without_saving(self):
         self.seed(pensions=(Pension('work', 'Pension', 'EUR', balance=1000, access=date(2050, 1, 1)),))

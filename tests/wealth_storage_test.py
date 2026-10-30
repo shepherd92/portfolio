@@ -26,11 +26,11 @@ class WealthStorageTest(unittest.TestCase):
                                  appreciation_percent=3, depreciation_percent=1,
                                  vacancy_percent=12.5,
                                  cashflows=(PropertyCashFlow(
-                                     CashFlow('Rent', 100.25, date(2026, 11, 1), currency='EUR', frequency='monthly'),
-                                     'income', 'rented', appreciation_percent=2.5),
+                                     CashFlow('Rent', 100.25, date(2026, 11, 1), currency='EUR', frequency='monthly',
+                                              appreciation_percent=2.5), 'income', 'rented'),
                                      PropertyCashFlow(flow),
-                                     PropertyCashFlow(CashFlow('Vacant upkeep', 200, date(2027, 1, 1)),
-                                                      'outgoing', 'vacant', appreciation_percent=-1))),),
+                                     PropertyCashFlow(CashFlow('Vacant upkeep', 200, date(2027, 1, 1),
+                                                               appreciation_percent=-1), 'outgoing', 'vacant'))),),
             pensions=(Pension('pension', 'Pension', balance=10000, annual_return=4,
                               access=date(2030, 1, 1),
                               contributions=(PensionContribution(flow, 'payroll'),),
@@ -47,37 +47,36 @@ class WealthStorageTest(unittest.TestCase):
         self.assertEqual(loaded, self.settings)
         self.assertEqual(token, loaded_token)
         data = json.loads(token)
-        self.assertEqual(data['version'], 2)
+        self.assertEqual(data['version'], 3)
         self.assertEqual(data['pensions'][0]['access'], '2030-01')
         self.assertEqual(data['loans'][0]['payment']['start'], '2027-01')
         property_data = data['properties'][0]
         self.assertEqual(property_data['vacancy_percent'], 12.5)
         self.assertEqual(property_data['cashflows'][0]['direction'], 'income')
         self.assertEqual(property_data['cashflows'][0]['occupancy'], 'rented')
-        self.assertEqual(property_data['cashflows'][0]['appreciation_percent'], 2.5)
-        self.assertEqual(property_data['cashflows'][0]['flow']['appreciation_percent'], 0)
+        self.assertNotIn('appreciation_percent', property_data['cashflows'][0])
+        self.assertEqual(property_data['cashflows'][0]['flow']['appreciation_percent'], 2.5)
         self.assertEqual(property_data['cashflows'][0]['flow']['amount'], 100.25)
         self.assertEqual(property_data['cashflows'][1]['flow']['count'], 3)
         self.assertEqual(property_data['cashflows'][1]['occupancy'], 'always')
         self.assertEqual(property_data['cashflows'][2]['occupancy'], 'vacant')
-        self.assertEqual(property_data['cashflows'][2]['appreciation_percent'], -1)
+        self.assertEqual(property_data['cashflows'][2]['flow']['appreciation_percent'], -1)
         self.assertEqual(data['loans'][0]['property_id'], 'home')
 
     def test_linked_appreciation_round_trip_preserves_each_single_growth_source(self):
         pension = self.settings.pensions[0]
         contribution = replace(pension.contributions[0], flow=replace(pension.contributions[0].flow,
-                                                                     appreciation_percent=3.125))
+                                                                     appreciation_percent=3.125, growth_mode='custom'))
         pension = replace(pension, contributions=(contribution,),
-                          withdrawals=(replace(pension.withdrawals[0], appreciation_percent=-1.5),))
+                          withdrawals=(replace(pension.withdrawals[0], appreciation_percent=-1.5, growth_mode='custom'),))
         loan = self.settings.loans[0]
-        loan = replace(loan, payment=replace(loan.payment, appreciation_percent=-2.75))
+        loan = replace(loan, payment=replace(loan.payment, appreciation_percent=-2.75, growth_mode='custom'))
         settings = replace(self.settings, pensions=(pension,), loans=(loan,))
         token = save_wealth(settings, self.directory, None)
         loaded, original = load_wealth(self.directory)
         self.assertEqual((loaded, original), (settings, token))
         self.assertEqual(loaded.properties, self.settings.properties)
-        self.assertEqual(loaded.properties[0].cashflows[0].flow.appreciation_percent, 0)
-        self.assertEqual(loaded.properties[0].cashflows[0].appreciation_percent, 2.5)
+        self.assertEqual(loaded.properties[0].cashflows[0].flow.appreciation_percent, 2.5)
         self.assertAlmostEqual(loaded.pensions[0].contributions[0].flow.amount_on(date(2028, 1, 1)),
                                1000 * 1.03125)
         self.assertAlmostEqual(loaded.pensions[0].withdrawals[0].amount_on(date(2031, 1, 1)), 100 * .985)
@@ -111,7 +110,7 @@ class WealthStorageTest(unittest.TestCase):
     def test_property_cannot_save_growth_twice_in_nested_and_wrapper_fields(self):
         token = save_wealth(self.settings, self.directory, None)
         data = json.loads(token)
-        data['properties'][0]['cashflows'][0]['flow']['appreciation_percent'] = 2.5
+        data['properties'][0]['cashflows'][0]['appreciation_percent'] = 2.5
         payload = json.dumps(data).encode()
         self.path.write_bytes(payload)
         with self.assertRaisesRegex(ValueError, 'Invalid wealth.json'):
@@ -176,7 +175,7 @@ class WealthStorageTest(unittest.TestCase):
                     b'{"version":2,"properties":[],"pensions":[],"loans":[],"extra":1}']
         for mutate in (
             lambda data: data.update(version=True),
-            lambda data: data.update(version=3),
+            lambda data: data.update(version=4),
             lambda data: data.update(properties={}),
             lambda data: data['properties'][0].update(unknown=1),
             lambda data: data['properties'][0].pop('value'),
@@ -216,7 +215,6 @@ class WealthStorageTest(unittest.TestCase):
             lambda entry: entry.pop('flow'),
             lambda entry: entry.pop('direction'),
             lambda entry: entry.pop('occupancy'),
-            lambda entry: entry.pop('appreciation_percent'),
             lambda entry: entry.update(flow=None),
             lambda entry: entry['flow'].update(unknown=1),
             lambda entry: entry['flow'].pop('amount'),
@@ -238,6 +236,44 @@ class WealthStorageTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid wealth.json'):
                     load_wealth(self.directory)
                 self.assertEqual(self.path.read_bytes(), payload)
+
+    def test_version_two_moves_property_growth_once_without_rewriting_file(self):
+        token = save_wealth(self.settings, self.directory, None)
+        data = json.loads(token)
+        data['version'] = 2
+        for item in data['properties']:
+            for entry in item['cashflows']:
+                entry['appreciation_percent'] = entry['flow']['appreciation_percent']
+                entry['flow']['appreciation_percent'] = 0
+                entry['flow'].pop('growth_mode')
+                entry['flow'].pop('price_month')
+        for pension in data['pensions']:
+            for flow in [*(entry['flow'] for entry in pension['contributions']), *pension['withdrawals']]:
+                flow.pop('growth_mode')
+                flow.pop('price_month')
+        for loan in data['loans']:
+            loan['payment'].pop('growth_mode')
+            loan['payment'].pop('price_month')
+        legacy = json.dumps(data).encode()
+        self.path.write_bytes(legacy)
+        loaded, original = load_wealth(self.directory)
+        self.assertEqual((loaded, original), (self.settings, legacy))
+        self.assertEqual(self.path.read_bytes(), legacy)
+        saved = save_wealth(loaded, self.directory, original)
+        self.assertEqual(json.loads(saved)['version'], 3)
+        self.assertEqual(load_wealth(self.directory), (loaded, saved))
+
+    def test_version_two_rejects_double_growth_without_rewriting_file(self):
+        token = save_wealth(self.settings, self.directory, None)
+        data = json.loads(token)
+        data['version'] = 2
+        for entry in data['properties'][0]['cashflows']:
+            entry['appreciation_percent'] = entry['flow']['appreciation_percent']
+        legacy = json.dumps(data).encode()
+        self.path.write_bytes(legacy)
+        with self.assertRaisesRegex(ValueError, 'both the wrapper and schedule'):
+            load_wealth(self.directory)
+        self.assertEqual(self.path.read_bytes(), legacy)
 
     def test_vacancy_percentage_is_validated_when_loading(self):
         original = save_wealth(self.settings, self.directory, None)

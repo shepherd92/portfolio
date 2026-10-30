@@ -84,7 +84,7 @@ class TreasuryApplicationTests(unittest.TestCase):
             portfolio = Portfolio((), allocation(treasury=50, cash=50), {},
                                   (ManualHolding(100, 'EUR'),))
             save_portfolio(portfolio, directory)
-            with (patch('main.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
+            with (patch('portfolio.market.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
                   patch('portfolio.market.fetch_exchange_rate', return_value=.0025),
                   patch('yfinance.Ticker', side_effect=AssertionError('Unexpected stock quote request')),
                   patch('sys.stdout', new_callable=io.StringIO) as output):
@@ -107,7 +107,7 @@ class TreasuryApplicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             save_portfolio(Portfolio((), allocation(cash=100), {'EUR': 100}), directory)
-            with (patch('main.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
+            with (patch('portfolio.market.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1))),
                   patch('portfolio.market.fetch_exchange_rate', return_value=.0025),
                   patch('yfinance.Ticker', side_effect=AssertionError('Unexpected stock quote request')),
                   patch('sys.stdout', new_callable=io.StringIO) as output):

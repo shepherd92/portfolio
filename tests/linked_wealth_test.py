@@ -39,6 +39,45 @@ def property_with_cost(amount=20, **values):
 
 
 class LinkedWealthTests(unittest.TestCase):
+    def test_ordinary_and_linked_operating_deficits_each_withdraw_once(self):
+        settings = linked_settings(inputs(30, 50, emergency_months=0, cash_months=0),
+                                   WealthSettings(properties=(property_with_cost(10),)), TODAY)
+        budget, = settings.income_budgets(TODAY, FEBRUARY)
+        self.assertEqual((budget.net, budget.surplus, budget.living_deficit), (-30, 0, 20))
+        reserved = settings.scheduled_payments(TODAY)
+        self.assertEqual(fsum(payment.amount for payment in reserved if payment.origin == 'living'), 240)
+        self.assertEqual(fsum(payment.amount for payment in reserved if payment.origin == 'linked'), 120)
+        result = project(settings, TODAY, ALLOCATION, total=1000, years=2)
+        self.assertEqual(result.net_worth['Investment portfolio'][-1], 1000 - 24 * 30)
+        self.assertFalse(result.living_shortfalls)
+        self.assertFalse(result.shortfalls)
+
+    def test_inflation_context_matches_rent_pension_loan_and_net_worth(self):
+        beginning = TODAY.replace(day=1)
+        rent = flow('Rent', 200, beginning, frequency='monthly', growth_mode='inflation')
+        property = Property('flat', 'Flat', 1000, cashflows=(PropertyCashFlow(rent, 'income'),))
+        contribution = flow('Contribution', 25, beginning, frequency='monthly', growth_mode='inflation')
+        pension = Pension('pension', 'Pension', access=date(2060, 1, 1),
+                          contributions=(PensionContribution(contribution),))
+        base = replace(inputs(emergency_months=0, cash_months=0, inflation_percent=10),
+                       outgoings=(flow('Living', 100, beginning, frequency='monthly', growth_mode='inflation'),))
+        settings = linked_settings(base, WealthSettings(properties=(property,), pensions=(pension,),
+                                                        loans=(loan(50, 300),)), TODAY)
+        budget, = settings.income_budgets(TODAY, FEBRUARY)
+        growth = 1.1 ** (1 / 12)
+        self.assertAlmostEqual(budget.gross_income, 200 * growth)
+        self.assertAlmostEqual(budget.living_costs, 100 * growth)
+        self.assertAlmostEqual(budget.surplus, 75 * growth - 50)
+        result = project(settings, TODAY, ALLOCATION, total=10000, years=2)
+        factors = fsum(1.1 ** (month / 12) for month in range(1, 25))
+        self.assertAlmostEqual(result.net_worth['Investment portfolio'][-1], 10000 + 75 * factors - 300)
+        self.assertAlmostEqual(result.net_worth['Pensions'][-1], 25 * factors)
+        self.assertEqual(result.net_worth['Loans'][-1], 0)
+        self.assertAlmostEqual(result.net_worth['Net worth'][-1], 10700 + 100 * factors)
+        real = result.in_todays_money()
+        factor = 1.1 ** ((result.dates[-1] - TODAY).days / 365.2425)
+        self.assertAlmostEqual(real.net_worth['Net worth'][-1], result.net_worth['Net worth'][-1] / factor)
+
     def test_empty_external_settings_preserve_existing_calculator(self):
         settings = inputs(100, 40)
         self.assertIs(linked_settings(settings, WealthSettings(), TODAY), settings)
@@ -52,10 +91,14 @@ class LinkedWealthTests(unittest.TestCase):
         self.assertEqual(settings.monthly_spending(as_of=TODAY), 50)
         self.assertEqual(settings.buffer_changes(TODAY), ())
 
-    def test_loan_deficit_remains_when_living_deficit_is_floored(self):
+    def test_loan_and_living_deficits_are_separate_without_negative_receipts(self):
         settings = linked_settings(inputs(30, 50), WealthSettings(loans=(loan(balance=100),)), TODAY)
         self.assertEqual(settings.income_receipts(TODAY, FEBRUARY), ())
-        payment, = settings.scheduled_payments(TODAY)
+        payments = settings.scheduled_payments(TODAY)
+        payment, = (payment for payment in payments if payment.origin == 'linked')
+        living = [payment for payment in payments if payment.origin == 'living']
+        self.assertEqual(len(living), 12)
+        self.assertEqual(fsum(payment.amount for payment in living), 240)
         self.assertEqual((payment.amount, payment.due, payment.cash_due, payment.currency),
                          (100, FEBRUARY, FEBRUARY, 'HUF'))
         self.assertTrue(payment.defensive)
@@ -160,8 +203,8 @@ class LinkedWealthTests(unittest.TestCase):
         self.assertFalse(result.deadline_shortfalls)
 
     def test_growing_weighted_costs_match_reserves_and_later_projection_withdrawals(self):
-        entry = PropertyCashFlow(flow('Empty utilities', 100, frequency='monthly'),
-                                 occupancy='vacant', appreciation_percent=12)
+        entry = PropertyCashFlow(flow('Empty utilities', 100, frequency='monthly', appreciation_percent=12),
+                                 occupancy='vacant')
         property = Property('flat', 'Apartment', 1_000_000, vacancy_percent=25, cashflows=(entry,))
         settings = linked_settings(inputs(), WealthSettings(properties=(property,)), TODAY)
         expected = [25 * 1.12 ** (month / 12) for month in range(24)]
@@ -177,8 +220,8 @@ class LinkedWealthTests(unittest.TestCase):
         self.assertFalse(projected.deadline_shortfalls)
 
     def test_growing_rent_finances_recommendation_and_projection_at_same_amount(self):
-        rent = PropertyCashFlow(flow('Rent', 100, frequency='monthly', count=2),
-                                'income', 'rented', appreciation_percent=12)
+        rent = PropertyCashFlow(flow('Rent', 100, frequency='monthly', count=2, appreciation_percent=12),
+                                'income', 'rented')
         property = Property('flat', 'Apartment', 1000, vacancy_percent=25, cashflows=(rent,))
         expense = flow('Renovation', 200, date(2026, 5, 1))
         settings = linked_settings(replace(inputs(), outgoings=(expense,), cash_months=0),
@@ -192,16 +235,16 @@ class LinkedWealthTests(unittest.TestCase):
         self.assertAlmostEqual(result.net_worth['Investment portfolio'][-1], 1000 + expected_income - 200)
 
     def test_current_month_estimate_grows_from_original_schedule_beginning(self):
-        rent = PropertyCashFlow(flow('Rent', 100, date(2025, 1, 1), frequency='monthly'),
-                                'income', 'rented', appreciation_percent=10)
+        rent = PropertyCashFlow(flow('Rent', 100, date(2025, 1, 1), frequency='monthly', appreciation_percent=10),
+                                'income', 'rented')
         property = Property('flat', 'Apartment', 1000, vacancy_percent=25, cashflows=(rent,))
         settings = linked_settings(inputs(), WealthSettings(properties=(property,)), TODAY)
         self.assertAlmostEqual(settings.monthly_totals(2026, 1).recurring_income, 82.5)
         self.assertEqual(settings.income_receipts(TODAY, date(2026, 1, 31)), ())
 
     def test_vacancy_and_appreciation_keep_fractional_currency_conversion(self):
-        entry = PropertyCashFlow(flow('Bill', .5, date(2025, 2, 1), currency='EUR', frequency='annual', count=2),
-                                 occupancy='vacant', appreciation_percent=10)
+        entry = PropertyCashFlow(flow('Bill', .5, date(2025, 2, 1), currency='EUR', frequency='annual', count=2,
+                                     appreciation_percent=10), occupancy='vacant')
         property = Property('flat', 'Apartment', 1000, vacancy_percent=25, cashflows=(entry,))
         settings = linked_settings(inputs(), WealthSettings(properties=(property,)), TODAY, {'EUR': 401.5})
         expected = .5 * 1.1 * .25 * 401.5

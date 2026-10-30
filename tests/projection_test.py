@@ -7,7 +7,7 @@ import unittest
 
 from portfolio.calculator import CalculatorSettings, CashFlow, ReturnAssumptions, recommend
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY
-from portfolio.projection import project
+from portfolio.projection import Projection, project
 
 
 TODAY = date(2026, 1, 31)
@@ -165,12 +165,89 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(total_at(result, -1), 1000 + 1200 - 600)
         self.assertFalse(result.shortfalls)
 
-    def test_income_below_spending_is_zero_and_living_costs_are_not_deducted_twice(self):
+    def test_income_below_spending_withdraws_only_the_monthly_deficit(self):
         inputs = settings(incomes=(CashFlow('Salary', 50, TODAY, frequency='monthly'),), outgoings=(CashFlow('Living costs', 100, date.min, frequency='monthly'),))
         result = project(inputs, TODAY, ALLOCATION, total=10000, years=1)
-        self.assertEqual(total_at(result, -1), 10000)
+        self.assertEqual(total_at(result, -1), 10000 - 12 * 50)
         self.assertEqual(set(result.purpose['Emergency fund']), {600})
         self.assertEqual(set(result.purpose['Monthly living costs']), {200})
+
+    def test_no_income_withdrawals_cross_the_reserved_year_once(self):
+        inputs = settings(emergency_months=0, cash_months=0,
+                          outgoings=(CashFlow('Living costs', 20, TODAY, frequency='monthly'),))
+        result = project(inputs, TODAY, ALLOCATION, total=1000, years=2)
+        self.assertEqual(result.purpose['Planned expenses'][0], 12 * 20)
+        self.assertEqual(total_at(result, -1), 1000 - 24 * 20)
+        for day, expected in ((date(2027, 1, 1), 1000 - 12 * 20),
+                              (date(2027, 2, 1), 1000 - 13 * 20)):
+            index = max(index for index, recorded in enumerate(result.dates) if recorded == day)
+            self.assertEqual(total_at(result, index), expected)
+            self.assertEqual(result.purpose['Planned expenses'][index], 0)
+        self.assertFalse(result.living_shortfalls)
+
+    def test_annual_living_costs_are_smoothed_once_without_income(self):
+        inputs = settings(emergency_months=0, cash_months=0,
+                          outgoings=(CashFlow('Insurance', 1200, date(2026, 1, 1), frequency='annual'),))
+        result = project(inputs, TODAY, ALLOCATION, total=2000, years=1)
+        self.assertEqual(total_at(result, -1), 800)
+        self.assertFalse(result.living_shortfalls)
+
+    def test_foreign_currency_living_deficits_share_fx_after_the_reserved_year(self):
+        inputs = settings(emergency_months=0, cash_months=0,
+                          outgoings=(CashFlow('Living', .5, TODAY, currency='EUR', frequency='monthly'),))
+        result = project(inputs, TODAY, ALLOCATION, total=10000, rates={'EUR': 401.5},
+                         currency='EUR', years=2)
+        self.assertAlmostEqual(total_at(result, -1), 10000 / 401.5 - 24 * .5)
+        self.assertFalse(result.living_shortfalls)
+
+    def test_exhausted_living_budget_reports_shortfall_and_preserves_buffers(self):
+        inputs = settings(incomes=(CashFlow('Salary', 50, TODAY, frequency='monthly'),),
+                          outgoings=(CashFlow('Living', 100, TODAY, frequency='monthly'),))
+        result = project(inputs, TODAY, ALLOCATION, total=900, years=1)
+        self.assertEqual(total_at(result, -1), 800)
+        self.assertEqual(result.purpose['Emergency fund'][-1], 600)
+        self.assertEqual(result.purpose['Monthly living costs'][-1], 200)
+        self.assertEqual(fsum(amount for _, amount in result.living_shortfalls), 500)
+        self.assertFalse(result.shortfalls)
+        self.assertTrue(all(value >= 0 for amounts in result.portfolio.values() for value in amounts))
+
+    def test_inflation_linked_costs_transition_from_savings_to_withdrawals(self):
+        inputs = settings(emergency_months=0, cash_months=0, inflation_percent=12,
+                          incomes=(CashFlow('Salary', 100, TODAY, frequency='monthly'),),
+                          outgoings=(CashFlow('Living', 90, TODAY, frequency='monthly',
+                                              growth_mode='inflation'),))
+        result = project(inputs, TODAY, ALLOCATION, total=1000, years=1)
+        expected_net = fsum(100 - 90 * 1.12 ** (month / 12) for month in range(1, 13))
+        self.assertAlmostEqual(total_at(result, -1), 1000 + expected_net)
+        self.assertFalse(result.living_shortfalls)
+
+    def test_real_display_deflates_all_series_and_shortfalls_once(self):
+        later = date(2027, 1, 31)
+        values = (100., 120., 110.)
+        nominal = Projection((TODAY, later, later), {'Cash': values}, {'Living': values},
+                             ((later, 10.),), 'EUR', ((later, 20.),),
+                             {'Loans': values, 'Net worth': (-100., -120., -110.)},
+                             ((later, 30.),), 10.)
+        real = nominal.in_todays_money()
+        factor = 1.1 ** ((later - TODAY).days / 365.2425)
+        for name in ('portfolio', 'purpose', 'net_worth'):
+            for key, amounts in getattr(nominal, name).items():
+                self.assertEqual(getattr(real, name)[key][0], amounts[0])
+                for index in (1, 2):
+                    self.assertAlmostEqual(getattr(real, name)[key][index], amounts[index] / factor)
+        for name in ('shortfalls', 'deadline_shortfalls', 'living_shortfalls'):
+            self.assertAlmostEqual(getattr(real, name)[0][1], getattr(nominal, name)[0][1] / factor)
+        self.assertIs(real.in_todays_money(), real)
+        self.assertEqual(nominal.portfolio['Cash'], values)
+        self.assertEqual(real.currency, 'EUR')
+        self.assertFalse(nominal.is_real)
+
+    def test_matching_nominal_returns_and_inflation_preserve_real_value(self):
+        inputs = CalculatorSettings(inflation_percent=10,
+                                    returns=ReturnAssumptions(equities=10, mak_huf=10))
+        result = project(inputs, TODAY, ALLOCATION, total=1000, years=3).in_todays_money()
+        for index in range(len(result.dates)):
+            self.assertAlmostEqual(total_at(result, index), 1000)
 
     def test_fixed_emergency_and_cash_buffers_are_separate_and_full(self):
         inputs = settings(
@@ -247,7 +324,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(total_at(result, -1), 800)
         self.assertEqual(result.purpose['Emergency fund'][-1], 600)
         self.assertEqual(result.purpose['Monthly living costs'][-1], 200)
-        self.assertEqual(result.shortfalls, ((date(2026, 7, 1), 1800),))
+        self.assertEqual(result.shortfalls, ((date(2026, 7, 1), 2000),))
+        self.assertEqual(fsum(amount for _, amount in result.living_shortfalls), 1000)
         self.assertTrue(all(value >= 0 for values in result.portfolio.values() for value in values))
 
     def test_savings_replenish_underfunded_fixed_buffers_before_planned_commitments(self):
@@ -378,6 +456,7 @@ class ProjectionTests(unittest.TestCase):
             emergency_months=10,
             cash_months=0,
             returns=ReturnAssumptions(equities=5, mak_huf=5),
+            incomes=(CashFlow('Income', 10 ** 307, date.min, frequency='monthly'),),
             outgoings=(CashFlow('Living costs', 10 ** 307, date.min, frequency='monthly'),),
         )
         with self.assertRaisesRegex(ValueError, 'numeric range'):

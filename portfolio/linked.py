@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, fields
 from datetime import date, timedelta
 from math import fsum
 
-from portfolio.calculator import (CalculatorSettings, IncomeBudget, MonthlyTotals, Payment, gross_income_by_date,
+from portfolio.calculator import (CalculatorSettings, IncomeBudget, MonthlyTotals, Payment,
                                   huf_value, month_after)
 from portfolio.wealth import WealthSettings
 
@@ -63,21 +63,24 @@ class LinkedSettings(CalculatorSettings):
         budgets, _ = self._ledger(as_of, end, self.rates if rates is None else rates)
         return budgets
 
-    def scheduled_payments(self, as_of):
+    def scheduled_payments(self, as_of, rates=None):
         """Protect uncovered finite commitments and twelve months of operations."""
+        rates = self.rates if rates is None else rates
         end = month_after(self.as_of, 12 * self.years) or date.max
-        _, deficits = self._ledger(as_of, end, self.rates)
+        _, deficits = self._ledger(as_of, end, rates)
         reserve_end = month_after(as_of, 12) or date.max
-        return (*super().scheduled_payments(as_of),
+        return (*super().scheduled_payments(as_of, rates),
                 *(payment for event, payment in deficits
                   if not _operating(event) or payment.due <= reserve_end))
 
-    def operating_payments(self, as_of, end):
+    def operating_payments(self, as_of, end, rates=None):
         """Later unfunded ongoing costs are paid in the projection when due."""
-        _, deficits = self._ledger(as_of, end, self.rates)
+        rates = self.rates if rates is None else rates
+        _, deficits = self._ledger(as_of, end, rates)
         reserve_end = month_after(as_of, 12) or date.max
-        return tuple(payment for event, payment in deficits
-                     if _operating(event) and payment.due > reserve_end)
+        return (*super().operating_payments(as_of, end, rates),
+                *(payment for event, payment in deficits
+                  if _operating(event) and payment.due > reserve_end))
 
     def monthly_totals(self, year, month, rates=None):
         """Scheduled gross cash movements, including linked recurring payments.
@@ -102,7 +105,8 @@ class LinkedSettings(CalculatorSettings):
             opening = start - timedelta(days=1) if start > date.min else start
             key = opening, end
             if key not in self._event_cache:
-                self._event_cache[key] = self.wealth.events(opening, end)
+                self._event_cache[key] = self.wealth.events(opening, end,
+                                                           inflation_percent=self.inflation_percent)
             return self._event_cache[key]
         return tuple(event for event in self._events(end) if event.due >= start)
 
@@ -112,11 +116,12 @@ class LinkedSettings(CalculatorSettings):
         key = next((key for key in self._event_cache if key[0] == self.as_of and key[1] >= end), None)
         if key is None:
             key = self.as_of, end
-            self._event_cache[key] = self.wealth.events(*key)
+            self._event_cache[key] = self.wealth.events(*key, inflation_percent=self.inflation_percent)
         return tuple(event for event in self._event_cache[key] if event.due <= end)
 
     def _ledger(self, as_of, end, rates):
-        incomes = gross_income_by_date(self.incomes, as_of, end, rates)
+        base_budgets = super().income_budgets(as_of, end, rates)
+        incomes = {budget.day: [budget.gross_income] for budget in base_budgets}
         linked_income = {}
         outgoings = {}
         for index, event in enumerate(self._events(end)):
@@ -144,7 +149,8 @@ class LinkedSettings(CalculatorSettings):
                 covered.append((event.name, amount, paid))
                 if amount > paid:
                     deficits.append((event, Payment(event.name, amount - paid, day, 'HUF',
-                                                     -index - 1, cash_due=day, defensive=True)))
+                                                     -index - 1, cash_due=day, defensive=True,
+                                                     origin='linked')))
             budgets.append(IncomeBudget(day, income, living, available,
                                         tuple(linked_income.get(day, ())), tuple(covered)))
         return tuple(budgets), tuple(deficits)

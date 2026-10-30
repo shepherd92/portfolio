@@ -39,7 +39,7 @@ class CalculatorStorageTests(unittest.TestCase):
         self.assertEqual(values['outgoings'][0], {
             'name': 'Living costs', 'amount': 100_000, 'currency': 'HUF',
             'start': '2026-01', 'frequency': 'monthly', 'count': None, 'end': None,
-            'appreciation_percent': 0})
+            'appreciation_percent': 0, 'growth_mode': 'fixed', 'price_month': None})
         self.assertIsNone(values['returns']['mak_huf'])
         self.assertNotIn('total', values)
         self.assertNotIn('monthly_costs', values)
@@ -75,6 +75,29 @@ class CalculatorStorageTests(unittest.TestCase):
         self.assertEqual(json.loads(token)['incomes'][0]['currency'], 'GBP')
         self.assertEqual([row['frequency'] for row in json.loads(token)['incomes']],
                          ['monthly', 'once', 'monthly', 'annual'])
+
+    def test_legacy_inputs_load_defaults_without_rewriting_and_new_assumptions_round_trip(self):
+        token = save_settings(self.settings, self.directory, None)
+        legacy = json.loads(token)
+        del legacy['inflation_percent']
+        for row in (*legacy['incomes'], *legacy['outgoings']):
+            del row['growth_mode']
+            del row['price_month']
+        legacy['incomes'][0]['appreciation_percent'] = 3
+        contents = json.dumps(legacy).encode()
+        self.path.write_bytes(contents)
+        loaded, original = load_settings(self.directory)
+        self.assertEqual(original, contents)
+        self.assertEqual(self.path.read_bytes(), contents)
+        self.assertEqual(loaded.inflation_percent, 0)
+        self.assertEqual(loaded.incomes[0].growth_mode, 'custom')
+        self.assertEqual(loaded.outgoings[1].growth_mode, 'fixed')
+        updated = replace(loaded, inflation_percent=4,
+                          incomes=(replace(loaded.incomes[0], growth_mode='inflation'),),
+                          outgoings=(replace(loaded.outgoings[1], price_month=date(2026, 10, 1)),))
+        saved = save_settings(updated, self.directory, original)
+        self.assertEqual(load_settings(self.directory), (updated, saved))
+        self.assertEqual(json.loads(saved)['outgoings'][0]['price_month'], '2026-10')
 
     def test_appreciation_round_trip_keeps_base_amounts_and_derived_huf_precision(self):
         settings = CalculatorSettings(

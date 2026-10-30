@@ -14,11 +14,11 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 DOWNLOADS = {
     "appimagetool.AppImage": (
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage",
-        "95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6"),
+        "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage",
+        "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"),
     "runtime-x86_64": (
-        "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
-        "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074"),
+        "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64",
+        "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"),
 }
 
 

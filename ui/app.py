@@ -19,7 +19,6 @@ from portfolio.market import MarketCache, fetch_base_rate, fetch_market_data
 from portfolio.projection import project
 from portfolio.linked import linked_settings
 from portfolio.storage import load_portfolio_with_signature, save_portfolio
-from portfolio.preferences import remember_directory
 from ui.reporting import format_amount, format_percent, format_plan
 from ui.links import quote_url
 from ui.theme import configure_theme
@@ -37,35 +36,13 @@ from ui.portfolio import AllocationPage
 from portfolio.networth import current_overview
 from ui.projection import ProjectionWindow
 from ui.help import AboutView, HELP, add_help, info_label
-from ui.startup import prepare_config_directory, select_config_directory
+from ui.startup import prepare_config_directory
 
 PRICE_REFRESH_SECONDS = 15 * 60
 MODES = ('Not allowed', 'Allowed')
 COMMON_CURRENCIES = tuple('AED AUD BRL CAD CHF CLP CNY COP CZK DKK EUR GBP HKD HUF IDR ILS INR '
                           'ISK JPY KRW MAD MXN MYR NOK NZD PHP PLN RON RSD SAR SEK SGD THB TRY '
                           'TWD USD ZAR'.split())
-
-
-def launch(directory, *, base_currency='EUR'):
-    root = tk.Tk(className='PortfolioPlanner')
-    root.withdraw()
-    configure_theme(root)
-    try:
-        directory = select_config_directory(
-            directory, base_currency=base_currency,
-            choose_directory=lambda: filedialog.askdirectory(title='Choose portfolio configuration directory', parent=root),
-            show_error=lambda message: messagebox.showerror('Cannot open portfolio', message, parent=root))
-        if directory is None:
-            root.destroy()
-            return 0
-        PortfolioApp(root, directory, base_currency=base_currency, on_directory_opened=remember_directory)
-    except (ValueError, OSError) as error:
-        messagebox.showerror('Cannot open portfolio', str(error), parent=root)
-        root.destroy()
-        return 1
-    root.deiconify()
-    root.mainloop()
-    return 0
 
 
 class PortfolioApp:
@@ -310,6 +287,7 @@ class PortfolioApp:
             self.root, parents={'properties': self.portfolio_notebook, 'pensions': self.portfolio_notebook,
                                 'loans': self.notebook}, show_page=self._show_wealth_page,
             currency=self.base_currency, currency_choices=self._currency_choices,
+            get_inflation=lambda: self.calculator.inflation_percent() if hasattr(self, 'calculator') else 0,
             on_change=self._wealth_edited)
         self.portfolio_notebook.add(self.wealth.pages['properties'], text='Properties')
         self.portfolio_notebook.add(self.wealth.pages['pensions'], text='Pension funds')
@@ -1081,7 +1059,7 @@ class PortfolioApp:
             else:
                 try:
                     complete(result)
-                except (ValueError, OSError) as error:
+                except (ValueError, OSError, ImportError) as error:
                     self._error(error, quiet=quiet)
         if not self.closed:
             self._update_calculator()

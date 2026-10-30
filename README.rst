@@ -422,17 +422,22 @@ The separate bank cash buffer holds that monthly total times cash months
 and two cash months reserve eight months of living costs in total.
 **Years to 100% stock market** (initially seven) is measured to the date an
 expense must be fully funded in cash, rather than its payment date.
-For a single expense, enter its expected nominal amount and currency **at its due date**.
+**Expected inflation** in Calculator Settings is a shared annual HUF purchasing-power
+assumption, initially 0%. It is not fetched or added to investment returns.
 For recurring income or outgoings, enter the amount in the **Begins** month and
-optionally set **Appreciation**, an annual percentage (initially 0%). The model uses::
+choose **Fixed amount**, **Follow inflation**, or **Custom rate**. The last option
+is the complete nominal growth rate, not a rate above inflation. The model uses::
 
-    payment = Begins amount × (1 + appreciation / 100)^(elapsed months / 12)
+    payment = Begins amount × (1 + chosen rate / 100)^(elapsed months / 12)
 
 This applies to both monthly and annual schedules. For example, 1,000 at 3%
 becomes 1,030 twelve months after Begins. Negative rates model decreasing payments.
-A single payment uses its entered amount. Appreciation is applied before currency
-conversion and is separate from investment returns. No raises or inflation are
-inferred beyond the rates you enter.
+For a single payment, **Future payment amount** means the entered amount is already
+the nominal sum due. **Today's money** means it is an estimate in the saved
+**Prices as of** month; inflation grows it from that month to the payment month.
+This reference month stays fixed when the app is reopened. The nominal payment is
+then discounted using nominal investment returns to calculate its reserve: inflation
+is not deducted a second time. All payment growth precedes currency conversion.
 HUF inputs require whole amounts; other currencies accept fractions and retain
 them internally while displaying whole amounts. Bank cash and all reserved
 MÁK stay in HUF even when the input spending currency is different.
@@ -450,8 +455,11 @@ on their actual dates and finite income stops at its end. Each future month's co
 first covers that month's ongoing living costs; only the
 remainder is investable income. Recurring living costs use the same first-of-month convention; after that day,
 the current month’s costs are already recorded. Future months include the entire
-ongoing monthly budget, including one twelfth of annual ongoing costs. A monthly living-cost deficit produces
-zero savings rather than a portfolio withdrawal, as before.
+ongoing monthly budget, including one twelfth of annual ongoing costs. Every future
+month is included, even with no income. A living-cost deficit becomes a dated
+portfolio withdrawal. Today's recommendation reserves the next twelve months of
+these deficits defensively; later deficits are paid from available long-term funds
+in the projection. A deficit is never treated as negative investable income.
 
 Single payments and finite instalments use the remaining income once through
 their funding schedules. Ongoing costs use their appreciated amounts for each
@@ -548,9 +556,10 @@ zero. Projection uses the same split for long-term growth and HUF growth for
 protected reserves. These are nominal return assumptions, not fetched bond yields.
 There is no forecast exchange-rate drift. A foreign-currency expense’s HUF cost
 changes when the fetched exchange rate changes.
-There are no inferred additions for inflation, fees, taxes, or early-redemption
-costs. Include them in your entered amounts or explicit cash-flow appreciation,
-and adjust investment returns separately. Expected growth is uncertain and does not guarantee
+Inflation affects only payments explicitly set to follow it, single payments entered
+in a saved month's prices, and the real-value display. Fees, taxes and redemption
+costs are not inferred. Include them in amounts or nominal return assumptions.
+Expected growth is uncertain and does not guarantee
 an expense will be funded. This is a deterministic scenario calculator, not a
 probability-of-success model or an automatic choice between MÁK and bond ETFs.
 
@@ -560,7 +569,12 @@ Choose a horizon from 1 to 100 years and switch between two stacked-area views:
 * **Portfolio**, from bottom to top: Cash, MÁK, and Stock market.
 * **Purpose**, from bottom to top: Monthly living costs, Emergency fund, Planned expenses, and Long-term investment.
 
-Both views show the same total in the selected portfolio currency. Hover over the
+Both views show the same total in the selected portfolio currency. **Nominal** shows
+future currency amounts. **Today's money** divides each value by
+``(1 + inflation / 100)^(days since opening / 365.2425)``. The same conversion applies
+to net worth, debts and dated shortfalls, and never reruns or changes the funding
+calculation. Purchasing power refers to HUF, even when displaying another currency
+at fixed exchange rates. Hover over the
 plot for dates and component values, or focus it and use Left/Right and Home/End.
 The projection starts with the recommended
 allocation of today's actual wealth, assumes rebalancing, and keeps today's exchange
@@ -569,15 +583,18 @@ Investable income enters on its scheduled future receipt dates;
 future income is never added upfront. Finite outgoing payments leave the portfolio on their actual
 due dates; overdue expenses are paid at the start. Vertical steps show deposits
 and payments. Monthly living costs represents the additional cash buffer; regular
-ongoing spending has already been deducted when computing investable receipts.
+ongoing spending is first deducted from income. Any uncovered living budget is
+withdrawn separately once. Its earmarked reserves appear with Planned expenses.
 
-Emergency and living-cost buffers retain their nominal targets. Emergency earnings
+Emergency and living-cost buffer targets track the growing ongoing-cost budget. Emergency earnings
 flow into long-term investments. Savings first restore any underfunded fixed buffers,
 then fund dated expense commitments, with the surplus invested in the long-term mix.
 Expense stock exposure declines to zero at its cash deadline, and available unreserved
-money fills any gap by that deadline. Fixed buffers are not spent on planned expenses.
-Missed cash deadlines and amounts still unpaid on their due dates are reported
-separately. The plot does not assume missing funds exist or deduct unpaid amounts.
+money fills any gap by that deadline. Protected buffers are not automatically spent
+on expenses or ordinary deficits. Missed cash deadlines, unpaid planned expenses
+and unpaid living costs are reported separately. The plot does not invent missing
+funds or deduct unpaid amounts. This protection rule can therefore report a shortfall
+while a protected emergency reserve still exists.
 
 The illustrative defaults are deliberately simple. Background research includes
 `AQR's 2026 capital-market assumptions
@@ -736,16 +753,15 @@ opens its original record on the appropriate tab.
 Property appreciation and depreciation change projected market value only.
 Each property has one **Vacancy** percentage, with no current rented/vacant status.
 Its **Cash flows** table contains Income and Outgoing schedules, an **Occupancy**
-choice and a separate annual **Appreciation** rate for each rent or cost::
+choice and the same Fixed / Follow inflation / Custom rate controls used elsewhere::
 
-    payment = amount × (1 + appreciation / 100)^(months since Begins / 12) × weight
+    payment = resolved nominal payment × weight
     Always weight = 1
     Rented weight = 1 − vacancy / 100
     Vacant weight = vacancy / 100
 
-The entered amount applies in the Begins month. Appreciation compounds monthly
-at the configured annual rate; negative rates model falling payments. A single
-payment uses its entered amount. For example, 1,000 rent at 3% appreciation and
+Recurring amounts apply in the Begins month and grow at the selected rate;
+single payments use their selected amount basis. For example, 1,000 rent at 3% custom growth and
 10% vacancy produces an average of 900 initially and 927 after twelve months.
 The Calculator and projections use these same averaged cash flows. Amounts paid
 directly by a tenant are not owner outgoings. Whole-HUF input validation remains;

@@ -10,6 +10,7 @@ from itertools import groupby
 from numbers import Integral
 
 from portfolio.models import AllocationTargets, CASH, STOCK_MARKET, TREASURY, currency_code, number
+from portfolio.growth import annual_percent, compound_months
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,8 @@ class CashFlow:
     count: int | None = None
     end: date | None = None
     appreciation_percent: float = 0
+    growth_mode: str | None = None
+    price_month: date | None = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name.strip():
@@ -57,29 +60,48 @@ class CashFlow:
         object.__setattr__(self, 'name', self.name.strip())
         object.__setattr__(self, 'amount', amount)
         object.__setattr__(self, 'currency', currency)
-        appreciation = number(self.appreciation_percent, 'Annual cash-flow appreciation')
-        if not -100 < appreciation <= 1000:
-            raise ValueError('Annual cash-flow appreciation must be greater than -100% and at most 1,000%.')
+        appreciation = annual_percent(self.appreciation_percent, 'Annual cash-flow appreciation')
         object.__setattr__(self, 'appreciation_percent', appreciation)
+        mode = self.growth_mode
+        if mode is None:
+            mode = 'custom' if appreciation else 'fixed'
+        if mode not in ('fixed', 'inflation', 'custom'):
+            raise ValueError('Cash-flow growth must be fixed, inflation, or custom.')
+        object.__setattr__(self, 'growth_mode', 'fixed' if self.frequency == 'once' else mode)
+        if self.price_month is not None:
+            _validate_date(self.price_month)
+            price_month = self.price_month.replace(day=1)
+            if self.frequency != 'once':
+                raise ValueError('Only a single payment can use a price reference month.')
+            if price_month > self.start:
+                raise ValueError('The price reference month cannot follow the payment month.')
+            object.__setattr__(self, 'price_month', price_month)
 
-    def amount_on(self, day):
+    def effective_growth(self, inflation_percent=0):
+        if self.growth_mode == 'inflation':
+            return annual_percent(inflation_percent, 'Expected inflation')
+        return self.appreciation_percent if self.growth_mode == 'custom' else 0.
+
+    def amount_on(self, day, inflation_percent=0):
         """Nominal payment in this month; Begins holds the entered amount.
 
         Growth uses elapsed whole months, including between annual payments.
-        One-time payments already specify their nominal due amount.
+        Single payments use their nominal due amount unless a saved price month
+        explicitly asks to inflate that amount to its due month.
         """
         _validate_date(day)
-        months = max(0, (day.year - self.start.year) * 12 + day.month - self.start.month)
-        if not months or not self.appreciation_percent or self.frequency == 'once':
+        if self.frequency == 'once':
+            if self.price_month is None:
+                return self.amount
+            start, end = self.price_month, self.start
+            rate = annual_percent(inflation_percent, 'Expected inflation')
+        else:
+            start, end = self.start, day
+            rate = self.effective_growth(inflation_percent)
+        months = max(0, (end.year - start.year) * 12 + end.month - start.month)
+        if not months or not rate:
             return self.amount
-        growth = _log_gross_blend(self.appreciation_percent, self.appreciation_percent, 0.) * months / 12
-        try:
-            amount = self.amount * exp(growth)
-        except OverflowError as error:
-            raise ValueError(f'{self.name}: appreciated payment exceeds the supported numeric range.') from error
-        if not isfinite(amount) or amount <= 0:
-            raise ValueError(f'{self.name}: appreciated payment exceeds the supported numeric range.')
-        return amount
+        return compound_months(self.amount, rate, months, f'{self.name}: appreciated payment')
 
     @property
     def interval_months(self):
@@ -123,6 +145,7 @@ class Payment:
     outgoing_index: int
     cash_due: date | None = None
     defensive: bool = False
+    origin: str = 'planned'
 
 
 @dataclass(frozen=True)
@@ -134,6 +157,14 @@ class IncomeBudget:
     surplus: float
     linked_income: tuple[tuple[str, float], ...] = ()
     obligations: tuple[tuple[str, float, float], ...] = ()
+
+    @property
+    def net(self):
+        return self.gross_income - self.living_costs - fsum(amount for _, amount, _ in self.obligations)
+
+    @property
+    def living_deficit(self):
+        return max(0., self.living_costs - self.gross_income)
 
 
 @dataclass(frozen=True)
@@ -190,6 +221,7 @@ class CalculatorSettings:
     cash_months: int = 2
     horizon_years: int = 7
     returns: ReturnAssumptions = field(default_factory=ReturnAssumptions)
+    inflation_percent: float = 0
 
     def __post_init__(self):
         for name, minimum, maximum in (('emergency_months', 0, 120), ('cash_months', 0, 120),
@@ -205,12 +237,13 @@ class CalculatorSettings:
             object.__setattr__(self, name, tuple(entries))
         if not isinstance(self.returns, ReturnAssumptions):
             raise ValueError('Expected validated return assumptions.')
+        object.__setattr__(self, 'inflation_percent', annual_percent(self.inflation_percent, 'Expected inflation'))
 
     def monthly_spending(self, rates=None, *, as_of=None):
         as_of = date.today() if as_of is None else as_of
         _validate_date(as_of)
         try:
-            return fsum(huf_value(outgoing.amount_on(as_of), outgoing.currency, rates) / outgoing.interval_months
+            return fsum(huf_value(outgoing.amount_on(as_of, self.inflation_percent), outgoing.currency, rates) / outgoing.interval_months
                         for outgoing in self.outgoings if outgoing.ongoing and outgoing.start <= as_of)
         except OverflowError as error:
             raise ValueError('Monthly spending exceeds the supported numeric range.') from error
@@ -222,7 +255,7 @@ class CalculatorSettings:
         try:
             for entries in (self.incomes, self.outgoings):
                 for recurring in (True, False):
-                    values.append(fsum(huf_value(entry.amount_on(start), entry.currency, rates) for entry in entries
+                    values.append(fsum(huf_value(entry.amount_on(start, self.inflation_percent), entry.currency, rates) for entry in entries
                                        if (entry.frequency != 'once') == recurring and any(entry.dates(start, end))))
         except OverflowError as error:
             raise ValueError('Monthly cash flows exceed the supported numeric range.') from error
@@ -234,28 +267,28 @@ class CalculatorSettings:
         Each month's receipts first cover that month's ongoing cost budget,
         with annual ongoing costs spread over 12 months. All flows use the first
         of the month; current-month income is already in the recorded portfolio.
-        Monthly deficits create no withdrawals. Finite outgoings are funded
+        Living deficits become defensive payments. Finite outgoings are funded
         separately by their deadlines.
         """
         return tuple((budget.day, budget.surplus) for budget in self.income_budgets(as_of, end, rates)
-                     if budget.surplus)
+                     if budget.surplus > 0)
 
     def income_budgets(self, as_of, end, rates=None):
         """Retain the actual income and living-cost deductions, including zero savings."""
         _validate_date(as_of)
         _validate_date(end)
-        gross = gross_income_by_date(self.incomes, as_of, end, rates)
+        gross = gross_income_by_date(self.incomes, as_of, end, rates, self.inflation_percent)
         budgets = []
         try:
-            for day, values in sorted(gross.items()):
-                income = fsum(values)
+            for day in future_months(as_of, end):
+                income = fsum(gross.get(day, ()))
                 living = self.monthly_spending(rates, as_of=day)
                 budgets.append(IncomeBudget(day, income, living, max(0., income - living)))
         except OverflowError as error:
             raise ValueError('Income receipts exceed the supported numeric range.') from error
         return tuple(budgets)
 
-    def scheduled_payments(self, as_of):
+    def scheduled_payments(self, as_of, rates=None):
         """Expand all unpaid finite commitments; past recurring payments are paid."""
         _validate_date(as_of)
         payments = []
@@ -265,8 +298,20 @@ class CalculatorSettings:
             for month in range(outgoing.payment_count):
                 due = month_after(outgoing.start, month * outgoing.interval_months)
                 if outgoing.frequency == 'once' or due >= as_of:
-                    payments.append(Payment(outgoing.name, outgoing.amount_on(due), due, outgoing.currency, index))
-        return tuple(payments)
+                    payments.append(Payment(outgoing.name, outgoing.amount_on(due, self.inflation_percent), due, outgoing.currency, index))
+        reserve_end = month_after(as_of, 12) or date.max
+        return (*payments, *self._living_payments(as_of, reserve_end, rates))
+
+    def operating_payments(self, as_of, end, rates=None):
+        """Uncovered living costs beyond the twelve months reserved today."""
+        reserve_end = month_after(as_of, 12) or date.max
+        return tuple(payment for payment in self._living_payments(as_of, end, rates)
+                     if payment.due > reserve_end)
+
+    def _living_payments(self, as_of, end, rates):
+        return tuple(Payment('Living-cost deficit', budget.living_deficit, budget.day, 'HUF', -1,
+                             cash_due=budget.day, defensive=True, origin='living')
+                     for budget in self.income_budgets(as_of, end, rates) if budget.living_deficit)
 
     def buffer_changes(self, as_of, rates=None, *, end=None):
         """Future signed changes in living-cost buffers, applied before expenses.
@@ -284,7 +329,7 @@ class CalculatorSettings:
             end = max(month_after(as_of, 12) or date.max, *(entry.start for entry in ongoing))
         _validate_date(end)
         days = {entry.start for entry in ongoing if as_of < entry.start <= end}
-        if any(entry.appreciation_percent for entry in ongoing):
+        if any(entry.effective_growth(self.inflation_percent) for entry in ongoing):
             day = month_after(as_of.replace(day=1), 1)
             while day is not None and day <= end:
                 days.add(day)
@@ -478,13 +523,21 @@ def huf_value(amount, currency, rates=None):
     return value
 
 
-def gross_income_by_date(incomes, as_of, end, rates=None):
+def future_months(as_of, end):
+    """Future month starts, including months without a scheduled cash receipt."""
+    day = month_after(as_of.replace(day=1), 1)
+    while day is not None and day <= end:
+        yield day
+        day = month_after(day, 1)
+
+
+def gross_income_by_date(incomes, as_of, end, rates=None, inflation_percent=0):
     """Group scheduled future income in HUF before any spending is deducted."""
     gross = {}
     for income in incomes:
         for day in income.dates(as_of, end):
             if day > as_of:
-                gross.setdefault(day, []).append(huf_value(income.amount_on(day), income.currency, rates))
+                gross.setdefault(day, []).append(huf_value(income.amount_on(day, inflation_percent), income.currency, rates))
     return gross
 
 
@@ -563,7 +616,7 @@ def recommend(settings, as_of, allocation, *, total, rates=None, funding_end=Non
     remaining = Decimal(str(total)) - emergency - cash
     rows = [AllocationRow('Emergency reserve', float(emergency), 0., float(emergency)),
             AllocationRow('Bank cash buffer', float(cash), 0., 0., float(cash))]
-    expenses = settings.scheduled_payments(as_of)
+    expenses = settings.scheduled_payments(as_of, rates)
     amounts = [huf_value(expense.amount, expense.currency, rates) for expense in expenses]
     calendar_end = month_after(as_of, 12) or date.max
     if funding_end is not None:
@@ -573,7 +626,7 @@ def recommend(settings, as_of, allocation, *, total, rates=None, funding_end=Non
     if hasattr(settings, 'wealth'):
         settings.validate_context(as_of, rates, calendar_end)
     income_budgets = settings.income_budgets(as_of, calendar_end, rates)
-    receipts = tuple((budget.day, budget.surplus) for budget in income_budgets if budget.surplus)
+    receipts = tuple((budget.day, budget.surplus) for budget in income_budgets if budget.surplus > 0)
     capacities = [expense_income_capacity(amount, max(0, (payment_cash_date(expense, settings.cash_months) - as_of).days),
                                          days, mak_return if expense.defensive else market_return, mak_return,
                                          defensive=expense.defensive)

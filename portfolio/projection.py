@@ -1,6 +1,6 @@
 """Deterministic projections of the calculator's allocation and protected reserves."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from math import exp, fsum, isfinite, log, log1p
 from itertools import groupby
@@ -21,6 +21,44 @@ class Projection:
     currency: str
     deadline_shortfalls: tuple[tuple[date, float], ...] = ()
     net_worth: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    living_shortfalls: tuple[tuple[date, float], ...] = ()
+    inflation_percent: float = 0
+    is_real: bool = False
+
+    def in_todays_money(self):
+        """Express this nominal result in opening-date purchasing power once.
+
+        Cash movements, allocations, amortization and returns remain nominal;
+        this immutable display conversion includes assets and liabilities alike.
+        """
+        if self.is_real or not self.dates:
+            return self
+        opening = self.dates[0]
+        growth = (log1p(self.inflation_percent / 100) if self.inflation_percent > -50
+                  else log((100 + self.inflation_percent) / 100))
+
+        def deflate(value, day):
+            if not value:
+                return value
+            try:
+                result = value * exp(-growth * (day - opening).days / 365.2425)
+            except OverflowError as error:
+                raise ValueError('Inflation-adjusted projection exceeds the supported numeric range.') from error
+            if not isfinite(result):
+                raise ValueError('Inflation-adjusted projection exceeds the supported numeric range.')
+            return result
+
+        def series(values):
+            return {name: tuple(deflate(value, day) for day, value in zip(self.dates, amounts))
+                    for name, amounts in values.items()}
+
+        def shortfalls(values):
+            return tuple((day, deflate(value, day)) for day, value in values)
+
+        return replace(self, portfolio=series(self.portfolio), purpose=series(self.purpose),
+                       net_worth=series(self.net_worth), shortfalls=shortfalls(self.shortfalls),
+                       deadline_shortfalls=shortfalls(self.deadline_shortfalls),
+                       living_shortfalls=shortfalls(self.living_shortfalls), is_real=True)
 
 
 def project(settings, as_of, allocation, *, total, rates=None, years=30, currency='HUF'):
@@ -31,7 +69,8 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
     monthly savings replenish fixed buffers and cash due before future commitments.
     Expenses are paid from their earmarked assets and then long-term investment,
     never from protected buffers. ``deadline_shortfalls`` records cash not ready on
-    time; ``shortfalls`` records expenses still unpaid at their actual due date.
+    time; ``shortfalls`` records planned expenses still unpaid at their due date.
+    ``living_shortfalls`` separately records unpaid ordinary living costs.
     Repeated dates show jumps when income arrives or an expense is paid.
     """
     if isinstance(years, bool) or not isinstance(years, Integral) or not 1 <= years <= 100:
@@ -47,11 +86,12 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
     currency = currency_code(currency)
     conversion = huf_value(1, currency, rates)
     ledger = _Ledger(settings, as_of, allocation, recommendation, rates, end)
-    wealth_projection = settings.wealth.project(as_of, end) if hasattr(settings, 'wealth') else None
+    wealth_projection = (settings.wealth.project(as_of, end, inflation_percent=settings.inflation_percent)
+                         if hasattr(settings, 'wealth') else None)
     wealth_days = {snapshot.day for snapshot in wealth_projection.snapshots if snapshot.before_payments} if wealth_projection else set()
     months = {month_after(as_of, month) for month in range(1, 12 * years + 1)}
     events = {end, *months, *wealth_days}
-    if any(flow.ongoing and flow.appreciation_percent for flow in settings.outgoings):
+    if any(flow.ongoing and flow.effective_growth(settings.inflation_percent) for flow in settings.outgoings):
         events.update(day for month in range(1, 12 * years + 1)
                       if (day := month_after(as_of.replace(day=1), month)) <= end)
     events.update(day for day in ledger.receipts if day <= end)
@@ -96,7 +136,9 @@ def project(settings, as_of, allocation, *, total, rates=None, years=30, currenc
                       {key: tuple(values) for key, values in purpose.items()},
                       tuple((day, _display_value(value, conversion)) for day, value in ledger.shortfalls), currency,
                       tuple((day, _display_value(value, conversion)) for day, value in ledger.deadline_shortfalls),
-                      net_worth)
+                      net_worth,
+                      tuple((day, _display_value(value, conversion)) for day, value in ledger.living_shortfalls),
+                      settings.inflation_percent)
 
 
 @dataclass
@@ -109,7 +151,7 @@ class _ExpensePot:
     income: float = 0
     paid: bool = False
     deadline_checked: bool = False
-    linked: bool = False
+    origin: str = 'planned'
 
     @property
     def value(self):
@@ -130,11 +172,11 @@ class _Ledger:
         self.emergency, self.cash = (row.amount for row in recommendation.rows[:2])
         self.long_term = recommendation.rows[-1].amount
         self.horizon_days = (month_after(as_of, 12 * settings.horizon_years) - as_of).days
-        expenses = settings.scheduled_payments(as_of)
+        expenses = tuple(item.payment for item in recommendation.expenses)
         amounts = [huf_value(expense.amount, expense.currency, rates) for expense in expenses]
         self.receipts = dict(recommendation.receipts)
         self.payments = recommendation.funding_schedule.payments
-        self.expenses, self.shortfalls, self.deadline_shortfalls = [], [], []
+        self.expenses, self.shortfalls, self.deadline_shortfalls, self.living_shortfalls = [], [], [], []
         for expense, amount, row in zip(expenses, amounts, recommendation.rows[2:-1]):
             deadline = payment_cash_date(expense, settings.cash_months)
             fraction = 0. if expense.defensive else min(1., max(0, (deadline - as_of).days) / self.horizon_days)
@@ -142,11 +184,11 @@ class _Ledger:
             # A negative adjustment is the absent defensive principal replaced by
             # future receipts. It is never counted as money the portfolio owns.
             self.expenses.append(_ExpensePot(expense.due, deadline, amount, baseline, row.amount - baseline,
-                                             linked=expense.outgoing_index < 0))
+                                             origin=expense.origin))
         if hasattr(settings, 'operating_payments'):
-            for payment in settings.operating_payments(as_of, end):
+            for payment in settings.operating_payments(as_of, end, rates):
                 amount = huf_value(payment.amount, payment.currency, rates)
-                self.expenses.append(_ExpensePot(payment.due, payment.due, amount, 0., 0., linked=True))
+                self.expenses.append(_ExpensePot(payment.due, payment.due, amount, 0., 0., origin=payment.origin))
 
     def allocations(self, day, *, before_cash=False):
         cash_day = day - timedelta(days=1) if before_cash else day
@@ -219,10 +261,11 @@ class _Ledger:
             extra = min(self.long_term, deficit)
             self.long_term += max(0., value - pot.target) - extra
             if deficit - extra > max(1e-7, pot.target * 1e-12):
-                if pot.linked:
+                if pot.origin == 'linked':
                     raise ValueError(f'Cannot project: a linked payment in {day:%Y-%m} has an unfunded '
                                      f'{deficit - extra:.0f} HUF. Review income, balances or its schedule.')
-                self.shortfalls.append((day, deficit - extra))
+                shortfalls = self.living_shortfalls if pot.origin == 'living' else self.shortfalls
+                shortfalls.append((day, deficit - extra))
             pot.baseline = pot.defensive = pot.income = 0.
             pot.paid = True
             changed = True

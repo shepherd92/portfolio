@@ -116,8 +116,8 @@ def _living(c):
     costs = []
     for flow in c.settings.outgoings:
         if flow.ongoing and flow.start <= c.as_of:
-            amount = flow.amount_on(c.as_of)
-            costs.append((flow.name, c.money(flow.amount, flow.currency), _percent(flow.appreciation_percent),
+            amount = flow.amount_on(c.as_of, c.settings.inflation_percent)
+            costs.append((flow.name, c.money(flow.amount, flow.currency), _growth(c, flow),
                           c.money(amount, flow.currency), flow.frequency,
                           _fx_text(flow.currency, 'HUF', c.huf_rates[flow.currency]),
                           c.huf(huf_value(amount, flow.currency, c.huf_rates) / flow.interval_months)))
@@ -127,7 +127,7 @@ def _living(c):
               CalculationFormula(r'B=\sum_k\frac{a_k x_k}{m_k}',
                                  'B is the monthly HUF living budget; a is the appreciated payment amount this month, x its HUF conversion, '
                                  'and m is one month for monthly costs or twelve for annual costs.'),
-              _table('Monthly living costs', ('Cost', 'Begins amount', 'Appreciation', 'Amount now', 'Frequency', 'Conversion', 'Monthly equivalent'),
+              _table('Monthly living costs', ('Cost', 'Begins amount', 'Growth', 'Amount now', 'Frequency', 'Conversion', 'Monthly equivalent'),
                      costs or [('No active ongoing costs', '0 HUF', '0%', '0 HUF', '—', '—', '0 HUF')], (1, 2, 3, 6)),
               CalculationFormula(r'C_{\mathrm{buffer}}=n_C B',
                                  f'{c.settings.cash_months} cash-buffer months × {c.huf(spending)} per month '
@@ -245,7 +245,7 @@ def _expense_overview(c):
     glossary = [
         ('D', 'Expense payment in HUF'), ('d; t', 'Nonnegative days to the cash deadline; t = d / 365.2425 years'),
         ('H', 'The configured stock horizon, using its actual calendar-day duration in years'),
-        ('w', 'Stock fraction today; zero for linked defensive obligations'),
+        ('w', 'Stock fraction today; zero for living and linked defensive obligations'),
         ('rS; rM; rE', 'Annual Stock market, HUF MÁK and EUR MÁK returns; decimal fractions in formulas'),
         ('P', 'Full present reserve before future income'), ('S', 'Stock reserve P × w, before shortage funding'),
         ('V0', 'Initial defensive reserve P − S'), ('K', 'Maximum eligible future savings value at the deadline'),
@@ -253,7 +253,7 @@ def _expense_overview(c):
         ('V; Q', 'Defensive reserve after credit; total reserve requested today')]
     blocks = [CalculationText(f'The stock horizon is {c.settings.horizon_years} years, or {horizon_days} calendar days. '
                               f'Normal expenses become Cash {max(2, c.settings.cash_months)} calendar months before payment. '
-                              'Linked defensive obligations use their own payment date and zero Stock market. '
+                              'Living deficits and linked defensive obligations use their own payment date and zero Stock market. '
                               'No growth is assumed after the cash deadline.'),
               _table('Return assumptions', ('Category', 'Within Stock market', 'Annual return'),
                      [(name, _percent(weights[name] / stock_total * 100 if stock_total else 0), _percent(rate))
@@ -286,7 +286,7 @@ def _expense_overview(c):
                        c.huf(max(detail.full_reserve * detail.stock_fraction,
                                  detail.full_reserve - detail.released_reserve)), c.huf(row.amount))
                       for index, (detail, row) in enumerate(zip(c.result.expenses, c.result.rows[2:-1]), 1)], (2, 3, 4)),
-              CalculationText('No unpaid finite expenses or linked deficits need funding.' if not c.result.expenses else
+              CalculationText('No unpaid finite expenses or living/linked deficits need funding.' if not c.result.expenses else
                               'Each dated payment has its own page, including repeated payments with the same name.'),
               _shortage_rule(c)]
     return CalculationPage('Expense method and return assumptions',
@@ -304,50 +304,73 @@ def _schedule(c, flow):
 
 def _appreciation_formula():
     return CalculationFormula(r'a(n)=a_0(1+g)^{n/12}',
-                              'a0 is the entered amount in the Begins month; g is annual appreciation as a decimal, '
-                              'and n is elapsed calendar months. Monthly and annual flows use the same formula. '
-                              'A single payment uses its entered amount. Appreciation changes payments, not investment returns.')
+                              'a0 is the entered amount in Begins; n is elapsed calendar months. The nominal annual rate g '
+                              'is zero for Fixed, the shared inflation assumption for Follow inflation, or the complete '
+                              'custom rate. Inflation is not added to custom growth. A today-priced single payment uses '
+                              'its saved price month as the origin and inflation as g; a nominal single payment stays fixed.')
+
+
+def _growth(c, flow):
+    if flow.price_month is not None:
+        return f'Inflation {_percent(c.settings.inflation_percent)} · prices {flow.price_month:%Y-%m}'
+    rate = flow.effective_growth(c.settings.inflation_percent)
+    if flow.frequency == 'once' or flow.growth_mode == 'fixed':
+        return 'Fixed'
+    return f'{"Inflation" if flow.growth_mode == "inflation" else "Custom"} · {_percent(rate)}'
 
 
 def _payment_appreciation(c, payment):
-    if not 0 <= payment.outgoing_index < len(c.settings.outgoings):
+    if payment.origin != 'planned' or not 0 <= payment.outgoing_index < len(c.settings.outgoings):
         return []
     flow = c.settings.outgoings[payment.outgoing_index]
-    if not flow.appreciation_percent:
+    rate = c.settings.inflation_percent if flow.price_month else flow.effective_growth(c.settings.inflation_percent)
+    if not rate and flow.price_month is None:
         return []
-    months = (payment.due.year - flow.start.year) * 12 + payment.due.month - flow.start.month
+    origin = flow.price_month or flow.start
+    months = (payment.due.year - origin.year) * 12 + payment.due.month - origin.month
     return [_appreciation_formula(),
-            _table('Payment appreciation', ('Input', 'Value'),
-                   [('Begins amount · a0', c.money(flow.amount, flow.currency)),
-                    ('Begins month', f'{flow.start:%Y-%m}'),
-                    ('Annual appreciation · g', _percent(flow.appreciation_percent)),
+            _table('Payment growth', ('Input', 'Value'),
+                   [('Entered amount · a0', c.money(flow.amount, flow.currency)),
+                    ('Price reference month' if flow.price_month else 'Begins month', f'{origin:%Y-%m}'),
+                    ('Growth rule', _growth(c, flow)),
+                    ('Annual nominal rate · g', _percent(rate)),
                     ('Elapsed months · n', str(months)),
                     ('Due payment · a(n)', c.money(payment.amount, payment.currency))], (1,))]
 
 
 def _savings(c):
-    schedule = [(kind, flow.name, *_schedule(c, flow), _percent(flow.appreciation_percent)) for kind, flows in
+    schedule = [(kind, flow.name, *_schedule(c, flow), _growth(c, flow)) for kind, flows in
                 (('Income', c.settings.incomes), ('Outgoing', c.settings.outgoings)) for flow in flows]
     budgets, obligations, linked_income = [], [], []
     for budget in c.result.income_budgets:
         covered = fsum(paid for _, _, paid in budget.obligations)
+        uncovered = fsum(required - paid for _, required, paid in budget.obligations)
         budgets.append((f'{budget.day:%Y-%m-%d}', c.huf(budget.gross_income), c.huf(budget.living_costs),
-                        c.huf(covered), c.huf(budget.surplus)))
+                        c.huf(covered), c.huf(uncovered), c.huf(budget.net), c.huf(budget.surplus), c.huf(budget.living_deficit)))
         obligations.extend((f'{budget.day:%Y-%m-%d}', name, c.huf(required), c.huf(paid), c.huf(required - paid))
                            for name, required, paid in budget.obligations)
         linked_income.extend((f'{budget.day:%Y-%m-%d}', name, c.huf(amount)) for name, amount in budget.linked_income)
     blocks = [CalculationText('Only receipts after the calculation date are eligible. Calendar-month payments occur on '
-                              'day one; current-month income is assumed already in recorded balances. An ordinary living '
-                              'deficit creates zero savings rather than a withdrawal. Finite Calculator expenses are '
-                              'reserved separately, not deducted twice.'),
-              CalculationFormula(r'I_j=\max(0,Y_j-B_j)-O_j',
-                                 'Y is gross income, B the active monthly living budget and O the linked obligations '
-                                 'actually covered from remaining income. Uncovered linked commitments become defensive expenses.'),
+                              'day one; current-month income is assumed already in recorded balances. Every future month '
+                              'is included, even without income. Living deficits become defensive payments: the next '
+                              'twelve months enter today’s reserve recommendation, and later deficits are projection '
+                              'withdrawals. Finite Calculator expenses are reserved separately, not deducted twice.'),
+              CalculationFormula(r'I_j=\max(0,Y_j-B_j)-O_j^{\mathrm{covered}},\qquad L_j=\max(0,B_j-Y_j)',
+                                 'Y is gross income, B the active monthly living budget and O covered the linked obligations '
+                                 'covered from remaining income. I is nonnegative investable savings; L is the living '
+                                 'withdrawal needed. Uncovered linked commitments become separate defensive expenses.'),
+              CalculationFormula(r'N_j=Y_j-B_j-O_j^{\mathrm{required}}=I_j-L_j-(O_j^{\mathrm{required}}-O_j^{\mathrm{covered}})',
+                                 'Required minus covered is the uncovered linked obligation. N is the full signed budget shown in the calendar. '
+                                 'Negative N is never supplied to the positive-income allocator; living and linked '
+                                 'deficits become their own payments, deducted once when due.'),
               _appreciation_formula(),
-              _table('Captured income and outgoing schedules', ('Kind', 'Name', 'Begins amount', 'Frequency', 'Begins', 'Ends', 'Appreciation'),
+              CalculationText(f'Captured expected inflation: {_percent(c.settings.inflation_percent)} per year. '
+                              'Amounts and reserves in this report are nominal. Today-priced expenses are inflated '
+                              'once before applying the nominal investment-return discount; there is no second inflation discount.'),
+              _table('Captured income and outgoing schedules', ('Kind', 'Name', 'Entered amount', 'Frequency', 'Begins', 'Ends', 'Growth'),
                      schedule, (2, 6)),
-              _table('Dated savings ledger · HUF', ('Receipt date', 'Gross income', 'Living budget', 'Linked payments', 'Savings'),
-                     budgets, (1, 2, 3, 4)),
+              _table('Dated savings ledger · HUF', ('Month', 'Gross income', 'Living budget', 'Linked covered', 'Linked uncovered', 'Net budget', 'Savings', 'Living withdrawal'),
+                     budgets, (1, 2, 3, 4, 5, 6, 7)),
               _table('Linked income included above', ('Date', 'Source', 'Income'), linked_income, (2,)),
               _table('Linked obligations', ('Date', 'Commitment', 'Required', 'Covered', 'Uncovered'), obligations, (2, 3, 4)),
               _table('Fixed-buffer changes before expense commitments', ('Month', 'Buffer change'),
@@ -393,7 +416,7 @@ def _linked_sources(c, wealth):
         for entry in item.cashflows:
             weight = {'always': 100, 'rented': 100 - item.vacancy_percent, 'vacant': item.vacancy_percent}[entry.occupancy]
             rows.append((f'Property · {item.name}', entry.flow.name, entry.direction, ' · '.join(_schedule(c, entry.flow)),
-                         f'Annual cash-flow appreciation {_percent(entry.appreciation_percent)}; '
+                         f'Growth {_growth(c, entry.flow)}; '
                          f'occupancy weight {_percent(weight)}; vacancy {_percent(item.vacancy_percent)}'))
     for item in wealth.pensions:
         rows.append((f'Pension · {item.name}', item.kind, 'Balance', c.money(item.balance, item.currency),
@@ -401,23 +424,26 @@ def _linked_sources(c, wealth):
                      f'access {item.access.strftime("%Y-%m") if item.access else "as scheduled"}'))
         for entry in item.contributions:
             rows.append((f'Pension · {item.name}', entry.flow.name, f'Contribution ({entry.source})',
-                         ' · '.join(_schedule(c, entry.flow)), 'Deducted from bank income' if entry.source == 'bank' else
-                         'Already outside net bank income; not deducted again'))
+                         ' · '.join(_schedule(c, entry.flow)), f'{_growth(c, entry.flow)}; ' +
+                         ('Deducted from bank income' if entry.source == 'bank' else
+                          'Already outside net bank income; not deducted again')))
         for flow in item.withdrawals:
             rows.append((f'Pension · {item.name}', flow.name, 'Withdrawal', ' · '.join(_schedule(c, flow)),
-                         'Balance pensions capped to available balance'))
+                         f'{_growth(c, flow)}; balance pensions capped to available balance'))
     for item in wealth.loans:
         rows.append((f'Loan · {item.name}', 'Repayment', c.money(item.balance, item.currency),
                      ' · '.join(_schedule(c, item.payment)) if item.payment else 'No repayment schedule',
-                     f'Annual interest {_percent(item.annual_interest)}; interest paid before principal'))
+                     f'Annual interest {_percent(item.annual_interest)}; interest paid before principal' +
+                     (f'; payment {_growth(c, item.payment)}' if item.payment else '')))
     return [CalculationText('Linked essential and finite payments use available income before discretionary ongoing '
                             'payments. Uncovered indefinite operations reserve the next twelve months; finite '
                             'commitments use the linked planning horizon. Property value and pension growth are not '
                             'bank income.'),
             _table('Linked asset assumptions and cash schedules', ('Source', 'Item', 'Kind / balance', 'Schedule', 'Treatment'), rows),
-            CalculationFormula(r'A_{\mathrm{property}}=A_0(1+r)^{m/12}v x',
-                               'Property cash payments grow from their Begins month, then apply the occupancy weight v '
-                               'and HUF conversion x.'),
+            CalculationFormula(r'A_{\mathrm{property}}=A_{\mathrm{nominal}}v x',
+                               'Resolve the nominal payment with its captured growth rule: recurring amounts grow from Begins; '
+                               'today-priced single payments grow from their saved price month. Then apply occupancy weight v '
+                               'and HUF conversion x exactly once.'),
             CalculationFormula(r'B_{\mathrm{before}}=B_{\mathrm{prior}}(1+r)^{d/365.25}',
                                'Pension and loan balances accrue between payments using elapsed days. Add pension '
                                'contributions then subtract eligible withdrawals; loan payments are capped to accrued '
@@ -450,7 +476,8 @@ def _expense(c, index, detail, row):
               ('Years to cash · t', _number(days / 365.2425, 4)), ('Horizon days', str(horizon_days)),
               ('Stock fraction · w', _percent(detail.stock_fraction * 100))]
     blocks = [*_payment_appreciation(c, payment),
-              CalculationText('This is a linked defensive commitment: zero Stock market and a cash deadline on its payment date.'
+              CalculationText(f'This is a {"living-cost deficit" if payment.origin == "living" else "linked defensive commitment"}: '
+                              'zero Stock market and a cash deadline on its payment date.'
                               if payment.defensive else 'This payment becomes Cash before its due date. Its allocation '
                               'moves from Stock market toward MÁK as that cash deadline approaches.'),
               _table('Payment and timing', ('Input', 'Captured value'), timing, (1,)),

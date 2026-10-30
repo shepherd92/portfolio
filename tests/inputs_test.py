@@ -25,7 +25,7 @@ class InputTests(unittest.TestCase):
             'cash.csv': 'currency,amount\nEUR,20\n',
         }
         self.write_files()
-        rate = patch('main.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1)))
+        rate = patch('portfolio.market.fetch_base_rate', return_value=BaseRate(5, date(2026, 1, 1)))
         rate.start()
         self.addCleanup(rate.stop)
         self.market = MarketData({'A': Quote(10, 'EUR')}, {'EUR': 1, 'HUF': .0025})
@@ -88,7 +88,7 @@ class InputTests(unittest.TestCase):
     def test_cli_operations(self):
         for operation in (['rebalance'], ['rebalance', '--allow-selling']):
             with (self.subTest(operation=operation),
-                  patch('main.fetch_market_data', return_value=self.market) as fetch,
+                  patch('portfolio.market.fetch_market_data', return_value=self.market) as fetch,
                   patch('sys.stdout', new_callable=io.StringIO) as output):
                 status = main(['--config', str(self.directory), *operation])
                 self.assertEqual(status, 0)
@@ -106,8 +106,8 @@ class InputTests(unittest.TestCase):
         save_settings(settings, self.directory, None)
         market = MarketData(self.market.quotes, {'HUF': .0025, 'USD': .9, 'GBP': 1.2})
         before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
-        with (patch('main.fetch_market_data', return_value=market) as fetch,
-              patch('main.rebalance', wraps=rebalance) as solve,
+        with (patch('portfolio.market.fetch_market_data', return_value=market) as fetch,
+              patch('portfolio.planning.rebalance', wraps=rebalance) as solve,
               patch('sys.stdout', new_callable=io.StringIO) as output):
             self.assertEqual(main(['--config', str(self.directory), 'rebalance']), 0)
         fetch.assert_called_once_with(load_portfolio(self.directory), 'EUR',
@@ -120,13 +120,13 @@ class InputTests(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
 
     def test_no_command_launches_gui_with_selected_inputs(self):
-        with patch('ui.app.launch', return_value=0) as launch:
+        with patch('ui.launcher.launch', return_value=0) as launch:
             result = main(['--config', str(self.directory), '--base-currency', 'USD'])
         self.assertEqual(result, 0)
         launch.assert_called_once_with(self.directory, base_currency='USD')
 
     def test_cli_reports_market_data_errors(self):
-        with (patch('main.fetch_market_data', side_effect=ValueError('Could not price A')),
+        with (patch('portfolio.market.fetch_market_data', side_effect=ValueError('Could not price A')),
               patch('sys.stderr', new_callable=io.StringIO) as output,
               self.assertRaises(SystemExit) as error):
             main(['--config', str(self.directory), 'rebalance'])

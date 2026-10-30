@@ -35,7 +35,7 @@ class CalculatorView(ttk.Frame):
         self._autosave_id, self._save_error = None, ''
         self._base_rate, self._rate_error, self._rate_date = None, '', ''
         self._inputs = {name: tk.StringVar(self) for name in
-                        ('emergency_months', 'cash_months', 'horizon_years', 'equities', 'gold', 'bonds', 'mak_huf', 'mak_eur')}
+                        ('emergency_months', 'cash_months', 'horizon_years', 'inflation_percent', 'equities', 'gold', 'bonds', 'mak_huf', 'mak_eur')}
         self._month = tk.StringVar(self, value=date.today().isoformat()[:7])
         self._recommendation = None
         self._auto_rate = tk.BooleanVar(self, value=True)
@@ -187,7 +187,10 @@ class CalculatorView(ttk.Frame):
                                   emergency_months=self._number('emergency_months', int),
                                   cash_months=self._number('cash_months', int),
                                   horizon_years=self._number('horizon_years', int),
-                                  returns=self.return_assumptions())
+                                  returns=self.return_assumptions(), inflation_percent=self.inflation_percent())
+
+    def inflation_percent(self):
+        return self._number('inflation_percent')
 
     def return_assumptions(self):
         return ReturnAssumptions(**{name: None if name == 'mak_huf' and self._auto_rate.get() else self._number(name)
@@ -223,7 +226,8 @@ class CalculatorView(ttk.Frame):
         reserves.columnconfigure(3, weight=1)
         for row, (name, label, unit) in enumerate((('emergency_months', 'Emergency reserve', 'months'),
                                                    ('cash_months', 'Bank cash buffer', 'months'),
-                                                   ('horizon_years', '100% stock market', 'years'))):
+                                                   ('horizon_years', '100% stock market', 'years'),
+                                                   ('inflation_percent', 'Expected annual inflation', ''))):
             info_label(reserves, label, HELP[name]).grid(row=row, column=0, sticky='w', pady=5)
             self._entry(reserves, name, 5).grid(row=row, column=1, padx=12, pady=5)
             ttk.Label(reserves, text=unit).grid(row=row, column=2, sticky='w', pady=5)
@@ -345,7 +349,8 @@ class CalculatorView(ttk.Frame):
         panel.rowconfigure(0, weight=1)
         notebook = ttk.Notebook(panel)
         notebook.grid(row=0, column=0, sticky='nsew')
-        self.cashflows = CashFlowTable(notebook, currency_choices=self._currency_choices, on_change=self._changed)
+        self.cashflows = CashFlowTable(notebook, currency_choices=self._currency_choices, on_change=self._changed,
+                                      get_inflation=self.inflation_percent)
         notebook.add(self.cashflows, text='Entered here')
         linked = ttk.Frame(notebook)
         notebook.add(linked, text='Linked payments')

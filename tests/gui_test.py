@@ -320,6 +320,21 @@ class GuiTests(unittest.TestCase):
         self.assertIn('unavailable', self.app.status.get())
         self.errors.assert_called_once()
 
+    def test_formula_import_failure_reports_error_and_keeps_polling(self):
+        previous_poll = self.app.poll_id
+        with patch('ui.calculation_view.formula_png', side_effect=ImportError('Missing formula renderer')):
+            self.app.generate_plan()
+            self.finish_worker()
+        self.assertIn('Missing formula renderer', self.app.status.get())
+        self.errors.assert_called_once_with('Check inputs', 'Missing formula renderer', parent=self.root)
+        self.assertTrue(self.app.holdings_table._enabled)
+        self.assertNotEqual(self.app.poll_id, previous_poll)
+        self.assertIn(self.app.poll_id, self.root.tk.call('after', 'info'))
+        received = []
+        self.app._run('Retrying', lambda: 42, received.append)
+        self.finish_worker()
+        self.assertEqual(received, [42])
+
     def test_failed_currency_refresh_clears_previous_prices_and_plan(self):
         self.app.generate_plan()
         self.finish_worker()

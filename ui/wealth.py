@@ -62,19 +62,19 @@ _NOTES = {
 _FLOW_HELP = {
     'pensions': 'Bank contributions reduce available cash. Payroll contributions are already deducted from net salary; employer contributions do not reduce your cash. Pension payments release money from the access month.',
     'loans': 'One repayment schedule per loan, in its currency. Payments include interest and principal, stop when the debt is repaid, and appear automatically in Calculator.',
-    'properties': 'Enter your own income and outgoings at their full amount in the Begins month. Each later payment grows by (1 + appreciation / 100) to the power of elapsed months / 12, then is weighted by vacancy. The Calculator and projection use these averaged amounts. Bills paid directly by a tenant are not your cash flows.',
+    'properties': 'Enter your own income and outgoings at their full amount. Choose fixed amounts, inflation or a custom annual change; payments are then weighted by vacancy. The Calculator and projection use these averaged amounts. Bills paid directly by a tenant are not your cash flows.',
 }
 _PROPERTY_FLOW_HELP = {
     'occupancy': 'Rented: multiply by (100 − vacancy)% of the property. Vacant: multiply by vacancy%. Always: use 100%. These are expected averages, not a prediction of which months have a tenant.',
-    'appreciation_percent': 'Expected annual change of this income or cost. Amount applies in the Begins month; later payments compound monthly at this annual rate. A negative rate models a decrease. A single payment uses its entered amount. This is separate from property value appreciation.',
 }
 
 
 class WealthEditor:
     """Source of pension, property and loan inputs; committed edits save automatically."""
 
-    def __init__(self, master, *, parents, show_page, currency, currency_choices, on_change):
+    def __init__(self, master, *, parents, show_page, currency, currency_choices, on_change, get_inflation=None):
         self._master, self._show_page = master, show_page
+        self._get_inflation = get_inflation or (lambda: 0)
         self._currency, self._currency_choices, self._on_change = currency, currency_choices, on_change
         self._directory, self._original, self._load_error = None, None, ''
         self._enabled, self.dirty = True, False
@@ -275,7 +275,7 @@ class WealthEditor:
         flows = []
         if kind == 'properties':
             return [dict(CashFlowTable._row(entry.flow, entry.direction.capitalize()),
-                         occupancy=entry.occupancy, appreciation_percent=plain_number(entry.appreciation_percent))
+                         occupancy=entry.occupancy)
                     for entry in record.cashflows]
         elif kind == 'pensions':
             roles = {'bank': 'Bank contribution', 'payroll': 'Payroll contribution', 'employer': 'Employer contribution'}
@@ -289,8 +289,7 @@ class WealthEditor:
         record = self._items[kind][self._selected[kind]]
         if kind == 'properties':
             return replace(record, cashflows=tuple(PropertyCashFlow(
-                CashFlowTable._cashflow(dict(row, appreciation_percent=0)), row['kind'].lower(), _key(_OCCUPANCY, row['occupancy']),
-                _percentage(row['appreciation_percent'])) for row in rows))
+                CashFlowTable._cashflow(row), row['kind'].lower(), _key(_OCCUPANCY, row['occupancy'])) for row in rows))
         flows = [(row['kind'], CashFlowTable._cashflow(row)) for row in rows]
         if kind == 'pensions':
             roles = {'Bank contribution': 'bank', 'Payroll contribution': 'payroll', 'Employer contribution': 'employer'}
@@ -377,12 +376,12 @@ class _RecordTable(DataTable):
 class _LinkedFlowTable(CashFlowTable):
     def __init__(self, parent, view, kind):
         self.view, self.kind = view, kind
-        extra = (('occupancy', 'Occupancy', 95), ('appreciation_percent', 'Appreciation', 110)) if kind == 'properties' else ()
+        extra = (('occupancy', 'Occupancy', 95),) if kind == 'properties' else ()
         super().__init__(parent, currency_choices=self._currencies,
-                         extra_columns=extra, percent_columns=('appreciation_percent',) if extra else (), appreciation=False,
+                         extra_columns=extra, get_inflation=view._get_inflation,
                          on_change=lambda *args: view._flows_changed(kind, *args))
         if extra:
-            self.field_rows += (('occupancy', 'appreciation_percent'),)
+            self.field_rows += (('occupancy',),)
         if kind != 'properties':
             self.tree.heading('kind', text='Payment type')
             self.tree.column('kind', width=155)
@@ -407,17 +406,14 @@ class _LinkedFlowTable(CashFlowTable):
         editor.configure(values=roles, width=24)
         variables['kind'].set((old or {}).get('kind', 'Outgoing' if self.kind == 'properties' else roles[0]))
         if self.kind == 'properties':
-            row = 2 * (len(self.field_rows) - 1)
-            for column, (key, title) in enumerate((('occupancy', 'Occupancy'), ('appreciation_percent', 'Appreciation'))):
-                value = (old or {}).get(key, 'always' if key == 'occupancy' else '0')
-                variable = variables[key] = tk.StringVar(form, value=_OCCUPANCY.get(value, value) if key == 'occupancy' else value)
-                info_label(form, title, _PROPERTY_FLOW_HELP[key]).grid(row=row, column=column, sticky='w', pady=(6, 2))
-                if key == 'occupancy':
-                    field = ttk.Combobox(form, textvariable=variable, values=tuple(_OCCUPANCY.values()), state='readonly', width=24)
-                else:
-                    field = PercentEntry(form, textvariable=variable, width=24)
-                field.grid(row=row + 1, column=column, sticky='ew', padx=(0, 12) if column == 0 else 0, pady=(0, 6))
-                add_help(field, _PROPERTY_FLOW_HELP[key])
+            # Leave room for the shared payment preview when it becomes visible.
+            row = form.grid_size()[1] + 1
+            variable = variables['occupancy'] = tk.StringVar(form, value=_OCCUPANCY[(old or {}).get('occupancy', 'always')])
+            info_label(form, 'Occupancy', _PROPERTY_FLOW_HELP['occupancy']).grid(
+                row=row, column=0, columnspan=2, sticky='w', pady=(6, 2))
+            field = ttk.Combobox(form, textvariable=variable, values=tuple(_OCCUPANCY.values()), state='readonly', width=24)
+            field.grid(row=row + 1, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+            add_help(field, _PROPERTY_FLOW_HELP['occupancy'])
         return variables, first
 
     def _validate(self, row, old):
@@ -425,13 +421,10 @@ class _LinkedFlowTable(CashFlowTable):
         if role not in _ROLES[self.kind]:
             raise ValueError('Select a valid payment type.')
         draft = dict(row, kind='Outgoing')
-        if self.kind == 'properties':
-            draft['appreciation_percent'] = 0
         normalized = super()._validate(draft, old)
         normalized['kind'] = role
         if self.kind == 'properties':
-            normalized.update(occupancy=_key(_OCCUPANCY, row['occupancy']),
-                              appreciation_percent=plain_number(_percentage(row['appreciation_percent'])))
+            normalized['occupancy'] = _key(_OCCUPANCY, row['occupancy'])
         rows = self.get_rows()
         if old is None:
             rows.append(normalized)

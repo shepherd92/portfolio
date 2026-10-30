@@ -9,6 +9,7 @@ from pathlib import Path
 
 from portfolio.calculator import CashFlow
 from portfolio.files import json_bytes, read_optional_bytes, stage_bytes, unique_object
+from portfolio.growth import annual_percent
 from portfolio.wealth import Loan, Pension, PensionContribution, Property, PropertyCashFlow, WealthSettings
 
 
@@ -21,13 +22,15 @@ def load_wealth(directory):
         values = json.loads(original, parse_float=Decimal, object_pairs_hook=unique_object,
                             parse_constant=_invalid_constant)
         _keys(values, {'version', 'properties', 'pensions', 'loans'})
-        if type(values['version']) is not int or values['version'] != 2:
+        if type(values['version']) is not int or values['version'] not in (2, 3):
             raise ValueError('Unsupported wealth file version.')
         properties, pensions, loans = [], [], []
         for row in _rows(values['properties']):
             _keys(row, Property)
             cashflows = []
             for entry in _rows(row['cashflows']):
+                if values['version'] == 2:
+                    entry = _legacy_property_flow(entry)
                 _keys(entry, PropertyCashFlow)
                 cashflows.append(PropertyCashFlow(**{**entry, 'flow': _flow(entry['flow'])}))
             row['cashflows'] = tuple(cashflows)
@@ -58,7 +61,7 @@ def save_wealth(settings, directory, original):
     if original is not None and not isinstance(original, bytes):
         raise ValueError('Expected the original wealth file bytes from loading.')
     path = Path(directory) / 'wealth.json'
-    contents = json_bytes({'version': 2, **asdict(settings)})
+    contents = json_bytes({'version': 3, **asdict(settings)})
     _check_original(path, original)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = stage_bytes(path, contents, preserve_mode=False)
@@ -81,9 +84,9 @@ def _rows(value):
     return value
 
 
-def _keys(value, model):
+def _keys(value, model, *, optional=frozenset()):
     expected = model if isinstance(model, set) else {field.name for field in fields(model)}
-    if not isinstance(value, dict) or set(value) != expected:
+    if not isinstance(value, dict) or not expected - optional <= set(value) <= expected:
         raise ValueError('A record has missing or unsupported fields.')
 
 
@@ -101,6 +104,19 @@ def _month(value):
 
 
 def _flow(row):
-    _keys(row, CashFlow)
+    _keys(row, CashFlow, optional={'growth_mode', 'price_month'})
     return CashFlow(**{**row, 'start': _month(row['start']),
-                       'end': _month(row['end']) if row['end'] is not None else None})
+                       'end': _month(row['end']) if row['end'] is not None else None,
+                       'price_month': _month(row['price_month']) if row.get('price_month') is not None else None})
+
+
+def _legacy_property_flow(entry):
+    """Move version-two property-payment growth to its sole schedule owner."""
+    _keys(entry, {'flow', 'direction', 'occupancy', 'appreciation_percent'})
+    flow = _flow(entry['flow'])
+    if flow.appreciation_percent:
+        raise ValueError('Property cash-flow growth cannot appear in both the wrapper and schedule.')
+    growth = annual_percent(entry['appreciation_percent'], 'Annual cash-flow appreciation')
+    return {key: value for key, value in entry.items() if key != 'appreciation_percent'} | {
+        'flow': {**entry['flow'], 'appreciation_percent': growth,
+                 'growth_mode': 'custom' if growth else 'fixed'}}

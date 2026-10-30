@@ -27,7 +27,7 @@ class ProjectionViewTests(unittest.TestCase):
                      'Emergency fund': (200_000, 200_000, 200_000),
                      'Planned expenses': (100_000, 70_000, 40_000),
                      'Monthly living costs': (100_000, 100_000, 100_000)}, shortfalls=(),
-            deadline_shortfalls=(), currency='HUF')
+            deadline_shortfalls=(), living_shortfalls=(), currency='HUF')
         self.get_projection = Mock(return_value=self.data)
         self.window = ProjectionWindow(self.root, self.get_projection)
         self.root.update()
@@ -112,6 +112,34 @@ class ProjectionViewTests(unittest.TestCase):
                 self.assertEqual(len(self.window.canvas.find_withtag('area')), 3)
                 self.assertLess(self.window._note.winfo_rooty(),
                                 self.window.winfo_rooty() + self.window.winfo_height())
+
+    def test_money_toggle_deflates_chart_readout_and_warnings_without_recalculation(self):
+        from portfolio.projection import Projection
+        nominal = Projection(**vars(self.data), inflation_percent=10,
+                             net_worth={'Net worth': (-100., -100., -100.)})
+        from dataclasses import replace
+        nominal = replace(nominal, living_shortfalls=((nominal.dates[-1], 1100),))
+        self.get_projection.return_value = nominal
+        self.window.refresh()
+        calls = self.get_projection.call_count
+        self.window.money.set("Today's money")
+        self.window._change_money()
+        real = nominal.in_todays_money()
+        self.assertEqual(self.window._projection, real)
+        self.assertEqual(self.get_projection.call_count, calls)
+        self.assertIn("today's money", self.window.readout.get())
+        self.assertIn('Unpaid living costs: 1\u202f000 HUF', self.window.warning.get())
+        self.assertIn('HUF purchasing power at 2026-10-16', self.window._note.cget('text'))
+        self.assertTrue(any("today's money" in self.window.canvas.itemcget(item, 'text')
+                            for item in self.window.canvas.find_withtag('axis')))
+        self.window.view.set('Net worth')
+        self.window._change_view()
+        self.assertEqual(self.window._series(), real.net_worth)
+        self.window.money.set('Nominal')
+        self.window._change_money()
+        self.assertIs(self.window._projection, nominal)
+        self.assertIn('Unpaid living costs: 1\u202f100 HUF', self.window.warning.get())
+        self.assertEqual(self.get_projection.call_count, calls)
 
     def test_empty_portfolio_still_has_finite_axes_and_zero_readout(self):
         for series in (self.data.portfolio, self.data.purpose):

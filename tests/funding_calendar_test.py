@@ -69,7 +69,10 @@ class FundingCalendarTests(unittest.TestCase):
         self.assertIsNone(march.assignment)
         self.assertEqual(april.totals.single_outgoings, 500)
         self.assertEqual(february.deadlines, (0,))
-        self.assertEqual(april.due_expenses, (0,))
+        self.assertEqual(april.due_expenses, (0, 2))
+        self.assertEqual(march.budget.net, -100)
+        self.assertEqual(result.expenses[2].payment.origin, 'living')
+        self.assertEqual(result.expenses[2].payment.amount, 100)
         self.assertEqual(february.assignment.expenses, result.funding_schedule.entries[0].expenses)
 
     def test_overdue_once_payment_and_passed_deadline_remain_in_opening_month(self):
@@ -108,6 +111,7 @@ class TreasuryReturnTests(unittest.TestCase):
 
     def test_recommendation_weights_protected_huf_and_long_term_currency_mix(self):
         settings = self.settings(emergency_months=2, cash_months=1,
+                                 incomes=(CashFlow('Income', 100, TODAY, frequency='monthly'),),
                                  outgoings=(CashFlow('Living', 100, TODAY, frequency='monthly'),))
         result = recommend(settings, TODAY, self.targets, total=1000)
         self.assertEqual((result.stock, result.mak_huf, result.mak_eur, result.cash), (420, 270, 210, 100))
@@ -131,7 +135,7 @@ class TreasuryReturnTests(unittest.TestCase):
         result = project(settings, TODAY, self.targets, total=1000, years=1)
         expected = 1000 * (1 + (.6 * 8 + .1 * 6 + .3 * 2) / 100) ** (365 / 365.2425)
         self.assertAlmostEqual(fsum(values[-1] for values in result.portfolio.values()), expected)
-        huf_only = replace(settings, outgoings=(CashFlow('Living', 100, TODAY, frequency='monthly'),),
+        huf_only = replace(settings, incomes=(CashFlow('Income', 100, TODAY, frequency='monthly'),), outgoings=(CashFlow('Living', 100, TODAY, frequency='monthly'),),
                            emergency_months=10)
         first = project(huf_only, TODAY, self.targets, total=1000, years=1)
         second = project(replace(huf_only, returns=replace(huf_only.returns, mak_eur=90)),

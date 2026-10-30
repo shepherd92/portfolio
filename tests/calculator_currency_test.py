@@ -94,7 +94,11 @@ class CalculatorCurrencyTests(unittest.TestCase):
         self.assertAlmostEqual(result.rows[0].mak, 6 * spending)
         self.assertAlmostEqual(result.rows[2].future_amount, expense)
         self.assertAlmostEqual(result.rows[2].amount, expense)
-        self.assertAlmostEqual(result.rows[-1].amount, 10_000_000 - spending * 8 - expense)
+        living = [item for item in result.expenses if item.payment.origin == 'living']
+        self.assertEqual(len(living), 12)
+        self.assertTrue(all(item.payment.currency == 'HUF' for item in living))
+        self.assertAlmostEqual(sum(item.payment.amount for item in living), 12 * spending)
+        self.assertAlmostEqual(result.rows[-1].amount, 10_000_000 - spending * 20 - expense)
         self.assertAlmostEqual(result.total, 10_000_000)
 
     def test_fx_changes_recalculate_inputs_without_changing_nominal_native_amounts(self):
@@ -104,7 +108,7 @@ class CalculatorCurrencyTests(unittest.TestCase):
         self.assertEqual((original.rows[0].amount, changed.rows[0].amount), (4_800_000, 5_400_000))
         self.assertEqual((original.rows[2].amount, changed.rows[2].amount), (48_000, 50_000))
         self.assertEqual(settings.outgoings[:2], (ongoing('Rent', 1_200, 'EUR'), ongoing('Other', 800, 'EUR')))
-        self.assertEqual(settings.scheduled_payments(self.today)[0].amount, 100)
+        self.assertEqual(settings.scheduled_payments(self.today, self.rates)[0].amount, 100)
         self.assertEqual(changed.total, original.total)
 
     def test_funding_uses_cross_rates_in_any_base_and_keeps_all_protected_amounts_huf(self):
@@ -116,8 +120,28 @@ class CalculatorCurrencyTests(unittest.TestCase):
         eur = prepare_allocation(portfolio, MarketData({}, eur_rates, 'EUR'), settings, self.today)
         self.assertEqual(huf.recommendation, eur.recommendation)
         self.assertEqual(huf.portfolio.allocation, eur.portfolio.allocation)
-        self.assertEqual(dict(huf.minimum_values), {(CASH, 'HUF'): 1_648_000, (TREASURY, 'HUF'): 4_800_000})
-        self.assertEqual(dict(eur.minimum_values), {(CASH, 'HUF'): 4_120, (TREASURY, 'HUF'): 12_000})
+        # Living deficits add 9.6m HUF of required reserves. Only owned assets
+        # can back the protected allocation after funding cash and emergency.
+        self.assertEqual(huf.recommendation.shortfall, Decimal('6048000'))
+        self.assertEqual(dict(huf.minimum_values), {(CASH, 'HUF'): 1_648_000, (TREASURY, 'HUF'): 8_352_000})
+        self.assertEqual(dict(eur.minimum_values), {(CASH, 'HUF'): 4_120, (TREASURY, 'HUF'): 20_880})
+
+    def test_inflation_linked_foreign_living_deficits_include_every_income_free_month(self):
+        flow = CashFlow('Rent', 100.01, self.today, 'EUR', 'monthly', growth_mode='inflation')
+        settings = self.settings(incomes=(), outgoings=(flow,), inflation_percent=12)
+        rates = {'EUR': 399.5}
+        budgets = settings.income_budgets(self.today, date(2026, 1, 1), rates)
+        self.assertEqual(len(budgets), 12)
+        for month, budget in enumerate(budgets, 1):
+            expected = 100.01 * 1.12 ** (month / 12) * 399.5
+            self.assertAlmostEqual(budget.living_deficit, expected)
+            self.assertAlmostEqual(budget.net, -expected)
+            self.assertEqual(budget.surplus, 0)
+        reserved = settings.scheduled_payments(self.today, rates)
+        self.assertEqual([payment.due for payment in reserved], [budget.day for budget in budgets])
+        for payment, budget in zip(reserved, budgets):
+            self.assertEqual(payment.amount, budget.living_deficit)
+            self.assertEqual(payment.currency, 'HUF')
 
     def test_only_nonzero_inputs_need_rates_and_invalid_missing_rates_are_explicit(self):
         settings = self.settings(outgoings=(), incomes=(),

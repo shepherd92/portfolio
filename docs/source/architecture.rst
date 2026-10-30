@@ -126,15 +126,19 @@ Savings recommendations
 The calculator uses validated native-currency inputs and a supplied valuation
 date. ``CashFlow`` is shared by ``CalculatorSettings.incomes`` and ``outgoings``.
 It carries a name, native amount, currency, payment month or first recurring month,
-frequency, annual appreciation and optional payment count or inclusive end month. Single outgoing payments and
+frequency, growth mode, custom nominal annual growth and optional payment count or inclusive end month. Single outgoing payments and
 finite monthly and annual schedules expand into ``Payment`` records with their source index.
 All start/end values normalize to the first of their month; recurring occurrences
 step by 1 or 12 months. Storage uses YYYY-MM for every schedule, including single payments. UI MonthEntry selects a year and month together. Past recurring payments are treated
 as paid; overdue single payments remain outstanding. All finite payments are included,
 not only those within the chart horizon. Income has its own currency.
-``CashFlow.amount_on(day)`` grows the Begins amount by
-``(1 + appreciation_percent / 100) ** (elapsed_calendar_months / 12)``.
-Single payments retain their entered due amount. Native-currency growth precedes
+``CashFlow.amount_on(day, inflation_percent)`` grows the Begins amount by
+``(1 + effective_growth / 100) ** (elapsed_calendar_months / 12)``.
+The rate is zero, shared inflation, or custom nominal growth; inflation is never
+added to custom growth. ``portfolio.growth`` centralizes rate validation and stable
+month compounding. Single payments retain their nominal due amount unless a saved
+``price_month`` anchors a price estimate; then inflation grows it to the due month.
+The anchor survives reopening and changing the valuation date. Native-currency growth precedes
 conversion, with no intermediate HUF rounding. Receipts, finite payment expansion,
 monthly totals and projections use this same calculation.
 ``CalculatorSettings.monthly_spending(rates, as_of=day)`` sums active ongoing
@@ -169,7 +173,14 @@ date. Each future month's combined income first covers its ongoing-cost budget;
 only positive remaining income enters the investment ledger. All flows use month-start dates, so current-month income and ongoing costs are
 already recorded after that day. Future-month budgets include the full ongoing
 monthly spending budget, including annual costs divided by 12.
-Monthly deficits do not create withdrawals. ``buffer_changes`` records monthly
+Every future month has an ``IncomeBudget``, including months with no receipts.
+Its nonnegative ``surplus`` enters the income allocator; ``living_deficit`` becomes
+a defensive ``Payment`` with an explicit ``living`` origin. The next twelve months
+are reserved today; later deficits are operating payments in the projection.
+``net`` is signed income minus living costs minus all required linked obligations,
+including uncovered linked commitments. ``Payment.origin`` distinguishes planned,
+living and linked obligations; source indices identify schedules only.
+``buffer_changes`` records monthly
 changes in the active living budget times the combined reserve months through
 the funding horizon. Positive changes withhold income before expense commitments;
 negative changes cancel unpaid top-up needs without inventing additional income.
@@ -182,11 +193,12 @@ Each assigned payment grows at the HUF MÁK rate until that cash deadline. The n
 is that expense's remaining defensive capacity discounted to the payment date; any unused
 part of the same payment remains available for the next expense. No income is
 counted twice or applied after an expense's cash deadline. The emergency reserve
-and bank living-cost buffer always use current wealth; income below spending
-does not cause withdrawals.
+and bank living-cost buffer always use current wealth; ordinary living deficits
+are separate dated payments, not negative receipts.
 
-An expense's cash deadline is its due date minus ``max(2,cash_months)`` calendar
-months. Both the payment and deadline fall on the first day of their month. ``T`` is the
+A planned expense's cash deadline is its due date minus ``max(2,cash_months)`` calendar
+months. Living and linked defensive payments instead use their due date.
+Both the payment and deadline fall on the first day of their month. ``T`` is the
 time until that deadline and ``H`` is the selected stock horizon. The current
 stock fraction is ``w(T)=min(T/H,1)`` for positive ``T``. For full future
 amount ``F``, the baseline reserve ``B`` is
@@ -275,6 +287,14 @@ read-only tree and the selected expense's reserve explanation; it does no planni
 The requested calendar end extends receipt evidence, not allocation horizons or
 expense eligibility. All finite payments remain in the recommendation.
 Currency conversion applies once to output series using constant current FX rates.
+The accounting engine remains nominal. ``Projection.in_todays_money()`` creates an
+idempotent display copy, dividing every series and dated shortfall by
+``(1 + inflation / 100) ** (days / 365.2425)`` from the opening date. Net worth is
+assembled before conversion, including signed debt; the nominal result is retained.
+Ordinary living withdrawals consume their reserve and then unearmarked long-term
+funds. Protected buffers and other earmarked pots remain intact. Unpaid living
+costs are separate ``living_shortfalls``; linked-payment shortfalls still stop the
+projection so external balances cannot benefit from unpaid transfers.
 ``ui/projection.py`` draws these series as stacked areas on a native Tk canvas and
 opens from Portfolio Summary without blocking editing in the main window. Display order
 is explicit and independent of model dictionary order. Mouse and keyboard inspection
@@ -372,8 +392,11 @@ overrides a live Quote's currency or changes optimization. Assets displays price
 and quote currencies from the accepted MarketData independently of editable
 metadata, sorting by the unrounded quote. Clearing market data also clears these
 prices; an ordinary failed refresh retains the previous accepted batch.
-There is one supported input schema and no automatic format conversion. Save
-protection is not a cross-process filesystem lock.
+Unknown input keys and missing required fields are rejected. New inflation and
+growth fields have explicit defaults when absent. Wealth v2 property growth is
+normalized into its nested cash flow when read and written as v3 on a later save;
+opening settings never rewrites them. Original bytes still protect against external
+edits. Save protection is not a cross-process filesystem lock.
 
 Market data stays in memory and is fetched on every launch or CLI run.
 Only held tickers and positive-target main tickers require quotes. Manual
@@ -508,14 +531,16 @@ messages remain centralized. Source navigation calls the app's page-selection
 callback before selecting the record. The trading Portfolio model is unchanged.
 Property market growth generates no cash event. A property has one vacancy rate
 and unified ``PropertyCashFlow`` records containing a schedule, direction,
-occupancy condition and annual appreciation. Only generated cash events are
-scaled: ``amount * (1 + appreciation/100) ** (months_since_start/12) * weight``.
+occupancy condition. The nested ``CashFlow`` owns growth exactly once. Only generated
+cash events are scaled: ``flow.amount_on(day, inflation_percent) * weight``.
 Weight is 1 for Always, ``1-vacancy/100`` for Rented, and ``vacancy/100`` for Vacant.
-The schedule's Begins month anchors escalation, including past-start schedules;
-single payments have zero elapsed months. Fractional HUF results never pass
+The schedule's Begins month anchors recurring escalation, including past-start
+schedules. A single payment stays nominal unless its saved price month requests
+inflation growth to the due month. Fractional HUF results never pass
 through input-only whole-HUF validators. All linked consumers use the same
 averaged event stream; dates, recurrence and finite/ongoing rules are unchanged.
-Property storage uses strict version 2 without a legacy decoder.
+Property storage writes strict version 3; a narrow read-only normalization accepts
+the preceding version's property growth field without changing existing amounts.
 
 Payroll and employer contributions
 grow investment-balance pensions without another bank debit. Income entitlements

@@ -5,11 +5,6 @@ from io import BytesIO
 import tkinter as tk
 from tkinter import font, ttk
 
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib.font_manager import FontProperties
-from matplotlib.mathtext import math_to_image
-
 from ui.calculation_report import CalculationFormula, CalculationTable
 from ui.help import info_label
 from ui.theme import ALTERNATE_BACKGROUND, CATEGORY_BACKGROUND, MUTED_TEXT, ROW_BACKGROUND, TEXT
@@ -369,6 +364,11 @@ class _ReportTable(ttk.Frame):
 @lru_cache(maxsize=128)
 def formula_png(latex, dpi=110):
     """Render the supported LaTeX math subset offline; no external TeX process."""
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.mathtext import math_to_image
+
     output = BytesIO()
     with matplotlib.rc_context({'savefig.transparent': True, 'mathtext.fontset': 'stix'}):
         display = latex.replace(r'\frac', r'\dfrac')

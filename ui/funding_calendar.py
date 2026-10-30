@@ -144,17 +144,22 @@ class FundingCalendar(ttk.Frame):
 
     def _funding_rows(self, parent, row):
         if row.day > date.today():
-            paid = fsum(covered for _, _, covered in row.budget.obligations)
+            required = fsum(amount for _, amount, _ in row.budget.obligations)
             money = lambda value: format_amount(value / self._conversion)
             available = row.assignment.available if row.assignment else 0.
             self._budget_details[parent] = (
-                f'Savings budget: max(0, income {money(row.budget.gross_income)} − living costs '
-                f'{money(row.budget.living_costs)}) − linked payments covered {money(paid)} '
-                f'= {money(available)} {self._currency.get()}. '
-                'Ongoing annual costs are spread over 12 months; Scheduled net uses actual payment months.')
+                f'Monthly budget: income {money(row.budget.gross_income)} − living costs '
+                f'{money(row.budget.living_costs)} − linked payments {money(required)} '
+                f'= {money(row.budget.net)} {self._currency.get()}. '
+                f'Living-cost withdrawal needed: {money(row.budget.living_deficit)} {self._currency.get()}. '
+                'Uncovered linked payments are listed separately below. Ongoing annual costs are spread over 12 months; '
+                'Scheduled net uses actual payment months.')
             budget = parent + '/budget'
-            self._insert(parent, budget, 'Savings budget', income=row.budget.gross_income,
-                         outgoings=row.budget.living_costs + paid, savings=available)
+            self._insert(parent, budget, 'Monthly budget', income=row.budget.gross_income,
+                         outgoings=row.budget.living_costs + required, net=row.budget.net, savings=available)
+            if row.budget.living_deficit:
+                self._insert(budget, parent + '/withdrawal', 'Living costs from portfolio',
+                             outgoings=row.budget.living_deficit)
             self._insert(budget, parent + '/living', 'Ongoing living costs',
                          outgoings=row.budget.living_costs)
             for number, (name, amount, covered) in enumerate(row.budget.obligations):

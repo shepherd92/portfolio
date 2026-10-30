@@ -29,11 +29,12 @@ class ProjectionWindow(tk.Toplevel):
         self.geometry('1050x650')
         self.minsize(800, 560)
         self._get_projection = get_projection
-        self._projection = None
+        self._projection = self._nominal_projection = None
         self._bounds = None
         self._xs = []
         self._message = ''
         self.view = tk.StringVar(self, value='Portfolio')
+        self.money = tk.StringVar(self, value='Nominal')
         self.years = tk.StringVar(self, value='30')
         self.readout = tk.StringVar(self)
         self.details = tk.StringVar(self)
@@ -42,33 +43,50 @@ class ProjectionWindow(tk.Toplevel):
         self.refresh()
 
     def refresh(self):
-        """Recompute from current inputs; invalid inputs clear the old projection."""
-        self._projection = None
+        """Recompute the nominal ledger once; money controls only change its display."""
+        self._nominal_projection = None
         self._message = ''
-        self.warning.set('')
-        self.readout.set('')
-        self.details.set('')
         try:
             text = self.years.get().strip()
             if not text.isascii() or not text.isdecimal() or not 1 <= int(text) <= 100:
                 raise ValueError('Choose a horizon from 1 to 100 whole years.')
-            self._projection = self._get_projection(int(text))
-            warnings = []
-            for label, shortfalls in (('Cash deadline shortfalls', self._projection.deadline_shortfalls),
-                                     ('Unpaid planned expenses', self._projection.shortfalls)):
-                if shortfalls:
-                    amount = sum(Decimal(str(amount)) for _, amount in shortfalls)
-                    warnings.append(f'{label}: {format_amount(amount)} {self._projection.currency} · '
-                                    f'first {shortfalls[0][0]:%Y-%m-%d}')
-            self.warning.set('\n'.join(warnings))
+            self._nominal_projection = self._get_projection(int(text))
         except ValueError as error:
             self._message = str(error)
-        if self.warning.get():
-            self._warning_label.grid()
-        else:
-            self._warning_label.grid_remove()
+        self._change_money()
+
+    def _change_money(self, _event=None):
+        self._projection = None
+        self.warning.set('')
+        self.readout.set('')
+        self.details.set('')
+        if self._nominal_projection is not None:
+            try:
+                self._projection = (self._nominal_projection.in_todays_money()
+                                    if self.money.get() == "Today's money" else self._nominal_projection)
+                self._message = ''
+            except ValueError as error:
+                self._message = str(error)
+        warnings = []
+        if self._projection is not None:
+            for label, shortfalls in (('Cash deadline shortfalls', self._projection.deadline_shortfalls),
+                                     ('Unpaid planned expenses', self._projection.shortfalls),
+                                     ('Unpaid living costs', self._projection.living_shortfalls)):
+                if shortfalls:
+                    amount = sum(Decimal(str(amount)) for _, amount in shortfalls)
+                    warnings.append(f'{label}: {format_amount(amount)} {self._unit()} · '
+                                    f'first {shortfalls[0][0]:%Y-%m-%d}')
+            basis = (f"Values show HUF purchasing power at {self._projection.dates[0]:%Y-%m-%d}, "
+                     f"expressed in {self._projection.currency}. " if self.money.get() == "Today's money" else '')
+            self._note.configure(text=(basis + 'Assumes the recommended allocation, monthly income and costs, and expense payments on due dates. '
+                                      'Returns are nominal estimates; exchange rates stay fixed. Inspect with the mouse or Left/Right and Home/End keys.'))
+        self.warning.set('\n'.join(warnings))
+        self._warning_label.grid() if warnings else self._warning_label.grid_remove()
         self._legend()
         self._draw()
+
+    def _unit(self):
+        return self._projection.currency + (" · today's money" if self.money.get() == "Today's money" else '')
 
     def _build(self):
         self.columnconfigure(0, weight=1)
@@ -89,6 +107,12 @@ class ProjectionWindow(tk.Toplevel):
         horizon.bind('<Return>', lambda _event: self.refresh())
         horizon.bind('<FocusOut>', lambda _event: self.refresh())
         ttk.Label(controls, text='years').pack(side='left', padx=6)
+        info_label(controls, 'Values', HELP['projection_money']).pack(side='left', padx=(24, 6))
+        money = ttk.Combobox(controls, textvariable=self.money, values=('Nominal', "Today's money"),
+                             state='readonly', width=15)
+        money.pack(side='left')
+        money.bind('<<ComboboxSelected>>', self._change_money)
+        add_help(money, HELP['projection_money'])
         self.legend = ttk.Frame(self, padding=(16, 0, 16, 6))
         self.legend.grid(row=1, column=0, sticky='ew')
         self.canvas = tk.Canvas(self, background=BACKGROUND, takefocus=True,
@@ -193,7 +217,7 @@ class ProjectionWindow(tk.Toplevel):
 
     def _axes(self, maximum, days, y, *, minimum=0):
         left, top, right, bottom = self._bounds
-        self.canvas.create_text(left, 10, text=self._projection.currency, anchor='w', fill=MUTED_TEXT, tags='axis')
+        self.canvas.create_text(left, 10, text=self._unit(), anchor='w', fill=MUTED_TEXT, tags='axis')
         for index in range(5):
             value = minimum + (maximum - minimum) * (index / 4)
             self.canvas.create_line(left, y(value), right, y(value), fill='#454b55', tags='grid')
@@ -235,7 +259,7 @@ class ProjectionWindow(tk.Toplevel):
             return
         self._point = index % len(self._xs)
         values = {name: amounts[index] for name, amounts in self._series().items()}
-        currency = self._projection.currency
+        currency = self._unit()
         total = values['Net worth'] if self.view.get() == 'Net worth' else fsum(values.values())
         self.readout.set(f'{self._projection.dates[index]:%Y-%m-%d} · {format_amount(total)} {currency}')
         self.details.set('  ·  '.join(f'{name}: {format_amount(value)} {currency}' for name, value in values.items()))

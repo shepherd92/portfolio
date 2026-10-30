@@ -110,7 +110,7 @@ def load_settings(directory):
         return CalculatorSettings(), None
     try:
         values = json.loads(original, parse_float=Decimal, object_pairs_hook=unique_object)
-        _keys(values, CalculatorSettings)
+        _keys(values, CalculatorSettings, optional={'inflation_percent'})
         _keys(values['returns'], ReturnAssumptions)
         values['returns'] = ReturnAssumptions(**values['returns'])
         for name in ('incomes', 'outgoings'):
@@ -118,10 +118,11 @@ def load_settings(directory):
                 raise ValueError(f'{name.capitalize()} must be a JSON list.')
             flows = []
             for row in values[name]:
-                _keys(row, CashFlow)
+                _keys(row, CashFlow, optional={'growth_mode', 'price_month'})
                 start = _setting_month(row['start'])
                 end = _setting_month(row['end']) if row['end'] is not None else None
-                flows.append(CashFlow(**{**row, 'start': start, 'end': end}))
+                price_month = _setting_month(row['price_month']) if row.get('price_month') is not None else None
+                flows.append(CashFlow(**{**row, 'start': start, 'end': end, 'price_month': price_month}))
             values[name] = tuple(flows)
         return CalculatorSettings(**values), original
     except (ValueError, TypeError, UnicodeError) as error:
@@ -305,6 +306,7 @@ def _check_original(path, original):
         raise ValueError('Calculator inputs changed outside this application. Reload before saving.')
 
 
-def _keys(value, model):
-    if not isinstance(value, dict) or set(value) != {field.name for field in fields(model)}:
+def _keys(value, model, *, optional=frozenset()):
+    expected = {field.name for field in fields(model)}
+    if not isinstance(value, dict) or not expected - optional <= set(value) <= expected:
         raise ValueError(f'{model.__name__} has missing or unsupported fields.')

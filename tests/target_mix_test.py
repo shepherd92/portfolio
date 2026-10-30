@@ -459,7 +459,9 @@ class TargetMixGuiTests(unittest.TestCase):
             loaded_wealth = load_wealth(directory)[0]
         self.assertEqual(loaded.allocation, allocation)
         self.assertEqual(loaded_wealth, wealth)
-        settings = CalculatorSettings(outgoings=(CashFlow('Living', 100, date(2026, 1, 1), frequency='monthly'),),
+        # Balanced operating cash flows isolate target-mix funding from withdrawals.
+        settings = CalculatorSettings(incomes=(CashFlow('Salary', 100, date(2026, 1, 1), frequency='monthly'),),
+                                      outgoings=(CashFlow('Living', 100, date(2026, 1, 1), frequency='monthly'),),
                                       emergency_months=1, cash_months=1,
                                       returns=ReturnAssumptions(equities=6, bonds=2, gold=0, mak_huf=5))
         today = date(2026, 1, 16)

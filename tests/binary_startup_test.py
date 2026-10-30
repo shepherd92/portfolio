@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,26 +39,28 @@ class BinaryStartupTests(unittest.TestCase):
                     patch.object(sys, 'frozen', frozen, create=True), \
                     patch.object(sys, 'executable', str(self.root / 'portable' / 'planner.exe')), \
                     patch.dict(os.environ, APPIMAGE=appimage), \
-                    patch('ui.app.launch', return_value=0) as launch:
+                    patch('ui.launcher.launch', return_value=0) as launch:
                 entry = runpy.run_path(str(source))
                 self.assertEqual(entry['main']([]), 0)
                 launch.assert_called_once_with(None, base_currency='EUR')
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_cancelled_launch_destroys_root_without_constructing_app(self):
-        from ui.app import launch
-        with patch('ui.app.tk.Tk') as root, patch('ui.app.configure_theme'), \
-                patch('ui.app.filedialog.askdirectory', return_value=''), \
+        from ui.launcher import launch
+        with patch('ui.launcher.tk.Tk') as root, patch('ui.launcher.configure_theme'), \
+                patch('ui.launcher.ttk.Frame'), patch('ui.launcher.ttk.Label'), \
+                patch('ui.launcher.filedialog.askdirectory', return_value=''), \
                 patch('ui.app.PortfolioApp') as app:
             self.assertEqual(launch(None), 0)
-        root.return_value.withdraw.assert_called_once_with()
+        root.return_value.withdraw.assert_not_called()
+        root.return_value.update.assert_called_once_with()
         root.return_value.destroy.assert_called_once_with()
         root.return_value.mainloop.assert_not_called()
         app.assert_not_called()
         self.assertFalse(self.preference.exists())
 
     def test_launch_remembers_only_after_successful_application_load(self):
-        from ui.app import launch
+        from ui.launcher import launch
         directory = self.empty_folder()
 
         def opened(root, selected, *, base_currency, on_directory_opened):
@@ -65,35 +68,128 @@ class BinaryStartupTests(unittest.TestCase):
             self.assertEqual(selected, directory)
             on_directory_opened(selected)
 
-        with patch('ui.app.tk.Tk') as root, patch('ui.app.configure_theme'), \
-                patch('ui.app.filedialog.askdirectory', return_value=str(directory)) as choose, \
+        with patch('ui.launcher.tk.Tk') as root, patch('ui.launcher.configure_theme'), \
+                patch('ui.launcher.ttk.Frame'), patch('ui.launcher.ttk.Label'), \
+                patch('ui.launcher.filedialog.askdirectory', return_value=str(directory)) as choose, \
                 patch('ui.app.PortfolioApp', side_effect=opened):
             self.assertEqual(launch(None), 0)
         choose.assert_called_once()
-        root.return_value.deiconify.assert_called_once_with()
+        root.return_value.update.assert_called_once_with()
         root.return_value.mainloop.assert_called_once_with()
         self.assertEqual(remembered_directory(), directory)
 
     def test_failed_application_load_does_not_remember_selected_folder(self):
-        from ui.app import launch
+        from ui.launcher import launch
         directory = self.empty_folder()
-        with patch('ui.app.tk.Tk') as root, patch('ui.app.configure_theme'), \
-                patch('ui.app.filedialog.askdirectory', return_value=str(directory)), \
+        with patch('ui.launcher.tk.Tk') as root, patch('ui.launcher.configure_theme'), \
+                patch('ui.launcher.ttk.Frame'), patch('ui.launcher.ttk.Label'), \
+                patch('ui.launcher.filedialog.askdirectory', return_value=str(directory)), \
                 patch('ui.app.PortfolioApp', side_effect=OSError('Cannot load inputs')), \
-                patch('ui.app.messagebox.showerror') as error:
+                patch('ui.launcher.messagebox.showerror') as error:
             self.assertEqual(launch(None), 1)
         root.return_value.destroy.assert_called_once_with()
         root.return_value.mainloop.assert_not_called()
-        self.assertIn('Cannot load inputs', error.call_args.args)
+        self.assertIn('Cannot load inputs', error.call_args.args[1])
         self.assertFalse(self.preference.exists())
 
     def test_explicit_config_is_passed_to_gui(self):
         directory = self.root / 'chosen elsewhere'
-        with patch('ui.app.launch', return_value=0) as launch:
+        with patch('ui.launcher.launch', return_value=0) as launch:
             self.assertEqual(main.main(['--config', str(directory), '--base-currency', 'HUF']), 0)
         launch.assert_called_once_with(directory, base_currency='HUF')
         self.assertFalse(directory.exists())
         self.assertFalse(self.preference.exists())
+
+    def test_startup_imports_do_not_load_numerical_or_formula_libraries(self):
+        source = '''
+import builtins
+original = builtins.__import__
+def checked(name, *args, **kwargs):
+    if name.split('.')[0] in ('numpy', 'scipy', 'highspy', 'matplotlib', 'yfinance'):
+        raise AssertionError('Heavy import before the startup window: ' + name)
+    return original(name, *args, **kwargs)
+builtins.__import__ = checked
+import main
+import ui.launcher
+import ui.calculation_view
+'''
+        result = subprocess.run([sys.executable, '-c', source], cwd=Path(main.__file__).parent,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_import_failure_is_visible_and_logged_without_private_values(self):
+        from ui.launcher import launch
+        directory = self.empty_folder()
+        with patch('ui.launcher.tk.Tk') as root, patch('ui.launcher.configure_theme'), \
+                patch('ui.launcher.ttk.Frame'), patch('ui.launcher.ttk.Label'), \
+                patch('ui.launcher.messagebox.showerror') as error, \
+                patch.dict(sys.modules, {'ui.app': None}):
+            self.assertEqual(launch(directory), 1)
+        self.assertIn('ui.app', error.call_args.args[1])
+        self.assertIs(error.call_args.kwargs['parent'], root.return_value)
+        root.return_value.destroy.assert_called_once_with()
+        root.return_value.mainloop.assert_not_called()
+        contents = self.preference.with_name('startup.log').read_text()
+        self.assertIn('Loading application modules', contents)
+        self.assertIn('Startup failed: ModuleNotFoundError', contents)
+        self.assertNotIn(str(directory), contents)
+        self.assertFalse(self.preference.exists())
+
+    def test_startup_log_replaces_old_log_and_omits_error_values(self):
+        from ui.launcher import _StartupLog
+        first = _StartupLog()
+        first.write('Previous launch marker')
+        log = _StartupLog()
+        try:
+            raise ValueError('Private portfolio value 123456')
+        except ValueError as error:
+            log.failure(error)
+        contents = log.path.read_text()
+        self.assertNotIn('Previous launch marker', contents)
+        self.assertNotIn('123456', contents)
+        self.assertNotIn('Private portfolio', contents)
+        self.assertIn('ValueError', contents)
+
+    def test_unwritable_startup_log_does_not_prevent_launch(self):
+        from ui.launcher import _StartupLog
+        with patch('ui.launcher.preferences.preferences_path',
+                   side_effect=PermissionError('Read-only preferences')):
+            log = _StartupLog()
+        log.write('Startup continues')
+        self.assertIsNone(log.path)
+
+    @unittest.skipUnless(os.environ.get('REBALANCE_GUI_TESTS') == '1', 'Run with a graphical display')
+    def test_native_owner_is_visible_before_choosing_and_building(self):
+        import tkinter as tk
+        from types import ModuleType
+        from ui.launcher import launch
+
+        directory = self.empty_folder()
+        stages = []
+
+        def choose(**options):
+            owner = options['parent']
+            self.assertTrue(owner.winfo_viewable())
+            self.assertEqual(owner.state(), 'normal')
+            stages.append('choose')
+            return str(directory)
+
+        def opened(root, selected, *, base_currency, on_directory_opened):
+            self.assertTrue(root.winfo_viewable())
+            self.assertEqual(selected, directory)
+            self.assertFalse(self.preference.exists())
+            stages.append('open')
+            on_directory_opened(selected)
+            root.after(1, root.destroy)
+
+        app = ModuleType('ui.app')
+        app.PortfolioApp = opened
+        with patch.dict(sys.modules, {'ui.app': app}), \
+                patch('ui.launcher.filedialog.askdirectory', side_effect=choose):
+            self.assertEqual(launch(None), 0)
+        self.assertEqual(stages, ['choose', 'open'])
+        self.assertEqual(remembered_directory(), directory)
+        self.assertIsNone(tk._default_root)
 
     def test_first_selection_initializes_empty_folder_and_only_app_success_remembers(self):
         directory = self.empty_folder()
@@ -201,8 +297,8 @@ class BinaryStartupTests(unittest.TestCase):
         self.assertEqual((directory / 'asset_group.csv').read_bytes(), b'Keep concurrent inputs')
 
     def test_cli_without_selection_requires_config_and_never_opens_gui(self):
-        with patch('ui.app.launch') as launch, \
-                patch('main.fetch_market_data') as fetch, \
+        with patch('ui.launcher.launch') as launch, \
+                patch('portfolio.market.fetch_market_data') as fetch, \
                 patch('sys.stderr', new_callable=io.StringIO) as output, \
                 self.assertRaises(SystemExit) as error:
             main.main(['rebalance'])
@@ -219,7 +315,7 @@ class BinaryStartupTests(unittest.TestCase):
         for arguments, expected in ((['rebalance'], remembered),
                                     (['--config', str(explicit), 'rebalance'], explicit)):
             with self.subTest(arguments=arguments), \
-                    patch('main.load_portfolio', side_effect=ValueError('Stop before market fetch')) as load, \
+                    patch('portfolio.storage.load_portfolio', side_effect=ValueError('Stop before market fetch')) as load, \
                     patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
                 main.main(arguments)
             load.assert_called_once_with(expected)
@@ -228,8 +324,8 @@ class BinaryStartupTests(unittest.TestCase):
     def test_cli_missing_remembered_folder_does_not_create_inputs_or_open_gui(self):
         directory = self.root / 'removed'
         remember_directory(directory)
-        with patch('ui.app.launch') as launch, \
-                patch('main.fetch_market_data') as fetch, \
+        with patch('ui.launcher.launch') as launch, \
+                patch('portfolio.market.fetch_market_data') as fetch, \
                 patch('sys.stderr', new_callable=io.StringIO) as output, self.assertRaises(SystemExit):
             main.main(['rebalance'])
         self.assertIn('Missing portfolio file', output.getvalue())

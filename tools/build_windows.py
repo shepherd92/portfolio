@@ -44,6 +44,9 @@ def main(argv=None):
         "Your portfolio is stored in the folder you select, separately from the app.\n"
         "This archive contains no personal portfolio data.\n"
         "Internet access is required when refreshing online market data.\n\n"
+        "A startup window appears before the folder chooser and portfolio load.\n"
+        "If startup fails, the error dialog gives the local diagnostic log path:\n"
+        "%APPDATA%\\PortfolioPlanner\\startup.log\n\n"
         "Requires 64-bit Windows 10 or Windows 11.\n",
         encoding="utf-8")
     output = args.output.expanduser().resolve()

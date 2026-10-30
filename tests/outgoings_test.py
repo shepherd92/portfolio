@@ -208,11 +208,13 @@ class CashFlowTests(unittest.TestCase):
                                     outgoings=(CashFlow('Living', 200, date(2026, 1, 31), frequency='monthly'),))
         self.assertEqual(inputs.income_receipts(date(2025, 12, 31), date(2026, 1, 31)), ((date(2026, 1, 1), 250),))
 
-    def test_monthly_income_deficit_is_zero_without_carrying_phantom_debt(self):
+    def test_monthly_deficit_is_a_payment_instead_of_a_negative_income_receipt(self):
         inputs = CalculatorSettings(incomes=(CashFlow('January', 100, date(2026, 1, 5)),
                                              CashFlow('February', 500, date(2026, 2, 5))),
                                     outgoings=(CashFlow('Living', 200, TODAY, frequency='monthly'),))
         self.assertEqual(inputs.income_receipts(date(2025, 12, 31), date(2026, 2, 28)), ((date(2026, 2, 1), 300),))
+        deficit = inputs.scheduled_payments(date(2025, 12, 31))[0]
+        self.assertEqual((deficit.due, deficit.amount, deficit.origin), (date(2026, 1, 1), 100, 'living'))
 
     def test_single_income_can_fund_only_expenses_ready_on_or_after_its_receipt(self):
         bonus = CashFlow('Bonus', 100, date(2026, 2, 15))
@@ -239,7 +241,8 @@ class CashFlowTests(unittest.TestCase):
         self.assertEqual(inputs.income_receipts(TODAY, date(2026, 12, 31), rates),
                          ((date(2026, 2, 1), 800), (date(2026, 3, 1), 300)))
         result = project(inputs, TODAY, ALLOCATION, total=10000, rates=rates, years=1)
-        self.assertEqual(total_at(result, -1), 11100)
+        self.assertEqual(total_at(result, -1), 10000 + 1000 + 500 - 12 * 200)
+        self.assertFalse(result.living_shortfalls)
 
 
 if __name__ == '__main__':

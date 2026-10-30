@@ -138,6 +138,7 @@ class PlanCalculationTests(unittest.TestCase):
         portfolio = Portfolio((Holding('ETF', 'World', 0),),
                               self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 1000})
         settings = self.settings(emergency_months=6, cash_months=2,
+                                 incomes=(CashFlow('Income', 100, self.today, frequency='monthly'),),
                                  outgoings=(CashFlow('Living costs', 100, self.today, frequency='monthly'),))
         report, plan, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
         self.assertEqual(plan.cash['HUF'], 200)
@@ -159,18 +160,46 @@ class PlanCalculationTests(unittest.TestCase):
         portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 100}), {'HUF': 100_000})
         report, _, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
         living = self.table(report, 'Monthly living costs').rows[0]
-        self.assertEqual(living[2], '21%')
+        self.assertEqual(living[2], 'Custom · 21%')
         self.assertEqual([self.money(living[column]) for column in (1, 3, 6)], [100, 121, 121])
         schedule = self.table(report, 'Captured income and outgoing schedules')
-        self.assertEqual([row[-1] for row in schedule.rows], ['21%'] * 3)
+        self.assertEqual([row[-1] for row in schedule.rows], ['Custom · 21%'] * 3)
         self.assertAlmostEqual(funding.recommendation.rows[0].amount, 363)
-        evidence = [table for table in self.tables(report) if table.title == 'Payment appreciation']
+        evidence = [table for table in self.tables(report) if table.title == 'Payment growth']
         self.assertEqual(len(evidence), 2)
-        self.assertEqual([table.rows[3][1] for table in evidence], ['12', '24'])
-        self.assertEqual([self.money(table.rows[4][1]) for table in evidence], [121, 146])
+        self.assertEqual([table.rows[4][1] for table in evidence], ['12', '24'])
+        self.assertEqual([self.money(table.rows[5][1]) for table in evidence], [121, 146])
         changes = self.table(report, 'Fixed-buffer changes before expense commitments')
         self.assertTrue(changes.rows)
-        self.assertIn('Appreciation changes payments, not investment returns.', report.text)
+        self.assertIn('Inflation is not added to custom growth.', report.text)
+
+    def test_saved_price_month_and_indexed_budget_match_nominal_report(self):
+        start = date(2024, 1, 1)
+        settings = self.settings(inflation_percent=10, emergency_months=1,
+            incomes=(CashFlow('Income', 100, start, frequency='monthly', growth_mode='inflation'),),
+            outgoings=(CashFlow('Living', 100, start, frequency='monthly', growth_mode='inflation'),
+                       CashFlow('Purchase', 1000, date(2026, 1, 1), price_month=start)))
+        portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 100}), {'HUF': 10_000})
+        report, _, funding = self.report(portfolio, MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF'), settings)
+        self.assertAlmostEqual(funding.recommendation.rows[0].amount, 110)
+        self.assertAlmostEqual(funding.recommendation.rows[2].future_amount, 1210)
+        payment = dict(self.table(report, 'Payment growth').rows)
+        self.assertEqual(payment['Price reference month'], '2024-01')
+        self.assertEqual(payment['Elapsed months · n'], '24')
+        self.assertEqual(self.money(payment['Due payment · a(n)']), 1210)
+        self.assertIn('Captured expected inflation: 10%', report.text)
+        self.assertIn('no second inflation discount', report.text)
+
+    def test_living_deficit_report_explains_reserve_and_reconciles_signed_budget(self):
+        settings = self.settings(outgoings=(CashFlow('Living', 100, self.today, frequency='monthly'),))
+        portfolio = Portfolio((), self.targets(cash={'HUF': 100}), {'HUF': 2000})
+        report, _, funding = self.report(portfolio, MarketData({}, {}, 'HUF'), settings)
+        self.assertEqual(len(funding.recommendation.expenses), 12)
+        self.assertEqual(funding.recommendation.mak, 1200)
+        budget = self.table(report, 'Dated savings ledger · HUF').rows[0]
+        self.assertEqual([self.money(value) for value in budget[1:]], [0, 100, 0, 0, -100, 0, 100])
+        self.assertIn('This is a living-cost deficit', report.text)
+        self.assertNotIn('Payment growth', report.text)
 
     def test_expense_preserves_stock_and_separates_present_and_future_values(self):
         self.today = date(2024, 1, 1)
@@ -220,6 +249,7 @@ class PlanCalculationTests(unittest.TestCase):
     def test_shortage_retains_requested_and_funded_values_and_global_priority(self):
         portfolio = Portfolio((), self.targets(cash={'HUF': 100}), {'HUF': 250})
         settings = self.settings(emergency_months=6, cash_months=2,
+            incomes=(CashFlow('Income', 100, self.today, frequency='monthly'),),
             outgoings=(CashFlow('Living costs', 100, self.today, frequency='monthly'),
                        CashFlow('Immediate', 100, date(2025, 2, 1))))
         report, _, funding = self.report(portfolio, MarketData({}, {}, 'HUF'), settings)
@@ -297,8 +327,8 @@ class PlanCalculationTests(unittest.TestCase):
     def test_linked_ledger_retains_zero_savings_uncovered_debt_and_external_assumptions(self):
         february, march = date(2025, 2, 1), date(2025, 3, 1)
         home = Property('flat', 'Flat', 10_000_000, appreciation_percent=5, vacancy_percent=25,
-            cashflows=(PropertyCashFlow(CashFlow('Rent', 100, date(2024, 2, 1), frequency='monthly', end=march),
-                                       'income', 'rented', appreciation_percent=12),))
+            cashflows=(PropertyCashFlow(CashFlow('Rent', 100, date(2024, 2, 1), frequency='monthly', end=march, appreciation_percent=12),
+                                       'income', 'rented'),))
         pension = Pension('pension', 'Pension', balance=500, annual_return=7, access=date(2060, 1, 1),
             contributions=(PensionContribution(CashFlow('Bank saving', 20, february, frequency='monthly', count=2)),
                            PensionContribution(CashFlow('Employer saving', 30, february, frequency='monthly', count=2), 'employer')))
@@ -314,7 +344,7 @@ class PlanCalculationTests(unittest.TestCase):
         self.assertEqual(first.obligations, (('Loan · Repayment', 100, 94), ('Pension · Bank saving', 20, 0)))
         self.assertAlmostEqual(second.surplus, 50 + 100 * 1.12 ** (13 / 12) * .75 - 40 - 50 - 20)
         ledger = self.table(report, 'Dated savings ledger · HUF')
-        self.assertEqual([self.money(v) for v in ledger.rows[0][1:]], [134, 40, 94, 0])
+        self.assertEqual([self.money(v) for v in ledger.rows[0][1:]], [134, 40, 94, 26, -26, 0, 0])
         self.assertEqual(plan.wealth, 10_000)
         self.assertEqual([item.payment.amount for item in funding.recommendation.expenses[1:]], [6, 20])
         self.assertIn('occupancy weight 75%; vacancy 25%', report.text)
@@ -348,6 +378,7 @@ class PlanCalculationTests(unittest.TestCase):
         portfolio = Portfolio((Holding('ETF', 'World', 0),), self.targets(stock={'World': 60}, mak={'HUF': 40}), {'HUF': 1000})
         market = MarketData({'ETF': Quote(10, 'HUF')}, {}, 'HUF')
         settings = self.settings(emergency_months=6, cash_months=2,
+                                 incomes=(CashFlow('Income', 100, self.today, frequency='monthly'),),
                                  outgoings=(CashFlow('Living costs', 100, self.today, frequency='monthly'),))
         valid, plan, funding = self.report(portfolio, market, settings)
         self.assertIn('PASS · 0 of 4', valid.text)

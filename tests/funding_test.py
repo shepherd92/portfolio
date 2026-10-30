@@ -23,6 +23,7 @@ class FundingTests(unittest.TestCase):
                                  {'EUR': 1, 'HUF': .0025})
         self.settings = CalculatorSettings(
             returns=ReturnAssumptions(equities=0, mak_huf=0),
+            incomes=(CashFlow('Income covering living costs', 100, date.min, frequency='monthly'),),
             outgoings=(
                 CashFlow('Rent', 60, date.min, frequency='monthly'),
                 CashFlow('Food', 40, date.min, frequency='monthly'),
@@ -63,7 +64,7 @@ class FundingTests(unittest.TestCase):
         self.assertEqual(dict(huf.minimum_values), {(CASH, 'HUF'): 200, (TREASURY, 'HUF'): 600})
 
     def test_no_reserves_preserve_home_targets_without_creating_protected_balances(self):
-        result = self.prepare(outgoings=())
+        result = self.prepare(incomes=(), outgoings=())
         self.assertEqual(result.portfolio.allocation, self.allocation)
         self.assertEqual(dict(result.minimum_values), {})
         self.assertEqual(result.recommendation.rows[-1].amount, 1_000)
@@ -83,7 +84,7 @@ class FundingTests(unittest.TestCase):
                 self.assertAlmostEqual(fsum(result.minimum_values.values()), cash * .0025)
 
     def test_expense_stock_uses_home_market_mix_and_defensive_portion_is_huf(self):
-        result = self.prepare(horizon_years=1, outgoings=(CashFlow('Half year', 200, date(2024, 9, 2)),))
+        result = self.prepare(incomes=(), horizon_years=1, outgoings=(CashFlow('Half year', 200, date(2024, 9, 2)),))
         values = self.target_values(result)
         stock = 200 * 182 / 366  # Jan 1–Jul 1 cash deadline in leap year 2024.
         defensive = 200 - stock

@@ -17,7 +17,7 @@ class FutureIncomeTests(unittest.TestCase):
                         returns=ReturnAssumptions(equities=0, mak_huf=0))
         return CalculatorSettings(**(defaults | values))
 
-    def test_no_surplus_matches_zero_income_and_does_not_model_withdrawals(self):
+    def test_living_deficits_reserve_twelve_months_without_creating_income(self):
         today = date(2025, 1, 1)
         settings = self.settings(
             income=0,
@@ -27,18 +27,49 @@ class FutureIncomeTests(unittest.TestCase):
                 CashFlow('Later', 300, date(2026, 1, 1)),
             ),
         )
-        expected = recommend(settings, today, allocation(), total=10_000)
         for income in (0, 25, 50):
             with self.subTest(income=income):
                 result = recommend(replace(settings, incomes=self.income(income, today)), today, allocation(), total=10000)
-                self.assertEqual(result.rows, expected.rows)
-                self.assertEqual((result.market_return, result.mak_huf_return, result.shortfall),
-                                 (expected.market_return, expected.mak_huf_return, expected.shortfall))
+                living = [expense for expense in result.expenses if expense.payment.origin == 'living']
+                self.assertEqual(len(living), 12 if income < 50 else 0)
+                self.assertEqual(fsum(expense.payment.amount for expense in living), 12 * (50 - income))
+                self.assertTrue(all(expense.payment.defensive and expense.deadline == expense.payment.due
+                                    for expense in living))
+                self.assertEqual(result.rows[-1].amount, 9100 - 12 * (50 - income))
+                self.assertEqual(result.total, 10000)
                 self.assertEqual(result.receipts, ())
-        self.assertEqual([row.income_funded for row in expected.rows], [None, None, 0, 0, None])
         without_expenses = replace(settings, outgoings=())
         self.assertEqual(recommend(replace(without_expenses, incomes=self.income(1000, today)), today, allocation(), total=10000).rows,
                          recommend(without_expenses, today, allocation(), total=10_000).rows)
+
+    def test_months_without_receipts_keep_living_deficits_and_later_operations(self):
+        today = date(2026, 1, 15)
+        settings = self.settings(today, income=0,
+                                 incomes=(CashFlow('Bonus', 100, date(2026, 3, 1)),),
+                                 outgoings=(CashFlow('Living', 50, today, frequency='monthly'),))
+        budgets = settings.income_budgets(today, date(2027, 3, 1))
+        self.assertEqual(len(budgets), 14)
+        self.assertEqual((budgets[0].net, budgets[0].living_deficit, budgets[0].surplus), (-50, 50, 0))
+        self.assertEqual((budgets[1].net, budgets[1].living_deficit, budgets[1].surplus), (50, 0, 50))
+        reserved = settings.scheduled_payments(today)
+        operating = settings.operating_payments(today, date(2027, 3, 1))
+        self.assertEqual(len(reserved), 11)
+        self.assertEqual([payment.due for payment in operating], [date(2027, 2, 1), date(2027, 3, 1)])
+        self.assertFalse({payment.due for payment in reserved} & {payment.due for payment in operating})
+
+    def test_living_deficits_use_only_receipts_before_their_own_deadlines(self):
+        today = date(2026, 1, 1)
+        inputs = self.settings(today, income=0, emergency_months=0, cash_months=0,
+                               incomes=(CashFlow('Bonus', 500, date(2026, 3, 1)),),
+                               outgoings=(CashFlow('Living', 100, today, frequency='monthly'),))
+        result = recommend(inputs, today, allocation(), total=1000)
+        expenses = {item.payment.due: item for item in result.expenses}
+        self.assertEqual(expenses[date(2026, 2, 1)].contributions, ())
+        self.assertEqual(expenses[date(2026, 2, 1)].income_funded, 0)
+        for month in (4, 5, 6, 7):
+            self.assertEqual(expenses[date(2026, month, 1)].contributions, ((date(2026, 3, 1), 100),))
+        self.assertEqual(expenses[date(2026, 8, 1)].income_funded, 0)
+        self.assertEqual(result.rows[-1].amount, 300)
 
     def test_monthly_income_starts_next_month_and_includes_the_cash_deadline(self):
         cases = ((date(2025, 1, 31), date(2025, 3, 31), 0),

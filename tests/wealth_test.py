@@ -23,6 +23,40 @@ def pension(**values):
 
 
 class WealthTest(unittest.TestCase):
+    def test_exhausted_pension_and_repaid_loan_ignore_unused_future_payment_growth(self):
+        schedule = payment(1e250, frequency='monthly', growth_mode='inflation')
+        loan = Loan('debt', 'Debt', 100, schedule)
+        retirement = pension(balance=100, withdrawals=(schedule,))
+        wealth = WealthSettings(loans=(loan,), pensions=(retirement,))
+        projected = wealth.project(TODAY, date(TODAY.year + 100, TODAY.month, TODAY.day),
+                                   inflation_percent=1000)
+        self.assertEqual([event.amount for event in projected.events], [100, 100])
+        self.assertTrue(all(balance.amount == 0 for balance in projected.balances))
+
+    def test_fixed_nominal_loan_does_not_change_with_inflation(self):
+        loan = Loan('debt', 'Debt', 1000, payment(200, frequency='monthly'), annual_interest=12)
+        wealth = WealthSettings(loans=(loan,))
+        nominal = wealth.project(TODAY, JANUARY)
+        inflation = wealth.project(TODAY, JANUARY, inflation_percent=20)
+        self.assertEqual(inflation, nominal)
+        self.assertEqual([event.amount for event in inflation.events], [200, 200, 200])
+
+    def test_inflation_linked_loan_and_pension_use_the_selected_payment_policy(self):
+        beginning = date(2025, 11, 1)
+        schedule = payment(100, start=beginning, frequency='monthly', growth_mode='inflation')
+        loan = Loan('debt', 'Debt', 1000, schedule)
+        retirement = pension(balance=1000, access=beginning, withdrawals=(schedule,))
+        wealth = WealthSettings(loans=(loan,), pensions=(retirement,))
+        events = wealth.events(TODAY, NOVEMBER, inflation_percent=10)
+        self.assertEqual(len(events), 2)
+        for event in events:
+            self.assertAlmostEqual(event.amount, 110)
+
+    def test_external_projection_validates_the_shared_inflation_assumption(self):
+        for inflation in (True, -100, 1001, float('nan'), float('inf')):
+            with self.subTest(inflation=inflation), self.assertRaisesRegex(ValueError, 'inflation'):
+                WealthSettings().project(TODAY, NOVEMBER, inflation_percent=inflation)
+
     def test_property_growth_is_not_income_or_expense(self):
         home = Property('home', 'Home', 10_000_000, appreciation_percent=5, depreciation_percent=2)
         result = WealthSettings(properties=(home,)).project(TODAY, JANUARY)
@@ -72,8 +106,8 @@ class WealthTest(unittest.TestCase):
 
     def test_property_payments_compound_monthly_from_beginning_not_projection_date(self):
         begins = date(2025, 11, 1)
-        entries = tuple(PropertyCashFlow(payment(100, start=begins, frequency='monthly'),
-                                        direction, 'rented', appreciation_percent=rate)
+        entries = tuple(PropertyCashFlow(payment(100, start=begins, frequency='monthly', appreciation_percent=rate),
+                                        direction, 'rented')
                         for direction, rate in (('income', 12), ('outgoing', -10)))
         home = Property('home', 'Home', 10000, vacancy_percent=25, cashflows=entries)
         settings = WealthSettings(properties=(home,))
@@ -84,9 +118,9 @@ class WealthTest(unittest.TestCase):
         self.assertEqual(result.balances[0].amount, home.value)
 
     def test_annual_and_once_payments_keep_dates_with_appreciation(self):
-        annual = PropertyCashFlow(payment(100, frequency='annual', count=2),
-                                  'income', 'rented', appreciation_percent=10)
-        once = PropertyCashFlow(payment(100, start=JANUARY), appreciation_percent=20)
+        annual = PropertyCashFlow(payment(100, frequency='annual', count=2, appreciation_percent=10),
+                                  'income', 'rented')
+        once = PropertyCashFlow(payment(100, start=JANUARY, appreciation_percent=20))
         home = Property('home', 'Home', 10000, vacancy_percent=25, cashflows=(annual, once))
         events = WealthSettings(properties=(home,)).events(TODAY, date(2028, 11, 1))
         self.assertEqual([event.due for event in events], [NOVEMBER, JANUARY, date(2027, 11, 1)])
@@ -98,7 +132,7 @@ class WealthTest(unittest.TestCase):
     def test_cashflow_growth_does_not_change_property_valuation(self):
         home = Property('home', 'Home', 10000, appreciation_percent=5, depreciation_percent=2,
                         vacancy_percent=25, cashflows=(PropertyCashFlow(
-                            payment(100, frequency='monthly'), 'income', 'rented', 20),))
+                            payment(100, frequency='monthly', appreciation_percent=20), 'income', 'rented'),))
         result = WealthSettings(properties=(home,)).project(TODAY, JANUARY)
         bare = WealthSettings(properties=(replace(home, cashflows=()),)).project(TODAY, JANUARY)
         self.assertEqual(result.balances, bare.balances)
@@ -106,8 +140,8 @@ class WealthTest(unittest.TestCase):
             self.assertAlmostEqual(event.amount, 75 * 1.2 ** (months / 12))
 
     def test_zero_weight_does_not_evaluate_unpayable_extreme_growth(self):
-        entry = PropertyCashFlow(payment(1e300, currency='EUR', start=date(2000, 1, 1), frequency='monthly'),
-                                 'income', 'rented', appreciation_percent=1000)
+        entry = PropertyCashFlow(payment(1e300, currency='EUR', start=date(2000, 1, 1), frequency='monthly',
+                                         appreciation_percent=1000), 'income', 'rented')
         home = Property('home', 'Home', 100, vacancy_percent=100, cashflows=(entry,))
         self.assertEqual(WealthSettings(properties=(home,)).events(TODAY, NOVEMBER), ())
         with self.assertRaisesRegex(ValueError, 'finite number|numeric range'):
@@ -258,7 +292,7 @@ class WealthTest(unittest.TestCase):
                 Property('id', 'Home', 100, vacancy_percent=vacancy)
         for rate in (True, -100, 1001, float('nan'), float('inf')):
             with self.subTest(rate=rate), self.assertRaises(ValueError):
-                PropertyCashFlow(payment(), appreciation_percent=rate)
+                PropertyCashFlow(payment(appreciation_percent=rate))
         with self.assertRaises(ValueError):
             PropertyCashFlow(payment(), occupancy='owner-occupied')
         with self.assertRaises(ValueError):
